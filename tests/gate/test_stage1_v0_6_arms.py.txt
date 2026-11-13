@@ -1,0 +1,113 @@
+"""Shape + grad tests for the Stage 1 v0.6 four-arm classes.
+
+Each arm is tested at a small spatial shape (B=1, T=64, H=W=128) to
+exercise the actual v0.6 geometry without inflating CI compute. Mamba
+requires CUDA, so all tests are skipped on CPU-only machines.
+
+Tested per arm:
+* Output shape matches §3.7 (full-res for Arms 1/3, low-res for Arms 2/4).
+* Forward output is finite (no NaN).
+* Backward produces finite gradients on every parameter (every
+  trainable parameter is reached by the loss).
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from localizer.gate.model import (
+    Stage1V06Arm1CnnMambaUnet, Stage1V06Arm2CnnMambaLowRes,
+    Stage1V06Arm3PureMambaUnet, Stage1V06Arm4PureMambaLowRes,
+    build_segmenter_v0_6,
+)
+
+
+CUDA_REQUIRED = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="v0.6 arms use Mamba which requires CUDA",
+)
+
+
+def _check_forward_and_backward(
+    model: torch.nn.Module,
+    input_shape: tuple,
+    expected_output_shape: tuple,
+) -> None:
+    """Assert the model produces the expected output shape, finite
+    output, and finite gradients on every parameter."""
+    model = model.cuda()
+    x = torch.randn(*input_shape, device="cuda")
+    y = model(x)
+    assert y.shape == expected_output_shape, (
+        f"expected {expected_output_shape}, got {y.shape}"
+    )
+    assert torch.isfinite(y).all(), "non-finite forward output"
+    loss = y.sum()
+    loss.backward()
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            assert p.grad is not None, f"missing grad for {name}"
+            assert torch.isfinite(p.grad).all(), (
+                f"non-finite grad for {name}"
+            )
+
+
+@CUDA_REQUIRED
+def test_arm_1_full_res_shape():
+    """Arm 1 produces full-resolution ``(B, 1, 64, 128, 128)``."""
+    model = Stage1V06Arm1CnnMambaUnet(nfeats=32)
+    _check_forward_and_backward(
+        model, input_shape=(1, 1, 64, 128, 128),
+        expected_output_shape=(1, 1, 64, 128, 128),
+    )
+
+
+@CUDA_REQUIRED
+def test_arm_2_low_res_shape():
+    """Arm 2 produces low-resolution ``(B, 1, 32, 32, 32)``."""
+    model = Stage1V06Arm2CnnMambaLowRes(nfeats=32)
+    _check_forward_and_backward(
+        model, input_shape=(1, 1, 64, 128, 128),
+        expected_output_shape=(1, 1, 32, 32, 32),
+    )
+
+
+@CUDA_REQUIRED
+def test_arm_3_full_res_shape():
+    """Arm 3 produces full-resolution ``(B, 1, 64, 128, 128)``."""
+    model = Stage1V06Arm3PureMambaUnet(embed_dim=64)
+    _check_forward_and_backward(
+        model, input_shape=(1, 1, 64, 128, 128),
+        expected_output_shape=(1, 1, 64, 128, 128),
+    )
+
+
+@CUDA_REQUIRED
+def test_arm_4_low_res_shape():
+    """Arm 4 produces low-resolution ``(B, 1, 32, 32, 32)``."""
+    model = Stage1V06Arm4PureMambaLowRes(embed_dim=64)
+    _check_forward_and_backward(
+        model, input_shape=(1, 1, 64, 128, 128),
+        expected_output_shape=(1, 1, 32, 32, 32),
+    )
+
+
+def test_factory_dispatch_returns_correct_class():
+    """``build_segmenter_v0_6(arm)`` returns the expected class."""
+    classes = (
+        Stage1V06Arm1CnnMambaUnet,
+        Stage1V06Arm2CnnMambaLowRes,
+        Stage1V06Arm3PureMambaUnet,
+        Stage1V06Arm4PureMambaLowRes,
+    )
+    for arm, cls in zip((1, 2, 3, 4), classes):
+        m = build_segmenter_v0_6(arm=arm)
+        assert isinstance(m, cls), f"arm={arm} returned {type(m)}"
+
+
+def test_factory_rejects_invalid_arm():
+    """``build_segmenter_v0_6`` raises ``ValueError`` for invalid arms."""
+    for bad in (0, 5, -1, "1"):
+        with pytest.raises(ValueError):
+            build_segmenter_v0_6(arm=bad)  # type: ignore[arg-type]

@@ -1,0 +1,56 @@
+{
+  "name": "segmenter_volseg_ep19",
+  "file": "segmenter_volseg_ep19.pth",
+  "role": "segmenter (Stage 3, validated standalone, not integrated)",
+  "sha256": "a039922d8064a0250bcbc5da2d82d46c4dac9d3b55bde7b532d0612ca7c21a4f",
+  "bytes": 73699819,
+  "safetensors_sha256": "104d3543e47684375a3463cde1874cf9dfd025323482efcb9b78aebf34034578",
+  "safetensors_bytes": 73659692,
+  "epoch": 19,
+  "selection_criterion": "best val_loss (train.log: '[epoch 19] saved best checkpoint (val_loss=0.0339)')",
+  "config_path": "configs/segmenter/default.yaml",
+  "config_path_at_training": "recovered/stage2_volseg/configs/default.yaml",
+  "config_commit": "609f1fe",
+  "config_note": "config_path is the current equivalent of config_path_at_training (same hyperparameters; dataset/run locations made relative).",
+  "source_path": "<runs root>/runs/stage2_volseg/models/best_3d_unet_model.pth",
+  "train_start": "2026-05-12T16:27:16-04:00",
+  "host": null,
+  "torch": null,
+  "mamba_ssm": null,
+  "causal_conv1d": null,
+  "dataset": "swarm_128x128x64, first 2,500 scenes by index (subset_size=2500; 10,000 scenes were on disk at training time): train 2,250 / val 250 (val_split=0.1, val_split_seed=0; 282/32 batches of 8)",
+  "model_build": null,
+  "val_metrics": {
+    "at_checkpoint_epoch_19": {
+      "val_loss": 0.0339,
+      "val_dice": 0.3909,
+      "val_iou": 0.3183
+    },
+    "at_final_epoch_150_not_saved": {
+      "val_loss": 0.0892,
+      "val_dice": 0.8985,
+      "val_iou": 0.8403
+    }
+  },
+  "notes": "Raw state_dict (154 tensors, 18,409,297 params). IMPORTANT: the only saved weights are the ep19 best-val_loss checkpoint, whose val Dice is 0.391. The often-cited 'final val Dice 0.8985' is epoch 150, for which no weights were saved. No active code loads this checkpoint.",
+  "inferred_fields": {
+    "config_commit": "last commit touching the config before launch (609f1fe, 2026-05-11); main HEAD at launch was bd8a70b",
+    "host": "not recorded anywhere found (run dir, logs, shell history); unknown",
+    "torch": "unknown (host unknown)"
+  },
+  "promoted": "2026-11-05",
+  "reproduced_on_x86": {
+    "date": "2026-11-05",
+    "platform": "Linux x86-64, NVIDIA RTX PRO 5000 Blackwell (24 GB), driver 595.84",
+    "environment": "Tier 1: Python 3.11.18, torch 2.12.0+cu130, mamba_ssm 2.3.2.post1, causal_conv1d 1.6.2.post1, numpy 2.4.6 (requirements/cuda-linux-x86_64.txt)",
+    "code_commit": "dfd6b28 plus scripts/segmenter/evaluate.py (committed with this record)",
+    "status": "reproduced exactly",
+    "command": "python scripts/segmenter/evaluate.py --config configs/segmenter/default.yaml --checkpoint segmenter_volseg_ep19.pth",
+    "val_metrics_at_checkpoint_epoch_19": {
+      "n_val": 250,
+      "val_loss": 0.0339,
+      "val_dice": 0.3909,
+      "val_iou": 0.3183
+    }
+  }
+}

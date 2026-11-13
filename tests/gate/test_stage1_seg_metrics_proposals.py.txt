@@ -1,0 +1,164 @@
+"""Parity tests for the vectorized ``extract_proposals`` against the
+legacy per-component-loop implementation.
+
+The vectorized path was introduced to fix the Arm 3 epoch-1 hang during
+the v0.6 sweep: the legacy implementation was O(N_components × N_voxels)
+because each iteration materialized a ``labeled == comp_id`` boolean
+mask and walked it via ``argwhere``, blowing up to hours on a 1M-voxel
+volume when an untrained pure-Mamba model thresholded into tens of
+thousands of tiny components. The vectorized path computes all
+centroids / voxel-counts / scores in a constant number of full-array
+passes via ``scipy.ndimage.center_of_mass`` and
+``scipy.ndimage.sum_labels``.
+
+These tests verify that the vectorized path returns the same
+``PatchProposal`` set as the legacy loop, within float tolerance on the
+per-component score. The score may differ at the last bit because
+``probs[mask].mean()`` (legacy) and ``sum(probs[mask]) / len(probs[mask])``
+(vectorized via ``sum_labels``) are not bit-identical in IEEE 754
+floating point, but they match well within ``np.testing.assert_allclose``
+default ``rtol=1e-7`` tolerance.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import torch
+
+from localizer.gate.metrics import (
+    extract_proposals, extract_proposals_legacy,
+)
+
+
+def _logits_with_clusters(
+    shape: tuple[int, int, int], cluster_centers: list[tuple[int, int, int]],
+    cluster_radius: int = 1, peak_logit: float = 5.0, bg_logit: float = -5.0,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Build a synthetic logits tensor ``(1, T, H, W)`` with planted
+    positive clusters at the specified centers.
+
+    Each cluster is a small ball of radius ``cluster_radius`` voxels
+    around its center, set to ``peak_logit``; everything else is at
+    ``bg_logit`` plus tiny noise so the threshold cleanly separates
+    positives from negatives. Designed so the resulting proposal list
+    has exactly ``len(cluster_centers)`` components with known
+    locations.
+    """
+    rng = np.random.default_rng(seed)
+    T, H, W = shape
+    arr = np.full(shape, bg_logit, dtype=np.float32)
+    arr += rng.normal(0, 0.1, size=shape).astype(np.float32)
+    for (t_c, h_c, w_c) in cluster_centers:
+        for dt in range(-cluster_radius, cluster_radius + 1):
+            for dh in range(-cluster_radius, cluster_radius + 1):
+                for dw in range(-cluster_radius, cluster_radius + 1):
+                    t, h, w = t_c + dt, h_c + dh, w_c + dw
+                    if 0 <= t < T and 0 <= h < H and 0 <= w < W:
+                        arr[t, h, w] = peak_logit
+    return torch.from_numpy(arr).unsqueeze(0)  # (1, T, H, W)
+
+
+def _sorted_proposal_tuples(proposals):
+    """Convert proposal list to a sortable list of plain tuples for
+    comparison. Sort key is (h_centroid, w_centroid, voxel_count)."""
+    return sorted(
+        [
+            (
+                round(p.centroid_hw[0], 4),
+                round(p.centroid_hw[1], 4),
+                p.component_voxel_count,
+                p.patch_bounds_hw,
+                p.score,
+            )
+            for p in proposals
+        ],
+        key=lambda t: (t[0], t[1], t[2]),
+    )
+
+
+def test_parity_three_well_separated_clusters():
+    """With 3 well-separated planted clusters, both paths produce the
+    same proposal set in the same order (by score)."""
+    logits = _logits_with_clusters(
+        shape=(16, 32, 32),
+        cluster_centers=[(2, 4, 4), (8, 16, 16), (12, 24, 28)],
+        cluster_radius=1, seed=0,
+    )
+    new_props = extract_proposals(logits)
+    old_props = extract_proposals_legacy(logits)
+    assert len(new_props) == 3, f"expected 3 components, got {len(new_props)}"
+    assert len(new_props) == len(old_props)
+    new_tuples = _sorted_proposal_tuples(new_props)
+    old_tuples = _sorted_proposal_tuples(old_props)
+    for n, o in zip(new_tuples, old_tuples):
+        # centroid_hw + voxel_count + patch_bounds_hw must match exactly:
+        assert n[:4] == o[:4], f"mismatch on non-score fields: {n[:4]} vs {o[:4]}"
+        # score: tolerate float-roundoff differences:
+        np.testing.assert_allclose(n[4], o[4], rtol=1e-6, atol=1e-7)
+
+
+def test_parity_five_clusters_different_sizes():
+    """Five clusters at varying radii to exercise non-uniform component
+    sizes; both paths should still agree."""
+    logits = _logits_with_clusters(
+        shape=(32, 64, 64),
+        cluster_centers=[
+            (4, 8, 8), (10, 20, 30), (16, 48, 16), (20, 32, 48), (28, 56, 56),
+        ],
+        cluster_radius=2, seed=42,
+    )
+    new_props = extract_proposals(logits)
+    old_props = extract_proposals_legacy(logits)
+    assert len(new_props) >= 5  # may be more if any clusters merge by 26-conn
+    assert len(new_props) == len(old_props)
+    new_tuples = _sorted_proposal_tuples(new_props)
+    old_tuples = _sorted_proposal_tuples(old_props)
+    for n, o in zip(new_tuples, old_tuples):
+        assert n[:4] == o[:4]
+        np.testing.assert_allclose(n[4], o[4], rtol=1e-6, atol=1e-7)
+
+
+def test_empty_thresholded_output():
+    """All-negative logits produce an empty proposal list on both paths."""
+    logits = torch.full((1, 8, 16, 16), -10.0, dtype=torch.float32)
+    new_props = extract_proposals(logits)
+    old_props = extract_proposals_legacy(logits)
+    assert new_props == []
+    assert old_props == []
+
+
+def test_single_global_positive():
+    """All-positive logits produce one giant component on both paths."""
+    logits = torch.full((1, 4, 8, 8), 10.0, dtype=torch.float32)
+    new_props = extract_proposals(logits)
+    old_props = extract_proposals_legacy(logits)
+    assert len(new_props) == 1
+    assert len(old_props) == 1
+    assert new_props[0].component_voxel_count == 4 * 8 * 8
+    assert old_props[0].component_voxel_count == 4 * 8 * 8
+    # Score should be sigmoid(10) ≈ 0.99995 for both:
+    np.testing.assert_allclose(new_props[0].score, old_props[0].score, rtol=1e-6)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_parity_under_random_noise(seed):
+    """Random low-amplitude noise logits — components are tiny and many;
+    this is the exact pathology shape Arm 3's epoch-1 output had."""
+    rng = np.random.default_rng(seed)
+    arr = rng.normal(0, 0.3, size=(8, 16, 16)).astype(np.float32)
+    logits = torch.from_numpy(arr).unsqueeze(0)
+    new_props = extract_proposals(logits)
+    old_props = extract_proposals_legacy(logits)
+    assert len(new_props) == len(old_props), (
+        f"seed={seed}: counts differ "
+        f"({len(new_props)} new vs {len(old_props)} old)"
+    )
+    new_tuples = _sorted_proposal_tuples(new_props)
+    old_tuples = _sorted_proposal_tuples(old_props)
+    for n, o in zip(new_tuples, old_tuples):
+        assert n[:4] == o[:4], (
+            f"seed={seed}: non-score fields differ {n[:4]} vs {o[:4]}"
+        )
+        np.testing.assert_allclose(n[4], o[4], rtol=1e-5, atol=1e-7)

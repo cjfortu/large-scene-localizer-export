@@ -1,0 +1,193 @@
+"""v0.9 §7.1 multi-target hit accounting tests.
+
+Verifies the per-target centroid extraction (``_target_centroids_hw``)
+and ``DetectionEpochAccumulator`` per-target hit accounting against
+the v0.9 design table (§7.1 (i)-(vi) plus the connectivity-choice
+behavior).
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+_ROOT = Path(__file__).resolve().parents[2]
+
+from localizer.gate.metrics import (  # noqa: E402
+    DetectionEpochAccumulator, PatchProposal,
+    _target_centroid_hw, _target_centroids_hw,
+    extract_proposals,
+)
+
+
+def _make_logit_volume(prob_at: list[tuple[int, int, int]],
+                      shape=(1, 64, 128, 128),
+                      hot_prob: float = 0.9,
+                      cold_prob: float = 0.01) -> torch.Tensor:
+    """Build a logits volume so that sigmoid(logits) hits ``hot_prob``
+    at the given (t, h, w) voxels and ``cold_prob`` elsewhere."""
+    probs = torch.full(shape, cold_prob)
+    for t, h, w in prob_at:
+        probs[0, t, h, w] = hot_prob
+    return torch.log(probs / (1.0 - probs))
+
+
+def _make_mask(targets: list[tuple[int, int, int, int]],
+               shape=(1, 64, 128, 128)) -> torch.Tensor:
+    """Build a binary mask with one 2x2x... target per spec.
+    targets entry = (t_lo, t_hi, h_center, w_center) — a 2x2 footprint
+    at (h_center-h_center+2, w_center-w_center+2) over [t_lo, t_hi).
+    """
+    mask = torch.zeros(shape)
+    for (t_lo, t_hi, hc, wc) in targets:
+        mask[0, t_lo:t_hi, hc:hc + 2, wc:wc + 2] = 1.0
+    return mask
+
+
+# ---------- _target_centroids_hw structural tests ----------
+
+def test_centroid_single_target_matches_legacy():
+    """Single-target centroid equals the legacy single-centroid value."""
+    mask = _make_mask([(10, 20, 5, 5)])
+    c_legacy = _target_centroid_hw(mask)
+    c_multi = _target_centroids_hw(mask)
+    assert len(c_multi) == 1
+    assert pytest.approx(c_multi[0][0], abs=1e-6) == c_legacy[0]
+    assert pytest.approx(c_multi[0][1], abs=1e-6) == c_legacy[1]
+
+
+def test_centroid_absent_returns_empty():
+    """Absent mask returns empty list (not None)."""
+    mask = torch.zeros(1, 64, 128, 128)
+    assert _target_centroids_hw(mask) == []
+
+
+def test_centroid_multi_targets_separated_returns_n_components():
+    """Three well-separated targets → 3 components."""
+    mask = _make_mask([
+        (10, 20, 2, 2),
+        (10, 20, 50, 50),
+        (10, 20, 100, 100),
+    ])
+    centroids = _target_centroids_hw(mask)
+    assert len(centroids) == 3
+    # Centroids cluster near each target's 2x2 center
+    hs = sorted(c[0] for c in centroids)
+    ws = sorted(c[1] for c in centroids)
+    assert pytest.approx(hs[0], abs=0.6) == 2.5
+    assert pytest.approx(hs[1], abs=0.6) == 50.5
+    assert pytest.approx(hs[2], abs=0.6) == 100.5
+
+
+def test_centroid_corner_touching_separated_under_6conn():
+    """Corner-touching 2x2 targets are 2 components under 6-connectivity.
+
+    v0.9 §7.1(vi) decision: corner-touching is separation (corner contact
+    is a pixel-quantization artifact, not meaningful target merging).
+    """
+    mask = torch.zeros(1, 8, 16, 16)
+    mask[0, 2:4, 2:4, 2:4] = 1.0
+    mask[0, 2:4, 4:6, 4:6] = 1.0  # corner-touches first at (3,3)/(4,4)
+    centroids = _target_centroids_hw(mask)
+    assert len(centroids) == 2
+
+
+def test_centroid_edge_touching_merged():
+    """Edge-touching 2x2 targets are 1 component (geometric, not connectivity)."""
+    mask = torch.zeros(1, 8, 16, 16)
+    mask[0, 2:4, 2:4, 2:4] = 1.0
+    mask[0, 2:4, 2:4, 4:6] = 1.0  # edge-touches first at the (2:4,3)/(2:4,4) edge
+    centroids = _target_centroids_hw(mask)
+    assert len(centroids) == 1
+
+
+# ---------- DetectionEpochAccumulator multi-target hit accounting ----------
+
+def _proposal_at(t, h, w, score=0.9, patch_h=128, patch_w=128, vox=10):
+    """Make a synthetic PatchProposal centered at (h, w) covering 128x128."""
+    h_lo = max(0, h - patch_h // 2)
+    w_lo = max(0, w - patch_w // 2)
+    return PatchProposal(
+        centroid_hw=(float(h), float(w)),
+        score=float(score),
+        patch_bounds_hw=(h_lo, h_lo + patch_h, w_lo, w_lo + patch_w),
+        component_voxel_count=vox,
+    )
+
+
+def test_acc_single_target_backward_compat():
+    """Single-target scene recall@K matches v0.8 semantics bit-identically."""
+    # Build a logit volume that produces exactly one high-prob voxel at (10, 50, 50)
+    logits = _make_logit_volume([(10, 50, 50)])
+    mask = _make_mask([(10, 20, 50, 50)])
+    acc = DetectionEpochAccumulator(ks=(1, 3, 5))
+    acc.update(logits.squeeze(0), mask.squeeze(0))
+    out = acc.summarize()
+    # 1 target / 1 hit per K (the proposal patch is 128x128 ≈ full image)
+    assert out["n_present"] == 1
+    assert out["recall@1"] == pytest.approx(1.0)
+    assert out["recall@3"] == pytest.approx(1.0)
+    assert out["recall@5"] == pytest.approx(1.0)
+
+
+def test_acc_two_targets_both_hit():
+    """Two well-separated targets, both covered by top-3 proposals → recall@3 = 1.0."""
+    # Build a logit volume with two hot voxels in well-separated regions.
+    # extract_proposals will produce two components, both with patches that
+    # contain the respective target.
+    logits = _make_logit_volume([
+        (10, 30, 30),
+        (10, 90, 90),
+    ])
+    # Target centroids near (30,30) and (90,90).
+    mask = _make_mask([
+        (10, 20, 30, 30),
+        (10, 20, 90, 90),
+    ])
+    acc = DetectionEpochAccumulator(ks=(1, 3, 5, 15))
+    acc.update(logits.squeeze(0), mask.squeeze(0))
+    out = acc.summarize()
+    # 2 targets, both hit by the 2 produced patches.
+    assert out["n_present"] == 1
+    assert out["recall@3"] == pytest.approx(1.0)
+    assert out["recall@15"] == pytest.approx(1.0)
+
+
+def test_acc_two_targets_zero_hit_absent_proposals():
+    """Two targets, model emits nothing → recall@K = 0."""
+    logits = torch.full((1, 64, 128, 128), -10.0)  # sigmoid ≈ 0
+    mask = _make_mask([(10, 20, 30, 30), (10, 20, 90, 90)])
+    acc = DetectionEpochAccumulator(ks=(1, 3, 5, 15))
+    acc.update(logits.squeeze(0), mask.squeeze(0))
+    out = acc.summarize()
+    assert out["n_present"] == 1
+    assert out["recall@3"] == pytest.approx(0.0)
+    assert out["recall@15"] == pytest.approx(0.0)
+
+
+def test_acc_absent_scene_no_recall_contribution():
+    """Absent scene increments n_absent and contributes no targets."""
+    logits = torch.full((1, 64, 128, 128), -10.0)
+    mask = torch.zeros(1, 64, 128, 128)
+    acc = DetectionEpochAccumulator(ks=(1, 3, 5))
+    acc.update(logits.squeeze(0), mask.squeeze(0))
+    out = acc.summarize()
+    assert out["n_absent"] == 1
+    assert out["n_present"] == 0
+    # No present scenes -> recall NaN (zero denominator).
+    assert np.isnan(out["recall@3"])
+
+
+def test_acc_recall_k15_present():
+    """K=15 is wired through the accumulator and computed correctly."""
+    logits = _make_logit_volume([(10, 30, 30)])
+    mask = _make_mask([(10, 20, 30, 30)])
+    acc = DetectionEpochAccumulator(ks=(1, 3, 5, 15))
+    acc.update(logits.squeeze(0), mask.squeeze(0))
+    out = acc.summarize()
+    assert "recall@15" in out
+    assert out["recall@15"] == pytest.approx(1.0)

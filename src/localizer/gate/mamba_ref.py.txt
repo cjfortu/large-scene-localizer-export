@@ -1,0 +1,333 @@
+"""Pure-PyTorch reference implementation of the Mamba (v1) selective-SSM block.
+
+Purpose
+-------
+Drop-in fallback for ``mamba_ssm.Mamba`` (``mamba_ssm/modules/mamba_simple.py``)
+on machines where the ``mamba_ssm`` CUDA extension is unavailable (Windows,
+CPU-only hosts). A checkpoint trained with the fused CUDA kernels loads into
+this module with ``load_state_dict(strict=True)`` and produces the same output
+up to floating-point reduction-order differences.
+
+Parity notes
+------------
+* Constructor signature, attribute names, submodule / parameter names and
+  shapes, parameter registration order and initialization scheme are copied
+  from ``mamba_simple.Mamba`` (mamba_ssm 2.3.1 and 2.3.2.post1 ship a
+  byte-identical ``mamba_simple.py`` and ``selective_scan_interface.py``).
+  Because the random draws happen in the same order, a module constructed
+  under the same torch seed has bitwise-identical parameters to the original.
+* The forward pass reproduces the fused CUDA path (``mamba_inner_fn``), which
+  is what runs at training time when ``causal_conv1d`` is installed:
+
+  1. ``xz = in_proj(hidden_states)``; split into ``x`` and ``z``.
+  2. Causal depthwise conv1d over time (left pad ``d_conv - 1``, keep the
+     first ``seqlen`` outputs), then SiLU. Computed in fp32, cast back.
+  3. ``x_dbl = x_proj(x)``; split into ``dt`` (``dt_rank``), ``B``, ``C``
+     (``d_state`` each).
+  4. ``delta = softplus(dt_proj.weight @ dt + dt_proj.bias)``. As in the CUDA
+     path, the matmul is done WITHOUT the bias in the compute dtype; the bias
+     is added afterwards in fp32 (``delta_bias``) before the softplus
+     (``delta_softplus=True``).
+  5. Sequential selective scan with fp32 state:
+     ``h_t = exp(delta_t * A) * h_{t-1} + delta_t * B_t * u_t``,
+     ``y_t = <h_t, C_t> + D * u_t``, with ``A = -exp(A_log)``.
+  6. Gating ``y * silu(z)`` (fp32), cast to the compute dtype, ``out_proj``.
+
+* Dtype policy: the "compute dtype" is the dtype of the ``in_proj`` output
+  (the autocast dtype under autocast, otherwise the input dtype). Projection
+  weights are cast to it, mirroring how ``MambaInnerFn`` casts
+  ``x_proj`` / ``dt_proj`` / ``out_proj`` weights to the autocast dtype. The
+  scan state, ``delta``, ``A``, ``B``, ``C``, ``D`` and the gating are fp32.
+* Inference-cache decoding (``inference_params``, ``step``,
+  ``allocate_inference_cache``) is intentionally not implemented.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any, Optional, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+__all__ = ["Mamba", "selective_scan_sequential"]
+
+
+def _autocast_active(device_type: str) -> bool:
+    """Report whether autocast is enabled for a device type.
+
+    Necessary because ``torch.is_autocast_enabled(device_type)`` only exists
+    in torch >= 2.4; older versions expose per-device query functions.
+
+    Args:
+        device_type: Device type string, e.g. ``"cuda"`` or ``"cpu"``.
+
+    Returns:
+        bool: True when autocast is active for ``device_type``.
+    """
+    try:
+        return bool(torch.is_autocast_enabled(device_type))
+    except TypeError:
+        if device_type == "cpu":
+            return bool(torch.is_autocast_cpu_enabled())
+        return bool(torch.is_autocast_enabled())
+
+
+def selective_scan_sequential(
+    u: torch.Tensor,
+    delta: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: Optional[torch.Tensor] = None,
+    z: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run the Mamba selective scan sequentially over time in fp32.
+
+    Necessary because the CUDA ``selective_scan_fn`` kernel is unavailable on
+    CPU. Semantics match ``mamba_ssm.ops.selective_scan_interface
+    .selective_scan_ref`` for real-valued ``A`` and input-dependent ``B``/``C``
+    with ``delta`` already biased and softplus-activated. Memory use is
+    ``O(batch * d_inner * d_state)`` for the state plus per-step temporaries
+    (the full ``(batch, L, d_inner, d_state)`` tensors are never built in the
+    forward pass).
+
+    Args:
+        u: Scan input (post-conv activations), shape ``(batch, L, d_inner)``,
+            any float dtype (promoted to fp32).
+        delta: Positive step sizes, shape ``(batch, L, d_inner)``, fp32.
+        A: Real state matrix (negative entries), shape ``(d_inner, d_state)``,
+            fp32.
+        B: Input-dependent input matrix, shape ``(batch, L, d_state)``.
+        C: Input-dependent output matrix, shape ``(batch, L, d_state)``.
+        D: Optional skip weights, shape ``(d_inner,)``.
+        z: Optional gate input, shape ``(batch, L, d_inner)``; when given the
+            output is multiplied by ``silu(z)`` (computed in fp32).
+
+    Returns:
+        torch.Tensor: Scan output, shape ``(batch, L, d_inner)``, fp32.
+    """
+    u = u.float()
+    delta = delta.float()
+    A = A.float()
+    B = B.float()
+    C = C.float()
+    batch, seqlen, d_inner = u.shape
+    d_state = A.shape[1]
+
+    h = u.new_zeros((batch, d_inner, d_state))
+    ys = []
+    for t in range(seqlen):
+        delta_t = delta[:, t, :].unsqueeze(-1)                    # (b, d, 1)
+        dA = torch.exp(delta_t * A)                                # (b, d, n)
+        dBu = delta_t * B[:, t, :].unsqueeze(1) * u[:, t, :].unsqueeze(-1)
+        h = dA * h + dBu                                           # (b, d, n)
+        ys.append(torch.einsum("bdn,bn->bd", h, C[:, t, :]))      # (b, d)
+    if seqlen > 0:
+        y = torch.stack(ys, dim=1)                                 # (b, L, d)
+    else:
+        y = u.new_zeros((batch, 0, d_inner))
+    if D is not None:
+        y = y + u * D.float()
+    if z is not None:
+        y = y * F.silu(z.float())
+    return y
+
+
+class Mamba(nn.Module):
+    """Pure-PyTorch Mamba v1 block, parameter-compatible with ``mamba_ssm.Mamba``.
+
+    Necessary so Stage 1 gate checkpoints that contain ``mamba_ssm.Mamba``
+    submodules can be loaded and run without the ``mamba_ssm`` CUDA kernels.
+    Submodules and parameters (``in_proj``, ``conv1d``, ``act``, ``x_proj``,
+    ``dt_proj``, ``A_log``, ``D``, ``out_proj``) have the same names, shapes
+    and registration order as the original, so ``state_dict`` keys match
+    exactly.
+
+    Args:
+        d_model: Model (token) width ``D``. Input/output last dimension.
+        d_state: SSM state size ``N``. Default 16.
+        d_conv: Depthwise causal-conv kernel width. Default 4.
+        expand: Inner-width expansion; ``d_inner = int(expand * d_model)``.
+            Default 2.
+        dt_rank: Rank of the ``dt`` projection, or ``"auto"`` for
+            ``ceil(d_model / 16)``. Default ``"auto"``.
+        dt_min: Lower bound of the initial ``softplus(dt_proj.bias)``.
+        dt_max: Upper bound of the initial ``softplus(dt_proj.bias)``.
+        dt_init: ``"random"`` (uniform in ``+-dt_init_std``) or ``"constant"``
+            initialization of ``dt_proj.weight``.
+        dt_scale: Multiplier on ``dt_init_std = dt_rank ** -0.5``.
+        dt_init_floor: Minimum initial ``dt`` before the inverse softplus.
+        conv_bias: Whether ``conv1d`` has a bias.
+        bias: Whether ``in_proj`` / ``out_proj`` have biases.
+        use_fast_path: Accepted for signature parity; ignored (there is no
+            fused path here). Stored as an attribute.
+        layer_idx: Accepted for signature parity (used by the original only
+            for inference caching). Stored as an attribute.
+        device: Optional device for parameter creation.
+        dtype: Optional dtype for the Linear / Conv1d parameters. ``A_log``
+            and ``D`` are always fp32, as in the original.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: Union[int, float] = 2,
+        dt_rank: Union[int, str] = "auto",
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dt_init: str = "random",
+        dt_scale: float = 1.0,
+        dt_init_floor: float = 1e-4,
+        conv_bias: bool = True,
+        bias: bool = False,
+        use_fast_path: bool = True,
+        layer_idx: Optional[int] = None,
+        device: Optional[Union[torch.device, str]] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        """Build the block; see the class docstring for argument meanings.
+
+        Returns:
+            None.
+        """
+        factory_kwargs: dict[str, Any] = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+        self.use_fast_path = use_fast_path
+        self.layer_idx = layer_idx
+
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,
+            **factory_kwargs,
+        )
+
+        self.activation = "silu"
+        self.act = nn.SiLU()
+
+        self.x_proj = nn.Linear(
+            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
+        )
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+
+        # dt projection init to preserve variance at initialization.
+        dt_init_std = self.dt_rank ** -0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(self.dt_proj.weight, dt_init_std)
+        elif dt_init == "random":
+            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        else:
+            raise NotImplementedError(f"dt_init={dt_init!r} is not supported")
+
+        # dt bias init so that softplus(dt_bias) is log-uniform in [dt_min, dt_max].
+        dt = torch.exp(
+            torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        # Inverse of softplus.
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        # Marks the bias so a global zero-bias re-init skips it (parity attribute).
+        self.dt_proj.bias._no_reinit = True  # type: ignore[attr-defined]
+
+        # S4D-real initialization: A[d, n] = n + 1; stored as log, kept in fp32.
+        A = (
+            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device)
+            .unsqueeze(0)
+            .expand(self.d_inner, self.d_state)
+            .contiguous()
+        )
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True  # type: ignore[attr-defined]
+
+        # D "skip" parameter, kept in fp32.
+        self.D = nn.Parameter(torch.ones(self.d_inner, device=device))
+        self.D._no_weight_decay = True  # type: ignore[attr-defined]
+
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        inference_params: Optional[Any] = None,
+    ) -> torch.Tensor:
+        """Apply the Mamba block (reference math of the fused CUDA path).
+
+        Args:
+            hidden_states: Input sequence, shape ``(batch, seqlen, d_model)``.
+            inference_params: Must be ``None``. Accepted only for signature
+                parity with ``mamba_ssm.Mamba.forward``; cached step-wise
+                decoding is not implemented and a non-``None`` value raises
+                ``NotImplementedError`` rather than silently computing
+                something different from the original.
+
+        Returns:
+            torch.Tensor: Output sequence, shape ``(batch, seqlen, d_model)``,
+            in the compute dtype (the input dtype, or the autocast dtype
+            when autocast is active).
+        """
+        if inference_params is not None:
+            raise NotImplementedError(
+                "localizer.gate.mamba_ref.Mamba does not implement inference_params "
+                "(cached decoding); call with inference_params=None."
+            )
+        batch, seqlen, _ = hidden_states.shape
+
+        # 1. Input projection. Weight cast lets fp32 weights take bf16/fp16 input.
+        w_in = self.in_proj.weight
+        if not _autocast_active(hidden_states.device.type):
+            w_in = w_in.to(hidden_states.dtype)
+        xz = F.linear(hidden_states, w_in)                        # (b, L, 2*d_inner)
+        if self.in_proj.bias is not None:
+            xz = xz + self.in_proj.bias.to(dtype=xz.dtype)
+        compute_dtype = xz.dtype
+        x, z = xz.chunk(2, dim=-1)                                 # (b, L, d_inner) each
+
+        # 2. Causal depthwise conv + SiLU, fp32 compute (as causal_conv1d does).
+        x_bdl = x.transpose(1, 2).float()                          # (b, d_inner, L)
+        conv_bias = self.conv1d.bias.float() if self.conv1d.bias is not None else None
+        x_bdl = F.conv1d(
+            x_bdl,
+            self.conv1d.weight.float(),
+            conv_bias,
+            padding=self.d_conv - 1,
+            groups=self.d_inner,
+        )[..., :seqlen]
+        x = self.act(x_bdl).to(compute_dtype).transpose(1, 2)      # (b, L, d_inner)
+
+        # 3. Input-dependent dt, B, C.
+        x_dbl = F.linear(x, self.x_proj.weight.to(compute_dtype))  # (b, L, R + 2N)
+        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+
+        # 4. delta = softplus(W_dt dt + b_dt): matmul without bias in the
+        #    compute dtype, bias added in fp32 (delta_bias, delta_softplus=True).
+        delta = F.linear(dt, self.dt_proj.weight.to(compute_dtype)).float()
+        delta = F.softplus(delta + self.dt_proj.bias.float())     # (b, L, d_inner)
+
+        # 5-6. Selective scan with D skip and silu(z) gating, fp32.
+        A = -torch.exp(self.A_log.float())                         # (d_inner, d_state)
+        y = selective_scan_sequential(x, delta, A, B, C, D=self.D.float(), z=z)
+        y = y.to(compute_dtype)
+
+        out_bias = self.out_proj.bias
+        return F.linear(
+            y,
+            self.out_proj.weight.to(compute_dtype),
+            out_bias.to(compute_dtype) if out_bias is not None else None,
+        )

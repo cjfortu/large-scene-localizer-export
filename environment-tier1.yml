@@ -1,0 +1,21 @@
+# Tier 1 (Linux x86-64 + CUDA 13.0, training) conda environment, stage 1 of 2.
+# This creates Python 3.11 with torch 2.12.0+cu130 and the kernel build tools
+# (requirements/cuda-linux-x86_64-build.txt, hash-checked). The fused Mamba
+# kernels are then compiled from source against that torch, which conda's pip
+# step cannot do in the same pass (it needs --no-build-isolation and torch
+# already installed). From the repository root, with the CUDA 13.0 toolkit
+# (nvcc) on PATH:
+#   conda env create -f environment-tier1.yml
+#   conda activate lsl-tier1
+#   MAMBA_FORCE_BUILD=TRUE CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
+#     python -m pip install --no-build-isolation -r requirements/cuda-linux-x86_64.txt
+#   python -m pip install -e . --no-deps
+# Details and the backend check: docs/environment.md, "Tier 1 from source".
+name: lsl-tier1
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r requirements/cuda-linux-x86_64-build.txt

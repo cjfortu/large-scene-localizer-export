@@ -1,0 +1,10 @@
+"""Gate -> classifier per-target(group) recall and loss decomposition (gate-miss vs classifier-reject).
+
+Thin wrapper around ``localizer.pipeline.per_target_recall.main``; same as the console
+command ``lsl-per-target-recall``. Run with ``--help`` for the arguments.
+"""
+
+from localizer.pipeline.per_target_recall import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

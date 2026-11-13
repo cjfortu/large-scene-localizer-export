@@ -1,0 +1,295 @@
+"""Build ``dataset_metadata.json`` for a multi-target swarm dataset.
+
+One builder for every ``grf_cluster`` multi-target swarm dataset (128^2,
+512^2 v2, 1024^2 v2). Geometry (image size, frame count, chip size) and
+generation parameters are read from the generator YAML passed with
+``--config``, so no per-resolution copy of this script is needed. It
+generalizes the earlier ``build_multi_target_swarm_128_metadata.py`` and
+``build_multi_target_swarm_1024_v2_metadata.py``.
+
+Checks performed before writing:
+
+* filename completeness and the parity rule (``idx % grf_absent_modulo ==
+  grf_absent_modulo - 1 -> absent``),
+* shape / dtype / size spot-checks on randomly chosen scenes,
+* optional spot-hash checks (``--spot_hash relpath=sha256prefix``),
+* realized target-count (N), non-empty-chip count (k) and chip-mask
+  contiguity statistics on a sample of present scenes,
+* optional distribution envelope assertions (``--envelope``) for datasets
+  whose spec defines one.
+
+Seeds: the generator seeds each worker batch with
+``np.random.default_rng(start_idx)`` of that batch, so the seed list is
+``range(0, total_scenes, batch_size)`` and is recorded in the output.
+
+Usage::
+
+    python scripts/build_multi_target_swarm_metadata.py \\
+        --config configs/data/multi_target_swarm_512_v2.yaml \\
+        --data_root <data root>/multi_target_swarm_512x512x64 \\
+        --dataset_name multi_target_swarm_512x512x64 --dataset_version v2 \\
+        --config_commit 60cc2bd --generator_commit 60cc2bd \\
+        --spot_hash data_all/vid0_1.npy=df49f98a56ff4b73
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import random
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import yaml
+
+CONTIGUITY_STRUCT = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
+# Distribution envelopes defined by dataset specs. Key = --envelope value.
+ENVELOPES: dict[str, dict[str, tuple[float, float]]] = {
+    # multi_target_swarm_128_dataset_spec.md section 6.1 / 7.6.
+    "multi_target_swarm_128": {
+        "mean": (4, 12), "p25": (3, 6), "p50": (5, 9), "p75": (8, 13),
+        "min": (1, float("inf")), "max": (-float("inf"), 30),
+    },
+}
+
+
+def _sha256(path: Path) -> str:
+    """Return the hex sha256 of a file.
+
+    Args:
+        path: File to hash.
+
+    Returns:
+        Hex digest string (64 chars).
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 22), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _realized_n_targets(mask: np.ndarray) -> int:
+    """Count realized targets on mask frame 0 under 8-connectivity.
+
+    Frame 0 is the placement frame; the ``grf_cluster`` sampler emits one
+    footprint per target there. Adjacent footprints merge, so this is a
+    lower bound on the true target count.
+
+    Args:
+        mask: Label mask, shape ``(T, H, W)``, uint8.
+
+    Returns:
+        Number of 8-connected components on frame 0.
+    """
+    from scipy.ndimage import label as ndi_label
+
+    f0 = mask[0] > 0
+    if not f0.any():
+        return 0
+    _, n = ndi_label(f0, structure=np.ones((3, 3), dtype=np.uint8))
+    return int(n)
+
+
+def _realized_k_and_contiguity(mask: np.ndarray, chip_size: int) -> tuple[int, int]:
+    """Return non-empty-chip count and chip-mask component count on frame 0.
+
+    Args:
+        mask: Label mask, shape ``(T, H, W)``, uint8.
+        chip_size: Chip edge length in pixels.
+
+    Returns:
+        ``(k_realized, n_chip_components)``: the number of chips holding at
+        least one mask pixel on frame 0, and the 4-connected component
+        count of the boolean chip mask.
+    """
+    from scipy.ndimage import label as ndi_label
+
+    f0 = mask[0]
+    n_side = f0.shape[0] // chip_size
+    if not (f0 > 0).any():
+        return 0, 0
+    chip_mask = np.zeros((n_side, n_side), dtype=bool)
+    rows, cols = np.nonzero(f0)
+    chip_mask[rows // chip_size, cols // chip_size] = True
+    _, n = ndi_label(chip_mask, structure=CONTIGUITY_STRUCT)
+    return int(chip_mask.sum()), int(n)
+
+
+def _summary(arr: np.ndarray, method_note: str) -> dict[str, Any]:
+    """Summarize an integer sample.
+
+    Args:
+        arr: 1-D integer array of per-scene values.
+        method_note: Human-readable description of how values were computed.
+
+    Returns:
+        Dict with sample size, min/max/mean/std and percentiles.
+    """
+    pct = {f"p{q}": float(np.percentile(arr, q)) for q in (10, 25, 50, 75, 90, 99)}
+    return {"sample_size": int(arr.size), "min": int(arr.min()), "max": int(arr.max()),
+            "mean": float(arr.mean()), "stdev": float(arr.std()), **pct,
+            "method_note": method_note}
+
+
+def main() -> None:
+    """Parse arguments, verify the dataset and write ``dataset_metadata.json``."""
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--config", required=True, type=Path, help="generator YAML")
+    p.add_argument("--data_root", required=True, type=Path)
+    p.add_argument("--dataset_name", required=True)
+    p.add_argument("--dataset_version", default=None)
+    p.add_argument("--spec", default=None, help="spec document path, if any")
+    p.add_argument("--spec_commit", default=None)
+    p.add_argument("--config_commit", required=True)
+    p.add_argument("--generator_commit", required=True)
+    p.add_argument("--generator_commit_inferred", action="store_true",
+                   help="mark generator_commit as inferred (no generation log)")
+    p.add_argument("--partition_json", default=None,
+                   help="JSON list describing per-node index partitions")
+    p.add_argument("--wall_seconds", type=int, default=None)
+    p.add_argument("--wall_seconds_note", default=None)
+    p.add_argument("--spot_hash", action="append", default=[],
+                   help="relpath=sha256prefix, repeatable; asserted")
+    p.add_argument("--envelope", choices=sorted(ENVELOPES), default=None)
+    p.add_argument("--notes", default=None)
+    p.add_argument("--target_count_sample_size", type=int, default=300)
+    p.add_argument("--spot_check_n", type=int, default=20)
+    p.add_argument("--out", type=Path, default=None,
+                   help="output path (default <data_root>/dataset_metadata.json)")
+    args = p.parse_args()
+
+    cfg = yaml.safe_load(args.config.read_text())
+    n_frames = int(cfg["n_frames"])
+    height, width = (int(v) for v in cfg["image_size"])
+    chip = int(cfg["chip_size"])
+    total = int(cfg["total_scenes"])
+    batch_size = int(cfg["batch_size"])
+    modulo = int(cfg["grf_absent_modulo"])
+    exp_absent = sum(1 for i in range(total) if i % modulo == modulo - 1)
+    exp_present = total - exp_absent
+
+    data_all, label_msk = args.data_root / "data_all", args.data_root / "label_msk"
+    assert data_all.is_dir() and label_msk.is_dir(), f"missing data_all/label_msk under {args.data_root}"
+    data_files = sorted(data_all.glob("vid*.npy"))
+    mask_files = sorted(label_msk.glob("vid*.npy"))
+    assert len(data_files) == total, f"expected {total} data files, got {len(data_files)}"
+    assert len(mask_files) == total, f"expected {total} mask files, got {len(mask_files)}"
+
+    present = absent = 0
+    seen = set()
+    for d in data_files:
+        idx_s, lab_s = d.stem[3:].split("_")
+        idx, lab = int(idx_s), int(lab_s)
+        seen.add(idx)
+        want = 0 if idx % modulo == modulo - 1 else 1
+        assert lab == want, f"parity mismatch {d.name}: label {lab}, expected {want}"
+        present += lab == 1
+        absent += lab == 0
+        assert (label_msk / f"{d.stem}_mask.npy").exists(), f"no mask for {d.name}"
+    assert seen == set(range(total)), "scene indices are not exactly 0..total-1"
+    assert (present, absent) == (exp_present, exp_absent), (present, absent)
+    print(f"parity verified: {present} present + {absent} absent")
+
+    rng = random.Random(0)
+    spot = sorted(rng.sample(range(total), min(args.spot_check_n, total)))
+    data_dtype = None
+    for idx in spot:
+        lab = 0 if idx % modulo == modulo - 1 else 1
+        for path in (data_all / f"vid{idx}_{lab}.npy", label_msk / f"vid{idx}_{lab}_mask.npy"):
+            arr = np.load(path, mmap_mode="r")
+            assert arr.shape == (n_frames, height, width), f"{path.name} shape {arr.shape}"
+            if path.parent == data_all:
+                data_dtype = data_dtype or str(arr.dtype)
+                assert str(arr.dtype) == data_dtype, f"{path.name} dtype {arr.dtype}"
+            else:
+                assert arr.dtype == np.uint8, f"{path.name} dtype {arr.dtype}"
+    print(f"shape/dtype spot-checks passed on {len(spot)} scenes (data dtype {data_dtype})")
+
+    spot_hashes = {}
+    for item in args.spot_hash:
+        rel, want = item.split("=", 1)
+        got = _sha256(args.data_root / rel)
+        assert got.startswith(want), f"spot hash mismatch {rel}: {got[:16]} != {want}"
+        spot_hashes[rel] = got
+    if spot_hashes:
+        print(f"spot hashes verified: {len(spot_hashes)}")
+
+    present_masks = [m for m in mask_files if m.name.endswith("_1_mask.npy")]
+    sample = rng.sample(present_masks, min(args.target_count_sample_size, len(present_masks)))
+    n_l, k_l, c_l = [], [], []
+    for i, mp in enumerate(sample):
+        mask = np.load(mp)
+        n_l.append(_realized_n_targets(mask))
+        k, c = _realized_k_and_contiguity(mask, chip)
+        k_l.append(k)
+        c_l.append(c)
+        if (i + 1) % 50 == 0:
+            print(f"  processed {i + 1}/{len(sample)}")
+    n_arr, k_arr, c_arr = (np.asarray(x, dtype=np.int64) for x in (n_l, k_l, c_l))
+    n_sum = _summary(n_arr, "8-connected components on mask frame 0; lower bound "
+                            "(adjacent footprints merge).")
+    print(f"realized N: {json.dumps({k: v for k, v in n_sum.items() if k != 'method_note'})}")
+
+    if args.envelope:
+        env = ENVELOPES[args.envelope]
+        vals = {"mean": n_sum["mean"], "p25": n_sum["p25"], "p50": n_sum["p50"],
+                "p75": n_sum["p75"], "min": n_sum["min"], "max": n_sum["max"]}
+        for key, (lo, hi) in env.items():
+            assert lo <= vals[key] <= hi, f"envelope {key}={vals[key]} not in [{lo}, {hi}]"
+        print(f"envelope '{args.envelope}' assertions passed")
+
+    gen_keys = ["n_frames", "image_size", "shape", "square_edge", "radius", "speeds",
+                "samedir", "n_circles", "target_sampler", "chip_size", "grf_fraction_range",
+                "grf_fraction_beta", "grf_corr_length", "grf_jitter", "grf_count_range",
+                "grf_count_noise_sigma", "grf_absent_modulo", "total_scenes", "batch_size",
+                "num_workers"]
+    metadata: dict[str, Any] = {
+        "dataset_name": args.dataset_name,
+        "dataset_version": args.dataset_version,
+        "spec_doc": args.spec,
+        "spec_commit": args.spec_commit,
+        "yaml_config": str(args.config),
+        "yaml_sha256": _sha256(args.config),
+        "config_commit": args.config_commit,
+        "generator_commit": args.generator_commit,
+        "generator_commit_inferred": bool(args.generator_commit_inferred),
+        "yaml_config_resolved": {k: cfg[k] for k in gen_keys if k in cfg},
+        "total_scenes": total,
+        "present_absent_split": {"present_count": int(present), "absent_count": int(absent),
+                                 "parity_rule": f"idx % {modulo} == {modulo - 1} -> absent"},
+        "seed_scheme": {"rule": "np.random.default_rng(start_idx) per generator batch",
+                        "batch_size": batch_size,
+                        "seeds": list(range(0, total, batch_size))},
+        "data_dtype": data_dtype,
+        "per_partition_layout": json.loads(args.partition_json) if args.partition_json else None,
+        "wall_seconds_total": args.wall_seconds,
+        "wall_seconds_note": args.wall_seconds_note,
+        "spot_hashes_sha256": spot_hashes,
+        "train_val_split": {"scheme": "make_dataloaders: sklearn train_test_split",
+                            "val_split_default": 0.1, "val_split_seed_default": 0,
+                            "stratified_by_label": False},
+        "realized_n_summary": n_sum,
+        "realized_k_summary": _summary(k_arr, f"distinct {chip}x{chip} chips with >=1 mask "
+                                              "pixel on frame 0."),
+        "cluster_contiguity": {"sample_size": int(c_arr.size),
+                               "median_components": int(np.median(c_arr)),
+                               "mean_components": float(c_arr.mean()),
+                               "max_components": int(c_arr.max()),
+                               "method_note": "4-connected components of the frame-0 chip mask."},
+        "envelope_checked": args.envelope,
+        "notes": args.notes,
+        "builder": "scripts/build_multi_target_swarm_metadata.py",
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    out = args.out or (args.data_root / "dataset_metadata.json")
+    out.write_text(json.dumps(metadata, indent=2) + "\n")
+    print(f"wrote {out}")
+
+
+if __name__ == "__main__":
+    main()

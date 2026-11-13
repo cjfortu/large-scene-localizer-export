@@ -1,0 +1,61 @@
+# Stage 1 v0.10 -- Absent-Side Stabilization Ablation (512 sq).
+# Spec: documents/history/specs/stage1_v0_10_stabilization_ablation_spec.md (§4, §6).
+#
+# Three parallel arms, one per GB10 training node, single-variable chain:
+#   A  = Phase 2 settle50 recipe + §5 instrumentation (no stabilizer).
+#   B1 = A + weight EMA (use_ema true, decay 0.9999, start ep30).
+#   B2 = B1 + more aggressive settled-regime LR (scheduler_factor 0.25).
+# Everything else is identical across arms and to the Phase 2 base
+# (configs/gate/gatediag_512_base.yaml): v0_7 strided-stem hybrid,
+# stem2/bs1, fp32, low_res [2,4,4], the 512 sq GRF multi-target set,
+# pos_weight 180 (tppf 91 -> 16384/91), subset 3000, 50 epochs. Distinct
+# run_name per arm so the parallel runs do not collide.
+#
+# pos_weight: tppf 91 -> pw 180 is the empirical settle50 operating point
+# (grid winner; v0.9 §6.3 density derivation was 3-8x wrong). num_epochs 50
+# and tppf 91 are the settle50 overrides (the base's 18 / 512 are
+# placeholders). proposal_patch 64 = the 512 sq rung of the 1/8-of-field
+# schedule. cluster_chip_size 128 = the 512 sq coverage-recall chip.
+model_factory: "v0_7"
+arm: 2
+stem_stride: 2
+output_resolution: "low_res"
+checkpoint_criterion: "best_unsplit_dice"
+seed: 0
+nfeats: 32
+target_positive_pixels_per_frame: 91   # settle50 override (base 512 is a placeholder); pw = 16384/91 = 180
+lr: 1.0e-3
+weight_decay: 1.0e-2
+weight_decay_ssm: 0.0
+scheduler_factor: 0.5
+scheduler_patience: 10
+batch_size: 1
+num_epochs: 50   # settle50 override (base 18 is a placeholder)
+subset_size: 3000
+dataset: multi_target_swarm_512x512x64            # resolved under $LSL_DATA_ROOT
+val_split: 0.1
+val_split_seed: 0
+run_name: gate/A_stem2_bs1            # resolved under $LSL_RUNS_ROOT
+num_workers: 4
+
+low_res_pool: [2, 4, 4]
+detection_recall_ks: [1, 3, 5, 15]
+secondary_recall_k: 15
+
+# 512 sq rung patch = 64x64 (1/8 of 512).
+proposal_patch_h: 64
+proposal_patch_w: 64
+
+# Full-res chip size for val_cluster_recall (512 sq uses chip 128, 4x4 grid).
+cluster_chip_size: 128
+
+# Gate-aware checkpoint selection (settled epoch >= 30 with highest
+# cluster_recall holding abs_pos_frac <= 0.25; last_epoch also saved).
+gate_settle_min_epoch: 30
+gate_abs_frac_bar: 0.25
+
+# v0.10 stabilizers (stage1_v0_10 spec §4.2); see header for the per-arm
+# A/B1/B2 values. min_lr is a lower bound left at 0.0 (B2 lowers settled
+# LR via scheduler_factor, not min_lr).
+use_ema: false
+min_lr: 0.0

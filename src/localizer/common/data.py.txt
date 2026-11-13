@@ -1,0 +1,282 @@
+"""Segmentation dataset + dataloader builders (recovered from earlier Stage 2 work).
+
+Reads ``vid{idx}_{label}.npy`` and ``vid{idx}_{label}_mask.npy`` files
+produced by ``localizer.synth.swarm``.
+
+Per-sample output is a dict:
+    ``volume``: ``(1, T, H, W) = (1, 64, 128, 128)`` float32 in [0, 1]
+    ``mask``:   ``(1, T, H, W)`` float32 in [0, 1]
+    ``label``:  int (0 or 1, parsed from filename suffix)
+    ``file_name``: str
+
+Recovery note: the original Colab data setup involved ``!cp`` and ``!unzip``
+of ZIPs from Google Drive into ``/content/data``. That has been replaced
+with a direct directory listing — the data already lives at
+``{data_root}/{data_all,label_msk}/`` produced by the swarm generator.
+"""
+
+from __future__ import annotations
+
+import glob
+import logging
+import os
+import re
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+
+
+logger = logging.getLogger(__name__)
+_VID_IDX_RE = re.compile(r"vid(\d+)_[01]\.npy$")
+
+_VALID_OUTPUT_RESOLUTIONS = ("full", "low_res")
+_LOW_RES_POOL = (2, 4, 4)  # (T, H, W) max-pool factors for v0.6 §3.3 — default; v0.9 §5.2 parameterizes via MoverDataset(low_res_pool=...)
+
+# v0.8 soft-target supervision per design §3.2. CenterNet-style
+# peak-1 Gaussian kernel for heatmap supervision: the kernel is
+# normalized so the center value is 1.0 (NOT mass-preserving).
+# Default σ = 1.0 (the pure-Mamba arm's 3-voxel trilinear interp
+# effective radius / 3 per §3.2), kernel size 7 = 2 * ceil(3σ) + 1.
+_GAUSSIAN_SIGMA = 1.0
+_GAUSSIAN_KERNEL_SIZE = 7
+
+
+def _make_gaussian_kernel_3d(size: int, sigma: float) -> torch.Tensor:
+    """Build a peak-1 (NOT mass-preserving) 3D Gaussian kernel for the
+    v0.8 soft-target supervision per design §3.2.
+
+    The kernel's center value is 1.0; the kernel sum is roughly
+    ``(2 π σ²)^(3/2)`` for σ=1 ≈ 15.7. This is the CenterNet convention
+    for keypoint-heatmap supervision targets — BCE-with-logits should
+    drive σ(z) toward 1.0 at target centers, so the supervision target
+    value at each target cell must be 1.0. A mass-preserving (sum=1)
+    kernel would peak at ~0.06 and tell the model to emit σ(z)=0.06 at
+    target centers, which is backwards.
+
+    Args:
+        size: Odd integer kernel size in each dimension. Default 7
+            (= 2 * ceil(3σ) + 1 for σ=1, the 3σ truncation point).
+        sigma: Gaussian σ in voxel units. Default 1.0.
+
+    Returns:
+        A ``(1, 1, size, size, size)`` float32 tensor suitable for
+        ``F.conv3d`` against a ``(B, 1, T, H, W)`` mask volume. Peak
+        value at center is 1.0; sum is ``(2 π σ²)^(3/2) ≈ 15.7`` for
+        σ=1.0.
+    """
+    coords = torch.arange(size, dtype=torch.float32) - (size - 1) / 2.0
+    g1 = torch.exp(-coords ** 2 / (2 * sigma ** 2))   # peak 1 at center
+    kernel = g1[:, None, None] * g1[None, :, None] * g1[None, None, :]
+    # NOTE: kernel.max() == 1.0; kernel.sum() ≈ 15.7 for σ=1.
+    # Do NOT divide by kernel.sum().
+    return kernel.view(1, 1, size, size, size)
+
+
+_GAUSSIAN_KERNEL = _make_gaussian_kernel_3d(
+    _GAUSSIAN_KERNEL_SIZE, _GAUSSIAN_SIGMA,
+)
+
+
+def _vid_idx(basename: str) -> int:
+    m = _VID_IDX_RE.match(basename)
+    if m is None:
+        raise ValueError(f"Cannot parse vid index from filename: {basename}")
+    return int(m.group(1))
+
+
+class MoverDataset(Dataset):
+    """Volumetric segmentation dataset (target trajectory mask).
+
+    Args:
+        data_dir: Directory of ``vid{idx}_{label}.npy`` files.
+        label_dir: Directory of ``vid{idx}_{label}_mask.npy`` files.
+        file_list: List of file basenames (relative to data_dir).
+        output_resolution: ``"full"`` (default; v0/v0.5 contract — the
+            returned ``mask`` is the full-resolution
+            ``(1, 64, 128, 128)`` mask) or ``"low_res"`` (v0.6 Arms 2/4
+            contract — ``mask`` is the max-pooled ``(1, 32, 32, 32)``
+            mask and ``mask_full`` carries the original full-resolution
+            mask alongside it, for cross-arm full-resolution dice). See
+            stage1_v0_6_design.md §3.3 / §6.3.
+        soft_target: v0.8 §3.2 — when True (and ``output_resolution ==
+            "low_res"``), the returned ``"mask"`` key is the Gaussian-
+            convolved soft target (peak-1 σ=1.0 kernel, clipped to
+            [0, 1] for overlap regions); the new always-present
+            ``"mask_hard"`` key is the hard-binary low-res mask for
+            metric computation. Default False preserves v0.6/v0.7
+            bit-identity: ``"mask"`` is the hard low-res mask and
+            ``"mask_hard"`` is byte-identical to ``"mask"``.
+        low_res_pool: v0.9 §5.2 — (T, H, W) max-pool factors for the
+            ``output_resolution == "low_res"`` branch. Default
+            ``(2, 4, 4)`` preserves all v0.6/v0.7/v0.8 behavior
+            bit-identically. v0.9 M-supgrid uses ``(1, 2, 2)`` per
+            §2.3. Ignored when ``output_resolution == "full"``.
+    """
+
+    def __init__(
+        self,
+        data_dir: str | Path,
+        label_dir: str | Path,
+        file_list: list[str],
+        output_resolution: str = "full",
+        soft_target: bool = False,
+        low_res_pool: tuple[int, int, int] = _LOW_RES_POOL,
+    ) -> None:
+        if output_resolution not in _VALID_OUTPUT_RESOLUTIONS:
+            raise ValueError(
+                f"output_resolution must be one of "
+                f"{_VALID_OUTPUT_RESOLUTIONS}; got {output_resolution!r}"
+            )
+        if soft_target and output_resolution != "low_res":
+            raise ValueError(
+                "soft_target=True requires output_resolution='low_res' "
+                "(v0.8 soft-target supervision applies on the pooled mask)"
+            )
+        if len(low_res_pool) != 3 or any(int(p) <= 0 for p in low_res_pool):
+            raise ValueError(
+                f"low_res_pool must be a 3-tuple of positive ints (T, H, W); "
+                f"got {low_res_pool!r}"
+            )
+        self.data_dir = str(data_dir)
+        self.label_dir = str(label_dir)
+        self.file_list = list(file_list)
+        self.output_resolution = output_resolution
+        self.soft_target = soft_target
+        self.low_res_pool = tuple(int(p) for p in low_res_pool)
+
+    def __len__(self) -> int:
+        return len(self.file_list)
+
+    def __getitem__(self, idx: int) -> dict:
+        file_name = self.file_list[idx]
+        data_path = os.path.join(self.data_dir, file_name)
+        base, ext = os.path.splitext(file_name)
+        mask_file = base + "_mask" + ext
+        mask_path = os.path.join(self.label_dir, mask_file)
+        volume = np.load(data_path)
+        mask = np.load(mask_path)
+        volume = np.expand_dims(volume, axis=0).astype(np.float32)
+        volume /= 255.0
+        mask_full = np.expand_dims(mask, axis=0).astype(np.float32)
+        mask_full /= 255.0
+        label = np.float32(int(file_name.split("_")[-1][0]))
+        if self.output_resolution == "full":
+            return {
+                "volume": volume,
+                "mask": mask_full,
+                "file_name": file_name,
+                "label": label,
+            }
+        # low_res: max-pool the mask to (1, T/2, H/4, W/4) = (1, 32, 32, 32)
+        # and also return the original full-resolution mask alongside, so
+        # the trainer can compute cross-arm full-resolution dice.
+        mask_full_t = torch.from_numpy(mask_full)              # (1, T, H, W)
+        mask_lr_t = F.max_pool3d(
+            mask_full_t.unsqueeze(0),                          # (1, 1, T, H, W)
+            kernel_size=self.low_res_pool, stride=self.low_res_pool,
+        )[0]                                                   # (1, T/pt, H/ph, W/pw)
+        # v0.8 §3.2 — always carry the hard-binary low-res mask in
+        # "mask_hard" for dice/detection metric computation; "mask"
+        # is the loss target (soft if soft_target=True, hard otherwise).
+        mask_hard_t = mask_lr_t                                # (1, T/2, H/4, W/4); hard
+        if self.soft_target:
+            soft = F.conv3d(
+                mask_hard_t.unsqueeze(0),                      # (1, 1, T/2, H/4, W/4)
+                weight=_GAUSSIAN_KERNEL,
+                padding=_GAUSSIAN_KERNEL_SIZE // 2,
+            )[0]                                                # (1, T/2, H/4, W/4)
+            mask_lr_t = soft.clamp(0.0, 1.0)                    # CRITICAL: clip overlap
+        return {
+            "volume": volume,
+            "mask": mask_lr_t.numpy(),                          # loss target (soft|hard)
+            "mask_hard": mask_hard_t.numpy(),                   # always hard for metrics
+            "mask_full": mask_full,
+            "file_name": file_name,
+            "label": label,
+        }
+
+
+def setup_output_dirs(output_root: str | Path) -> Path:
+    """Create the segmenter output directory tree under ``output_root``."""
+    out = Path(output_root)
+    (out / "models").mkdir(parents=True, exist_ok=True)
+    (out / "generated_files" / "pred_NPYs").mkdir(parents=True, exist_ok=True)
+    (out / "generated_files" / "input_GIFs").mkdir(parents=True, exist_ok=True)
+    (out / "generated_files" / "truth_vs_pred_GIFs").mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def make_dataloaders(
+    data_root: str | Path,
+    subset_size: int,
+    batch_size: int,
+    num_workers: int = 4,
+    val_split: float = 0.1,
+    val_split_seed: int = 0,
+    output_resolution: str = "full",
+    soft_target: bool = False,
+    low_res_pool: tuple[int, int, int] = _LOW_RES_POOL,
+) -> tuple[DataLoader, DataLoader, tuple]:
+    """Build train + val DataLoaders over ``data_root/{data_all,label_msk}``.
+
+    Args:
+        data_root: Directory containing ``data_all/`` and ``label_msk/``.
+        subset_size: Use only the first N files from the sorted listing.
+        batch_size: Batch size for both loaders.
+        num_workers: DataLoader workers.
+        val_split: Fraction held out for validation.
+        val_split_seed: ``random_state`` for ``train_test_split``.
+        output_resolution: ``"full"`` (default, v0/v0.5) or ``"low_res"``
+            (v0.6 Arms 2/4). See ``MoverDataset`` docstring.
+        soft_target: v0.8 §3.2 — when True, the returned ``"mask"`` key
+            is a Gaussian-soft target (low_res only); ``"mask_hard"``
+            carries the hard-binary mask for metrics. Default False
+            preserves v0.6/v0.7 behavior.
+        low_res_pool: v0.9 §5.2 — (T, H, W) max-pool factors for the
+            low-res branch. Default ``(2, 4, 4)`` preserves
+            v0.6/v0.7/v0.8 behavior. v0.9 M-supgrid uses ``(1, 2, 2)``.
+
+    Returns:
+        ``(train_loader, val_loader, datshape)`` where datshape is the shape
+        of one ``volume`` tensor from the train dataset (e.g. ``(1, 64, 128, 128)``).
+    """
+    data_dir = Path(data_root) / "data_all"
+    label_dir = Path(data_root) / "label_msk"
+
+    file_list = sorted(
+        [os.path.basename(f) for f in glob.glob(os.path.join(str(data_dir), "vid*.npy"))],
+        key=_vid_idx,
+    )
+    logger.info("Found %d samples in %s", len(file_list), data_dir)
+    if subset_size > len(file_list):
+        logger.warning(
+            "subset_size=%d larger than available %d; using all available",
+            subset_size, len(file_list),
+        )
+        subset_size = len(file_list)
+    train_files, val_files = train_test_split(
+        file_list[:subset_size], test_size=val_split, random_state=val_split_seed,
+    )
+
+    train_dataset = MoverDataset(
+        data_dir, label_dir, train_files,
+        output_resolution=output_resolution, soft_target=soft_target,
+        low_res_pool=low_res_pool,
+    )
+    val_dataset = MoverDataset(
+        data_dir, label_dir, val_files,
+        output_resolution=output_resolution, soft_target=soft_target,
+        low_res_pool=low_res_pool,
+    )
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+    )
+    datshape = tuple(train_dataset[0]["volume"].shape)
+    return train_loader, val_loader, datshape

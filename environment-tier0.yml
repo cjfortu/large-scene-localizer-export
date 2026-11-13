@@ -1,0 +1,13 @@
+# Tier 0 (CPU-only, import-safe) conda environment.
+# Create from the repository root:  conda env create -f environment-tier0.yml
+# Pins live in requirements/base.txt (see its header); torch 2.12.0+cpu,
+# the same torch release as Tier 1.
+name: lsl-tier0
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r requirements/base.txt
+      - -e .

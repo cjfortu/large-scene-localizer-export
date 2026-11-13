@@ -1,0 +1,73 @@
+"""Tests for ``localizer.common.checkpoint_io`` (safetensors / .pth loading)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import torch
+
+from localizer.common.checkpoint_io import (
+    load_state_dict,
+    load_weights,
+    resolve_weights,
+    save_safetensors,
+)
+
+
+def _model() -> torch.nn.Module:
+    """Small module with float weights and an int64 buffer (BatchNorm)."""
+    torch.manual_seed(0)
+    return torch.nn.Sequential(torch.nn.Conv3d(1, 4, 3), torch.nn.BatchNorm3d(4), torch.nn.Linear(4, 2))
+
+
+def _assert_same(a: dict, b: dict) -> None:
+    """Same names, dtypes, shapes and values."""
+    assert set(a) == set(b)
+    for k in a:
+        assert a[k].dtype == b[k].dtype and a[k].shape == b[k].shape
+        assert torch.equal(a[k], b[k]), k
+
+
+def test_round_trip_is_exact(tmp_path: Path) -> None:
+    """save_safetensors then load_state_dict gives back every tensor exactly."""
+    sd = _model().state_dict()
+    out = save_safetensors(sd, tmp_path / "m.safetensors")
+    _assert_same(sd, load_state_dict(out))
+
+
+def test_safetensors_preferred_over_pth(tmp_path: Path) -> None:
+    """With both files present, a .pth name resolves to the .safetensors file."""
+    sd = _model().state_dict()
+    torch.save({k: torch.zeros_like(v) for k, v in sd.items()}, tmp_path / "m.pth")
+    save_safetensors(sd, tmp_path / "m.safetensors")
+    assert resolve_weights(tmp_path / "m.pth").suffix == ".safetensors"
+    assert resolve_weights(tmp_path / "m").suffix == ".safetensors"
+    _assert_same(sd, load_state_dict(tmp_path / "m.pth"))
+
+
+def test_pth_only_and_wrapped(tmp_path: Path) -> None:
+    """A lone .pth loads (by any suffix), and {"state_dict": ...} is unwrapped."""
+    sd = _model().state_dict()
+    torch.save({"state_dict": sd}, tmp_path / "w.pt")
+    assert resolve_weights(tmp_path / "w.safetensors").name == "w.pt"
+    _assert_same(sd, load_state_dict(tmp_path / "w.safetensors"))
+
+
+def test_load_weights_strict(tmp_path: Path) -> None:
+    """load_weights fills a fresh module so its outputs equal the source's."""
+    src = _model().eval()
+    save_safetensors(src.state_dict(), tmp_path / "m.safetensors")
+    dst = load_weights(torch.nn.Sequential(torch.nn.Conv3d(1, 4, 3), torch.nn.BatchNorm3d(4),
+                                           torch.nn.Linear(4, 2)), tmp_path / "m.safetensors").eval()
+    x = torch.randn(1, 1, 3, 3, 6)
+    with torch.no_grad():
+        assert torch.equal(src(x), dst(x))
+
+
+def test_missing_and_bad_suffix(tmp_path: Path) -> None:
+    """A missing file names the candidates; save rejects a non-.safetensors path."""
+    with pytest.raises(FileNotFoundError, match="nope.safetensors"):
+        resolve_weights(tmp_path / "nope.pth")
+    with pytest.raises(ValueError):
+        save_safetensors({"a": torch.zeros(1)}, tmp_path / "x.pth")

@@ -1,0 +1,110 @@
+"""End-to-end CLI contract: GIF subdirectories are siblings; MoverDataset is unaffected.
+
+Runs the generate_swarm_data.py CLI on a small-scale config and asserts:
+- both data_all/ + label_msk/ and data_all_gif/ + label_msk_gif/ exist
+- file counts are correct
+- MoverDataset constructed from data_all/ + label_msk/ picks up exactly
+  the .npy files (not the .gif files)
+- each sample loads with the expected shapes/dtypes/value sets
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import yaml
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_gif_separation_and_dataset_compat(tmp_path: Path) -> None:
+    """End-to-end CLI: GIFs as siblings; MoverDataset only sees .npys."""
+    cfg = {
+        "n_frames": 8,
+        "image_size": [32, 32],
+        "shape": "square",
+        "square_edge": 2,
+        "radius": 2,
+        "speeds": [0.25],
+        "n_circles": 100,
+        "samedir": True,
+        "total_scenes": 10,
+        "save_gifs": True,
+        "fps": 10,
+        "batch_size": 10,
+        "num_workers": 1,
+        "output_root": str(tmp_path / "out"),
+    }
+    cfg_path = tmp_path / "test_cfg.yaml"
+    with open(cfg_path, "w") as f:
+        yaml.safe_dump(cfg, f)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/data/generate.py",
+            "--config",
+            str(cfg_path),
+        ],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"CLI failed: {result.stderr}"
+
+    out = tmp_path / "out"
+    assert (out / "data_all").is_dir()
+    assert (out / "label_msk").is_dir()
+    assert (out / "data_all_gif").is_dir()
+    assert (out / "label_msk_gif").is_dir()
+
+    npy_data = list((out / "data_all").glob("vid*.npy"))
+    npy_mask = list((out / "label_msk").glob("vid*_mask.npy"))
+    gif_data = list((out / "data_all_gif").glob("vid*.gif"))
+    gif_mask = list((out / "label_msk_gif").glob("vid*_mask.gif"))
+
+    assert len(npy_data) == 10, f"data_all: {len(npy_data)} != 10"
+    assert len(npy_mask) == 10, f"label_msk: {len(npy_mask)} != 10"
+    assert len(gif_data) == 10, f"data_all_gif: {len(gif_data)} != 10"
+    assert len(gif_mask) == 10, f"label_msk_gif: {len(gif_mask)} != 10"
+
+    # MoverDataset compatibility: vid*.npy glob picks only the .npy files.
+    from localizer.common.data import (  # noqa: E402
+        MoverDataset,
+        _vid_idx,
+        make_dataloaders,
+    )
+
+    data_all = out / "data_all"
+    label_msk = out / "label_msk"
+    file_list = sorted(
+        [
+            os.path.basename(f)
+            for f in glob.glob(str(data_all / "vid*.npy"))
+        ],
+        key=_vid_idx,
+    )
+    assert len(file_list) == 10, f"file_list: {len(file_list)} != 10"
+
+    ds = MoverDataset(data_all, label_msk, file_list)
+    for sample in ds:
+        assert sample["volume"].shape == (1, 8, 32, 32)
+        assert sample["mask"].shape == (1, 8, 32, 32)
+        assert sample["volume"].dtype == np.float32
+        assert sample["mask"].dtype == np.float32
+        assert set(np.unique(sample["volume"])).issubset({0.0, 1.0})
+        assert set(np.unique(sample["mask"])).issubset({0.0, 1.0})
+        assert sample["label"] in (0.0, 1.0)
+
+    train_loader, val_loader, datshape = make_dataloaders(
+        out, subset_size=10, batch_size=2, num_workers=0, val_split=0.2,
+    )
+    train_batch = next(iter(train_loader))
+    assert train_batch["volume"].shape[1:] == (1, 8, 32, 32)
+    val_batch = next(iter(val_loader))
+    assert val_batch["volume"].shape[1:] == (1, 8, 32, 32)

@@ -1,0 +1,1000 @@
+"""Synthetic swarm-video generator (recovered from earlier Stage 2 work).
+
+Generates 128x128x64 grayscale videos with a swarm of ~10000 identical small
+moving disks. Even-indexed scenes contain an anomalous "target" mover with
+either a different direction or speed from the background swarm; odd-indexed
+scenes contain only the swarm (no target). Per-target trajectory masks are
+written for the target scenes; the mask is all-zeros for non-target scenes.
+
+This is adapted from the original engineer's ``data_generation_worker.py``:
+- Colab-specific path conventions removed; output paths injected via the
+  ``dat_lab_paths`` constructor argument.
+- Legacy ``np.random.seed(i)`` replaced with per-call ``numpy.random.Generator``
+  instances; the worker function wires a fresh ``np.random.default_rng(seed)``
+  through to ``DataGenerator``, which threads it through ``_create_centers``,
+  ``_set_vels``, and ``_set_spds``.
+- ``print`` replaced with ``logging``; module-level logger configured by the
+  CLI entry point (``main`` below; ``scripts/data/generate.py``).
+- GIF generation made opt-in via ``save_gifs`` flag on the worker call (the
+  original always saved GIFs).
+
+Outputs:
+  ``{output_root}/data_all/vid{idx}_{label}.npy``         (T, H, W) uint8
+  ``{output_root}/label_msk/vid{idx}_{label}_mask.npy``   (T, H, W) uint8
+  ``{output_root}/data_all_gif/vid{idx}_{label}.gif``     (if save_gifs)
+  ``{output_root}/label_msk_gif/vid{idx}_{label}_mask.gif`` (if save_gifs)
+
+where ``label`` is 1 for target-present and 0 for target-absent scenes. The
+parity rule varies by ``target_sampler``: ``single``/``chip_aware`` use
+``idx % 2 == 0 -> present``; ``grf_cluster`` uses
+``idx % grf_absent_modulo == grf_absent_modulo - 1 -> absent`` (production
+modulus 4 -> 25% absent).
+"""
+
+from __future__ import annotations
+
+import argparse
+from multiprocessing import Pool
+
+import yaml
+
+import gc
+import logging
+from collections import deque
+from pathlib import Path
+from typing import List, Tuple
+
+import imageio.v3 as iio
+import numpy as np
+
+
+logger = logging.getLogger(__name__)
+
+
+class DataGenerator:
+    """Numpy-based synthetic swarm-video generator.
+
+    Args:
+        n_frames: Number of frames per video.
+        n_circles: Number of disks per frame (background swarm).
+        image_size: ``(H, W)`` spatial dims.
+        radius: Disk pixel radius.
+        speeds: Allowed per-frame pixel speeds.
+        dat_lab_paths: ``[data_all_path, label_msk_path]`` -- output dirs for
+            ``.npy`` files; created if missing.
+        samedir: If True, target and background may share direction (forcing
+            a speed difference); if False, target always has a different
+            direction.
+        shape: 'disk' or 'square'. Production uses 'square' with
+            ``square_edge=2`` at all scales after v0.
+        square_edge: Edge length of square targets/swarm members in pixels.
+        target_sampler: 'single' (one target per scene, v0/v0.5/v0.6),
+            'chip_aware' (multi-target uniform-without-replacement chip
+            selection, v1), or 'grf_cluster' (multi-target GRF-clustered
+            chip selection, v2).
+        chip_size: Chip side length in pixels for 'chip_aware' and
+            'grf_cluster' samplers.
+        chip_nonempty_range: 'chip_aware' only -- (k_lo, k_hi) inclusive
+            range for the per-scene uniform-integer chip count k.
+        chip_target_count_range: 'chip_aware' only -- (m_lo, m_hi) inclusive
+            range for the per-chip uniform-integer target count m_c.
+        grf_fraction_range: 'grf_cluster' only -- (p_lo, p_hi) range to
+            rescale the Beta-distributed fraction draw into.
+        grf_fraction_beta: 'grf_cluster' only -- (alpha, beta) parameters
+            for the Beta distribution on the per-scene fraction u.
+        grf_corr_length: 'grf_cluster' only -- ([l_y, l_x]) correlation
+            length scales (in units of chips) for the squared-exponential
+            kernel.
+        grf_count_range: 'grf_cluster' only -- (lo, hi) clip bounds for
+            the per-chip target count m_c.
+        grf_count_noise_sigma: 'grf_cluster' only -- standard deviation
+            of the additive Gaussian noise on the per-chip count.
+        grf_jitter: 'grf_cluster' only -- diagonal jitter added to the
+            covariance matrix before Cholesky decomposition.
+        grf_absent_modulo: 'grf_cluster' only -- parity rule modulus;
+            scene is target-absent iff ``idx % grf_absent_modulo ==
+            grf_absent_modulo - 1``.
+    """
+
+    def __init__(
+        self,
+        n_frames: int,
+        n_circles: int,
+        image_size: Tuple[int, int],
+        radius: int,
+        speeds: list,
+        dat_lab_paths: list,
+        samedir: bool,
+        shape: str = "disk",
+        square_edge: int = 2,
+        target_sampler: str = "single",
+        chip_size: int = 128,
+        chip_nonempty_range: Tuple[int, int] = (24, 40),
+        chip_target_count_range: Tuple[int, int] = (1, 10),
+        grf_fraction_range: Tuple[float, float] = (0.1, 2.0 / 3.0),
+        grf_fraction_beta: Tuple[float, float] = (2.0, 5.0),
+        grf_corr_length: Tuple[float, float] = (1.5, 1.5),
+        grf_count_range: Tuple[int, int] = (1, 10),
+        grf_count_noise_sigma: float = 1.0,
+        grf_jitter: float = 1e-6,
+        grf_absent_modulo: int = 4,
+    ) -> None:
+        assert n_frames > 0
+        assert n_circles > 0
+        assert len(image_size) == 2 and all(i > 0 for i in image_size)
+        assert shape in ("disk", "square"), (
+            f"shape must be 'disk' or 'square', got {shape!r}"
+        )
+        assert square_edge >= 1
+        assert target_sampler in ("single", "chip_aware", "grf_cluster"), (
+            f"target_sampler must be 'single', 'chip_aware', or 'grf_cluster'; "
+            f"got {target_sampler!r}"
+        )
+        if target_sampler == "chip_aware":
+            assert chip_size > 0
+            assert image_size[0] % chip_size == 0 and image_size[1] % chip_size == 0, (
+                f"image_size {image_size} must be divisible by chip_size {chip_size}"
+            )
+            n_chips = (image_size[0] // chip_size) * (image_size[1] // chip_size)
+            assert 0 < chip_nonempty_range[0] <= chip_nonempty_range[1]
+            assert chip_nonempty_range[1] <= n_chips, (
+                f"chip_nonempty_range upper {chip_nonempty_range[1]} exceeds total chips {n_chips}"
+            )
+            assert 1 <= chip_target_count_range[0] <= chip_target_count_range[1]
+        if target_sampler == "grf_cluster":
+            assert chip_size > 0
+            assert image_size[0] == image_size[1], (
+                f"grf_cluster requires square scenes; got image_size {image_size}"
+            )
+            assert image_size[0] % chip_size == 0, (
+                f"image_size {image_size} must be divisible by chip_size {chip_size}"
+            )
+            assert 0.0 < grf_fraction_range[0] < grf_fraction_range[1] <= 1.0, (
+                f"grf_fraction_range must satisfy 0 < lo < hi <= 1; got {grf_fraction_range}"
+            )
+            assert grf_fraction_beta[0] > 0 and grf_fraction_beta[1] > 0
+            assert grf_corr_length[0] > 0 and grf_corr_length[1] > 0
+            assert 1 <= grf_count_range[0] <= grf_count_range[1]
+            assert grf_count_noise_sigma >= 0.0
+            assert grf_jitter > 0
+            assert grf_absent_modulo >= 2
+
+        self.n_frames = n_frames
+        self.n_circles = n_circles
+        self.H, self.W = image_size
+        self.radius = radius
+        self.speeds = list(speeds)
+        self.dirs = [
+            "left", "right", "up", "down",
+            "upleft", "upright", "downleft", "downright",
+        ]
+        self.samedir = samedir
+        self.shape = shape
+        self.square_edge = square_edge
+        self.target_sampler = target_sampler
+        self.chip_size = chip_size
+        self.chip_nonempty_range = tuple(chip_nonempty_range)
+        self.chip_target_count_range = tuple(chip_target_count_range)
+        self.grf_fraction_range = tuple(grf_fraction_range)
+        self.grf_fraction_beta = tuple(grf_fraction_beta)
+        self.grf_corr_length = tuple(grf_corr_length)
+        self.grf_count_range = tuple(grf_count_range)
+        self.grf_count_noise_sigma = float(grf_count_noise_sigma)
+        self.grf_jitter = float(grf_jitter)
+        self.grf_absent_modulo = int(grf_absent_modulo)
+
+        self.data_all_pth = Path(dat_lab_paths[0])
+        self.label_msk_pth = Path(dat_lab_paths[-1])
+        self.data_all_pth.mkdir(parents=True, exist_ok=True)
+        self.label_msk_pth.mkdir(parents=True, exist_ok=True)
+
+        # Precompute Cholesky factor of the GRF covariance only when
+        # the grf_cluster sampler is selected. 64x64 for production;
+        # trivial cost. Reused across all target-present scenes generated
+        # by this DataGenerator instance.
+        if target_sampler == "grf_cluster":
+            self._grf_chol_L = self._build_grf_cholesky()
+        else:
+            self._grf_chol_L = None
+
+    # ----- public API -----
+
+    def generate_data_samples(
+        self, batch_size: int, start_idx: int, rng: np.random.Generator,
+    ) -> List[Tuple[Path, Path]]:
+        """Generate a batch of synthetic scenes.
+
+        Args:
+            batch_size: Number of scenes in the batch.
+            start_idx: First scene index this batch produces. Scene indices
+                are ``start_idx..start_idx + batch_size - 1``.
+            rng: Random number generator. Threaded through all sampling.
+
+        Returns:
+            List of ``(data_path, mask_path)`` tuples.
+        """
+        logger.info("Generating batch: size=%d, start_idx=%d", batch_size, start_idx)
+        batch_paths = [
+            self._generate_video(idx, rng) for idx in range(start_idx, start_idx + batch_size)
+        ]
+        logger.info("Completed batch %d..%d", start_idx, start_idx + batch_size - 1)
+        gc.collect()
+        return batch_paths
+
+    def save_gifs(self, npy_paths: List[Tuple[Path, Path]], fps: int) -> None:
+        """Save GIFs alongside the NPYs (opt-in via the CLI's --save_gifs)."""
+        data_all_gif_pth = Path(str(self.data_all_pth) + "_gif")
+        label_msk_gif_pth = Path(str(self.label_msk_pth) + "_gif")
+        data_all_gif_pth.mkdir(parents=True, exist_ok=True)
+        label_msk_gif_pth.mkdir(parents=True, exist_ok=True)
+
+        for a_path, m_path in npy_paths:
+            if a_path.exists() and a_path.suffix == ".npy":
+                a_video = np.load(a_path)
+                assert a_video.ndim == 3, f"Expected (T, H, W), got {a_video.shape}"
+                a_gif_path = data_all_gif_pth / (a_path.stem + ".gif")
+                iio.imwrite(a_gif_path, a_video, format="GIF", fps=fps)
+                logger.debug("Saved data GIF: %s", a_gif_path)
+            if m_path is not None and m_path.exists() and m_path.suffix == ".npy":
+                m_video = np.load(m_path)
+                assert m_video.ndim == 3, f"Expected (T, H, W), got {m_video.shape}"
+                m_gif_path = label_msk_gif_pth / (m_path.stem + ".gif")
+                iio.imwrite(m_gif_path, m_video, format="GIF", fps=fps)
+                logger.debug("Saved mask GIF: %s", m_gif_path)
+
+    # ----- internals (rng-threaded) -----
+
+    def _make_circle(self, center: Tuple[int, int], circval: int = 255) -> None:
+        """Stamp a disk into ``self.frame`` at ``center``."""
+        Y, X = np.ogrid[: self.H, : self.W]
+        dist = (X - center[0]) ** 2 + (Y - center[1]) ** 2
+        self.frame[dist <= self.radius ** 2] = circval
+
+    def _make_square(self, center: Tuple[int, int], circval: int = 255) -> None:
+        """Stamp a square into ``self.frame`` at ``center``.
+
+        The square covers a ``square_edge x square_edge`` block with its
+        top-left corner at ``center = (cx, cy)``. Out-of-bounds pixels are
+        clipped.
+        """
+        cx, cy = center
+        edge = self.square_edge
+        r0 = max(0, cy)
+        r1 = min(self.H, cy + edge)
+        c0 = max(0, cx)
+        c1 = min(self.W, cx + edge)
+        if r0 < r1 and c0 < c1:
+            self.frame[r0:r1, c0:c1] = circval
+
+    def _create_centers(
+        self, tgt_dir: str, rng: np.random.Generator,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Sample starting positions for background swarm and target.
+
+        Returns ``(all_centers, target_only_centers)``.
+        """
+        a_centers: deque = deque()
+        m_centers: deque = deque()
+        for j in range(self.n_circles):
+            if j != 0:  # background swarm -- anywhere in or just outside the frame
+                cx = rng.integers(-self.W, 2 * self.W)
+                cy = rng.integers(-self.H, 2 * self.H)
+            if j == 0:  # target -- biased to start opposite its motion direction
+                cx = rng.integers(int(0.05 * self.W), int(0.95 * self.W))
+                cy = rng.integers(int(0.05 * self.H), int(0.95 * self.H))
+                if "up" in tgt_dir:
+                    cy = rng.integers(int(0.85 * self.H), int(0.95 * self.H))
+                elif "down" in tgt_dir:
+                    cy = rng.integers(int(0.05 * self.H), int(0.15 * self.H))
+                if "left" in tgt_dir:
+                    cx = rng.integers(int(0.85 * self.W), int(0.95 * self.W))
+                elif "right" in tgt_dir:
+                    cx = rng.integers(int(0.05 * self.W), int(0.15 * self.W))
+                m_centers.append((cx, cy))
+            a_centers.append((cx, cy))
+        return (
+            np.array(a_centers, dtype=np.float64),
+            np.array(m_centers, dtype=np.float64),
+        )
+
+    def _set_spds(
+        self, bg_dir: str, tgt_dir: str, rng: np.random.Generator,
+    ) -> Tuple[float, float]:
+        """Sample background and target per-frame speeds.
+
+        Enforces speed difference iff target and background share direction.
+        """
+        if self.has_mover:
+            if bg_dir == tgt_dir:
+                spd_fst = self.speeds[-1]
+                spd_slw = self.speeds[0]
+            else:
+                a, b = rng.choice(self.speeds, 2, replace=True)
+                spd_fst = max(a, b)
+                spd_slw = min(a, b)
+            tgt_faster = bool(rng.choice([True, False]))
+            if tgt_faster:
+                return spd_slw, spd_fst
+            return spd_fst, spd_slw
+        # No target: shared speed.
+        bg_spd = float(rng.choice(self.speeds))
+        return bg_spd, bg_spd
+
+    def _set_vels(
+        self, rng: np.random.Generator,
+    ) -> Tuple[Tuple[float, float], Tuple[float, float], str]:
+        """Sample direction-speed pairs and convert to (Vx, Vy) velocity vectors."""
+        if self.has_mover:
+            bg_dir, tgt_dir = rng.choice(self.dirs, 2, replace=self.samedir)
+        else:
+            bg_dir = rng.choice(self.dirs)
+            tgt_dir = bg_dir
+
+        bg_spd, tgt_spd = self._set_spds(bg_dir, tgt_dir, rng)
+
+        velswitch = lambda direction, speed: {  # noqa: E731
+            "left": (-speed, 0),
+            "right": (speed, 0),
+            "up": (0, -speed),
+            "down": (0, speed),
+            "upleft": (-speed, -speed),
+            "upright": (speed, -speed),
+            "downleft": (-speed, speed),
+            "downright": (speed, speed),
+        }[direction]
+
+        return velswitch(bg_dir, bg_spd), velswitch(tgt_dir, tgt_spd), tgt_dir
+
+    def _assemble_frames(
+        self,
+        bg_vel: Tuple[float, float],
+        tgt_vel: Tuple[float, float],
+        a_centers_arr: np.ndarray,
+        m_centers_arr: np.ndarray,
+        mover: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Render the data video + mask video frame by frame."""
+        a_video = np.zeros((self.n_frames, self.H, self.W), dtype=np.uint8)
+        for t in range(self.n_frames):
+            self.frame = np.zeros((self.H, self.W), dtype=np.uint8)
+            deltas = np.tile(bg_vel, (self.n_circles, 1)).astype(np.float64)
+            deltas[0] = tgt_vel
+            a_centers_arr += deltas
+            for cx, cy in a_centers_arr:
+                if self.shape == "square":
+                    self._make_square((int(np.ceil(cx)), int(np.ceil(cy))))
+                else:
+                    self._make_circle((int(np.ceil(cx)), int(np.ceil(cy))))
+            a_video[t] = self.frame
+
+        m_video = np.zeros((self.n_frames, self.H, self.W), dtype=np.uint8)
+        for k in range(self.n_frames):
+            self.frame = np.zeros((self.H, self.W), dtype=np.uint8)
+            deltas = np.tile(bg_vel, (len(m_centers_arr), 1)).astype(np.float64)
+            deltas[0] = tgt_vel
+            m_centers_arr += deltas
+            if mover:
+                for cx, cy in m_centers_arr:
+                    if self.shape == "square":
+                        self._make_square((int(np.ceil(cx)), int(np.ceil(cy))))
+                    else:
+                        self._make_circle((int(np.ceil(cx)), int(np.ceil(cy))))
+            m_video[k] = self.frame
+        return a_video, m_video
+
+    def _generate_video(
+        self, idx: int, rng: np.random.Generator,
+    ) -> Tuple[Path, Path]:
+        """Generate one scene + mask NPY pair. Returns the two file paths.
+
+        Dispatches on ``self.target_sampler``: 'single' (default) runs the
+        original v0/v0.5/v0.6 code path bit-identically; 'chip_aware' runs
+        the v1 multi-target chip-aware path; 'grf_cluster' runs the v2
+        GRF-clustered multi-target path.
+        """
+        if self.target_sampler == "grf_cluster":
+            return self._generate_video_grf_cluster(idx, rng)
+        if self.target_sampler == "chip_aware":
+            return self._generate_video_chip_aware(idx, rng)
+
+        assert idx >= 0
+        self.has_mover = 1 if idx % 2 == 0 else 0
+        label = self.has_mover
+
+        bg_vel, tgt_vel, tgt_dir = self._set_vels(rng)
+        a_centers_arr, m_centers_arr = self._create_centers(tgt_dir, rng)
+        a_video, m_video = self._assemble_frames(
+            bg_vel, tgt_vel, a_centers_arr, m_centers_arr, label,
+        )
+
+        a_filename = self.data_all_pth / f"vid{idx}_{label}.npy"
+        np.save(a_filename, a_video)
+        m_filename = self.label_msk_pth / f"vid{idx}_{label}_mask.npy"
+        np.save(m_filename, m_video)
+        logger.debug("Saved scene %d: %s, %s", idx, a_filename, m_filename)
+        return a_filename, m_filename
+
+    # ----- multi-target chip-aware path (v1 spec) -----
+
+    def _sample_chip_aware_targets(
+        self, rng: np.random.Generator,
+    ) -> np.ndarray:
+        """Sample target starting positions under the v1 §3.2 two-stage scheme.
+
+        Returns:
+            (N, 2) float64 array of target starting positions (cx, cy),
+            where N is determined by the sampler (not fixed). Positions
+            use (cx=column, cy=row) order to match the rest of the
+            generator's convention.
+        """
+        cs = self.chip_size
+        n_chips_per_side = self.H // cs
+        total_chips = n_chips_per_side * n_chips_per_side
+
+        k_lo, k_hi = self.chip_nonempty_range
+        k = int(rng.integers(k_lo, k_hi + 1))
+        chip_indices = rng.choice(total_chips, size=k, replace=False)
+
+        m_lo, m_hi = self.chip_target_count_range
+        target_positions: List[Tuple[int, int]] = []
+        for chip_idx in chip_indices:
+            chip_row = int(chip_idx) // n_chips_per_side
+            chip_col = int(chip_idx) % n_chips_per_side
+            m_c = int(rng.integers(m_lo, m_hi + 1))
+            cx_lo = chip_col * cs
+            cx_hi = (chip_col + 1) * cs - self.square_edge
+            cy_lo = chip_row * cs
+            cy_hi = (chip_row + 1) * cs - self.square_edge
+            for _ in range(m_c):
+                cx = int(rng.integers(cx_lo, cx_hi))
+                cy = int(rng.integers(cy_lo, cy_hi))
+                target_positions.append((cx, cy))
+
+        if target_positions:
+            return np.array(target_positions, dtype=np.float64)
+        return np.empty((0, 2), dtype=np.float64)
+
+    # ----- multi-target velocity sampling (shared by chip_aware + grf_cluster) -----
+
+    @staticmethod
+    def _velswitch(direction: str, speed: float) -> Tuple[float, float]:
+        """Convert (direction, speed) -> (Vx, Vy). Extracted to a module-
+        level helper to support reuse across sampler paths without
+        changing the RNG draw order."""
+        return {
+            "left": (-speed, 0.0), "right": (speed, 0.0),
+            "up": (0.0, -speed), "down": (0.0, speed),
+            "upleft": (-speed, -speed), "upright": (speed, -speed),
+            "downleft": (-speed, speed), "downright": (speed, speed),
+        }[direction]
+
+    def _sample_bg_velocity(
+        self, rng: np.random.Generator,
+    ) -> Tuple[Tuple[float, float], str, float]:
+        """Sample one bg velocity. Returns (bg_vel, bg_dir, bg_spd).
+
+        Two RNG draws: bg_dir (rng.choice over self.dirs), bg_spd
+        (rng.choice over self.speeds). Order: bg_dir first, bg_spd second.
+        Matches the order of v1's monolithic _sample_multi_target_velocities.
+        """
+        bg_dir = str(rng.choice(self.dirs))
+        bg_spd = float(rng.choice(self.speeds))
+        bg_vel = self._velswitch(bg_dir, bg_spd)
+        return bg_vel, bg_dir, bg_spd
+
+    def _sample_target_velocities(
+        self, n_targets: int, bg_dir: str, bg_spd: float,
+        rng: np.random.Generator,
+    ) -> Tuple[List[Tuple[float, float]], List[str]]:
+        """Sample N independent target velocities under the anomalous-mover
+        constraint, given the bg already chosen.
+
+        Per-target draws (in order): tgt_dir, then tgt_spd (with conditional
+        speed pool when tgt_dir == bg_dir and self.samedir is True). Matches
+        the per-target loop of v1's monolithic _sample_multi_target_velocities.
+
+        Returns:
+            (tgt_vels, tgt_dirs): lists of length n_targets.
+        """
+        tgt_vels: List[Tuple[float, float]] = []
+        tgt_dirs: List[str] = []
+        for _ in range(n_targets):
+            if self.samedir:
+                tgt_dir = str(rng.choice(self.dirs))
+                if tgt_dir == bg_dir:
+                    alt_speeds = [s for s in self.speeds if s != bg_spd]
+                    tgt_spd = float(rng.choice(alt_speeds))
+                else:
+                    tgt_spd = float(rng.choice(self.speeds))
+            else:
+                alt_dirs = [d for d in self.dirs if d != bg_dir]
+                tgt_dir = str(rng.choice(alt_dirs))
+                tgt_spd = float(rng.choice(self.speeds))
+
+            tgt_vels.append(self._velswitch(tgt_dir, tgt_spd))
+            tgt_dirs.append(tgt_dir)
+
+        return tgt_vels, tgt_dirs
+
+    def _sample_multi_target_velocities(
+        self, n_targets: int, rng: np.random.Generator,
+    ) -> Tuple[Tuple[float, float], List[Tuple[float, float]], List[str]]:
+        """v1 wrapper: combined bg + N-target velocity sampling.
+
+        Used by ``_generate_video_chip_aware`` (v1) and any other path that
+        wants the combined-draw convenience. RNG draw order is bg_dir,
+        bg_spd, then per-target (tgt_dir, tgt_spd) -- identical to v1's
+        pre-refactor implementation, so v1 chip-aware reproducibility is
+        preserved bit-identical.
+
+        Args:
+            n_targets: number of target velocities to draw.
+            rng: numpy Generator.
+
+        Returns:
+            (bg_vel, tgt_vels, tgt_dirs):
+            - bg_vel: (Vx, Vy) tuple.
+            - tgt_vels: list of (Vx, Vy) tuples, length n_targets.
+            - tgt_dirs: list of direction strings, length n_targets.
+        """
+        bg_vel, bg_dir, bg_spd = self._sample_bg_velocity(rng)
+        tgt_vels, tgt_dirs = self._sample_target_velocities(
+            n_targets, bg_dir, bg_spd, rng,
+        )
+        return bg_vel, tgt_vels, tgt_dirs
+
+    def _assemble_frames_multi(
+        self,
+        bg_vel: Tuple[float, float],
+        tgt_vels: List[Tuple[float, float]],
+        bg_centers_arr: np.ndarray,
+        m_centers_arr: np.ndarray,
+        mover: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Multi-target variant of ``_assemble_frames``.
+
+        The full-scene render concatenates targets and swarm into one
+        centers array (length N + n_circles), with per-row deltas:
+        targets get their individual ``tgt_vels[i]``, swarm gets ``bg_vel``.
+        The mask render uses only ``m_centers_arr`` with ``tgt_vels``.
+
+        Args:
+            bg_vel: (Vx, Vy) bg velocity, applied to all n_circles swarm.
+            tgt_vels: list of (Vx, Vy) per target; length must equal
+                ``m_centers_arr.shape[0]``.
+            bg_centers_arr: (n_circles, 2) float64 swarm starting positions.
+            m_centers_arr: (N, 2) float64 target starting positions.
+            mover: 1 if target-present scene, 0 if target-absent. For
+                ``mover=0``, ``m_centers_arr`` must be shape (0, 2).
+
+        Returns:
+            (a_video, m_video): both ``(n_frames, H, W)`` uint8.
+        """
+        N = int(m_centers_arr.shape[0])
+        assert len(tgt_vels) == N
+        n_total = N + self.n_circles
+
+        deltas = np.tile(np.asarray(bg_vel, dtype=np.float64), (n_total, 1))
+        if N > 0:
+            deltas[:N] = np.asarray(tgt_vels, dtype=np.float64)
+
+        a_centers_arr = np.empty((n_total, 2), dtype=np.float64)
+        if N > 0:
+            a_centers_arr[:N] = m_centers_arr
+        a_centers_arr[N:] = bg_centers_arr
+
+        a_video = np.zeros((self.n_frames, self.H, self.W), dtype=np.uint8)
+        for t in range(self.n_frames):
+            self.frame = np.zeros((self.H, self.W), dtype=np.uint8)
+            a_centers_arr += deltas
+            for cx, cy in a_centers_arr:
+                if self.shape == "square":
+                    self._make_square((int(np.ceil(cx)), int(np.ceil(cy))))
+                else:
+                    self._make_circle((int(np.ceil(cx)), int(np.ceil(cy))))
+            a_video[t] = self.frame
+
+        m_video = np.zeros((self.n_frames, self.H, self.W), dtype=np.uint8)
+        if mover and N > 0:
+            m_centers_running = m_centers_arr.copy()
+            m_deltas = np.asarray(tgt_vels, dtype=np.float64)
+            for t in range(self.n_frames):
+                self.frame = np.zeros((self.H, self.W), dtype=np.uint8)
+                m_centers_running += m_deltas
+                for cx, cy in m_centers_running:
+                    if self.shape == "square":
+                        self._make_square((int(np.ceil(cx)), int(np.ceil(cy))))
+                    else:
+                        self._make_circle((int(np.ceil(cx)), int(np.ceil(cy))))
+                m_video[t] = self.frame
+
+        return a_video, m_video
+
+    def _generate_video_chip_aware(
+        self, idx: int, rng: np.random.Generator,
+    ) -> Tuple[Path, Path]:
+        """Multi-target chip-aware scene generation (v1 spec)."""
+        assert idx >= 0
+        self.has_mover = 1 if idx % 2 == 0 else 0
+        label = self.has_mover
+
+        if self.has_mover:
+            m_centers_arr = self._sample_chip_aware_targets(rng)
+            N = int(m_centers_arr.shape[0])
+            bg_vel, tgt_vels, _tgt_dirs = self._sample_multi_target_velocities(N, rng)
+        else:
+            m_centers_arr = np.empty((0, 2), dtype=np.float64)
+            bg_vel, tgt_vels, _tgt_dirs = self._sample_multi_target_velocities(0, rng)
+
+        # Background swarm starts: uniform over the super-window
+        # [-W, 2W) x [-H, 2H), matching the existing _create_centers
+        # j != 0 branch (so the swarm wraps in from outside).
+        bg_centers_arr = np.empty((self.n_circles, 2), dtype=np.float64)
+        bg_centers_arr[:, 0] = rng.integers(-self.W, 2 * self.W, size=self.n_circles)
+        bg_centers_arr[:, 1] = rng.integers(-self.H, 2 * self.H, size=self.n_circles)
+
+        a_video, m_video = self._assemble_frames_multi(
+            bg_vel, tgt_vels, bg_centers_arr, m_centers_arr, label,
+        )
+
+        a_filename = self.data_all_pth / f"vid{idx}_{label}.npy"
+        np.save(a_filename, a_video)
+        m_filename = self.label_msk_pth / f"vid{idx}_{label}_mask.npy"
+        np.save(m_filename, m_video)
+        logger.debug(
+            "Saved chip_aware scene %d (N=%d): %s, %s",
+            idx, int(m_centers_arr.shape[0]), a_filename, m_filename,
+        )
+        return a_filename, m_filename
+
+    # ----- multi-target GRF-clustered path (v2 spec) -----
+
+    def _build_grf_cholesky(self) -> np.ndarray:
+        """Build the GRF covariance matrix and return its Cholesky factor.
+
+        Squared-exponential kernel with anisotropic length scales
+        [l_y, l_x] over the n_chips_per_side x n_chips_per_side chip grid,
+        with diagonal jitter ``self.grf_jitter`` added for numerical
+        stability before Cholesky decomposition.
+
+        Returns:
+            L: (T_chips, T_chips) float64 lower-triangular Cholesky factor
+                such that ``L @ L.T == Sigma``. T_chips = (H // chip_size)^2.
+        """
+        n_chips_per_side = self.H // self.chip_size
+        T_chips = n_chips_per_side * n_chips_per_side
+        ly, lx = self.grf_corr_length
+
+        chip_rows = np.arange(T_chips) // n_chips_per_side
+        chip_cols = np.arange(T_chips) % n_chips_per_side
+
+        di = chip_rows[:, None] - chip_rows[None, :]
+        dj = chip_cols[:, None] - chip_cols[None, :]
+
+        K = np.exp(-0.5 * ((di / ly) ** 2 + (dj / lx) ** 2))
+        Sigma = K + self.grf_jitter * np.eye(T_chips)
+        L = np.linalg.cholesky(Sigma)
+        return L
+
+    def _sample_grf_cluster_targets(
+        self, rng: np.random.Generator,
+    ) -> np.ndarray:
+        """Sample target starting positions under the v2 §3.2 GRF-clustered scheme.
+
+        Caller responsibility: invoke only for target-present scenes.
+        Target-absent scenes do not call this method (matches the v1
+        chip_aware pattern).
+
+        Args:
+            rng: numpy Generator.
+
+        Returns:
+            target_positions: (N, 2) float64 array of target starts
+                (cx=col, cy=row). N is determined by the sampler (Stages
+                A-D of §3.2), not fixed. Always non-empty in practice
+                because the per-chip count clip lower bound is 1 and
+                k >= 1.
+        """
+        cs = self.chip_size
+        n_chips_per_side = self.H // cs
+        T_chips = n_chips_per_side * n_chips_per_side
+
+        # Stage A -- Beta fraction draw + rescale to [p_lo, p_hi].
+        alpha, beta_param = self.grf_fraction_beta
+        u = float(rng.beta(alpha, beta_param))
+        p_lo, p_hi = self.grf_fraction_range
+        p = p_lo + u * (p_hi - p_lo)
+        k = max(1, int(round(p * T_chips)))
+
+        # Stage B -- GRF field draw via precomputed Cholesky.
+        z = rng.standard_normal(size=T_chips)
+        f = self._grf_chol_L @ z
+
+        # Stage C -- threshold to exact k (descending-field-value order).
+        chip_order = np.argsort(f)[::-1]
+        non_empty_chip_indices = chip_order[:k]
+
+        # Stage D -- per-chip count (field-rank linear mapping + noise +
+        # clip) and per-target placement.
+        f_at_non_empty = f[non_empty_chip_indices]
+        f_min = float(f_at_non_empty.min())
+        f_max = float(f_at_non_empty.max())
+        range_f = f_max - f_min
+        lo_count, hi_count = self.grf_count_range
+        count_span = hi_count - lo_count
+
+        target_positions: List[Tuple[int, int]] = []
+        for chip_idx in non_empty_chip_indices:
+            f_c = f[chip_idx]
+            if range_f > 0:
+                mu_c = lo_count + count_span * (f_c - f_min) / range_f
+            else:
+                mu_c = 0.5 * (lo_count + hi_count)
+
+            eps_c = float(rng.normal(0.0, self.grf_count_noise_sigma))
+            m_c = int(np.clip(int(round(mu_c + eps_c)), lo_count, hi_count))
+
+            chip_row = int(chip_idx) // n_chips_per_side
+            chip_col = int(chip_idx) % n_chips_per_side
+            cx_lo = chip_col * cs
+            cx_hi = (chip_col + 1) * cs - self.square_edge
+            cy_lo = chip_row * cs
+            cy_hi = (chip_row + 1) * cs - self.square_edge
+            for _ in range(m_c):
+                cx = int(rng.integers(cx_lo, cx_hi))
+                cy = int(rng.integers(cy_lo, cy_hi))
+                target_positions.append((cx, cy))
+
+        if target_positions:
+            return np.array(target_positions, dtype=np.float64)
+        return np.empty((0, 2), dtype=np.float64)
+
+    def _generate_video_grf_cluster(
+        self, idx: int, rng: np.random.Generator,
+    ) -> Tuple[Path, Path]:
+        """GRF-clustered multi-target scene generation (v2 spec).
+
+        RNG draw order per §3.2.1:
+          1. bg_dir; 2. bg_spd (both branches, via _sample_bg_velocity)
+          For target-present (idx % grf_absent_modulo != grf_absent_modulo - 1):
+            3. u ~ Beta(alpha, beta)
+            4. z ~ N(0, I_T)
+            5. for each non-empty chip in descending field order:
+                a. eps_c ~ Normal(0, sigma_count)
+                b. m_c integer cx/cy uniform draws inside chip bounds
+            6. N target velocities (tgt_dir then tgt_spd per target)
+          7. bg starting positions: rng.integers x size n_circles, then y.
+        """
+        assert idx >= 0
+        self.has_mover = (
+            0 if (idx % self.grf_absent_modulo == self.grf_absent_modulo - 1) else 1
+        )
+        label = self.has_mover
+
+        # Steps 1-2: bg_dir, bg_spd (both branches).
+        bg_vel, bg_dir, bg_spd = self._sample_bg_velocity(rng)
+
+        if self.has_mover:
+            # Steps 3-5: GRF-driven target placement.
+            m_centers_arr = self._sample_grf_cluster_targets(rng)
+            N = int(m_centers_arr.shape[0])
+            # Step 6: per-target velocity draws.
+            tgt_vels, _tgt_dirs = self._sample_target_velocities(
+                N, bg_dir, bg_spd, rng,
+            )
+        else:
+            m_centers_arr = np.empty((0, 2), dtype=np.float64)
+            tgt_vels: List[Tuple[float, float]] = []
+
+        # Step 7: bg starting positions.
+        bg_centers_arr = np.empty((self.n_circles, 2), dtype=np.float64)
+        bg_centers_arr[:, 0] = rng.integers(-self.W, 2 * self.W, size=self.n_circles)
+        bg_centers_arr[:, 1] = rng.integers(-self.H, 2 * self.H, size=self.n_circles)
+
+        a_video, m_video = self._assemble_frames_multi(
+            bg_vel, tgt_vels, bg_centers_arr, m_centers_arr, label,
+        )
+
+        a_filename = self.data_all_pth / f"vid{idx}_{label}.npy"
+        np.save(a_filename, a_video)
+        m_filename = self.label_msk_pth / f"vid{idx}_{label}_mask.npy"
+        np.save(m_filename, m_video)
+        logger.debug(
+            "Saved grf_cluster scene %d (label=%d, N=%d): %s, %s",
+            idx, label, int(m_centers_arr.shape[0]), a_filename, m_filename,
+        )
+        return a_filename, m_filename
+
+
+def worker(start_idx: int, batch_size: int, generator: DataGenerator,
+           save_gifs: bool = False, fps: int = 10, seed: int | None = None) -> None:
+    """Multiprocessing worker.
+
+    Args:
+        start_idx: First scene index this worker produces.
+        batch_size: Number of scenes this worker produces.
+        generator: A ``DataGenerator`` instance.
+        save_gifs: If True, save GIFs alongside the NPYs.
+        fps: GIF playback rate.
+        seed: RNG seed for this worker. Default ``start_idx`` (the original
+            convention; one worker per batch, seed = batch start).
+    """
+    if seed is None:
+        seed = start_idx
+    rng = np.random.default_rng(seed)
+    logger.info("worker: start_idx=%d batch_size=%d seed=%d", start_idx, batch_size, seed)
+    paths = generator.generate_data_samples(batch_size=batch_size, start_idx=start_idx, rng=rng)
+    if save_gifs:
+        generator.save_gifs(paths, fps=fps)
+
+
+# ---------------------------------------------------------------------------
+# Command-line interface (moved here from the scripts/ entry point)
+# ---------------------------------------------------------------------------
+
+def _resolve_data_root(cli_value: str | None) -> Path:
+    """Return the data root from ``--data-root`` or ``LSL_DATA_ROOT``.
+
+    Kept local (not imported from ``localizer.common``) so that the generator
+    package has no dependency on the rest of ``localizer``.
+
+    Args:
+        cli_value: The ``--data-root`` value, or ``None``.
+
+    Returns:
+        The data root directory.
+
+    Raises:
+        RuntimeError: if neither the argument nor the variable is set.
+    """
+    import os
+
+    value = cli_value or os.environ.get("LSL_DATA_ROOT", "").strip()
+    if not value:
+        raise RuntimeError(
+            "The directory holding the datasets is not configured. Pass "
+            "--data-root or set the environment variable LSL_DATA_ROOT "
+            "(or give an absolute --output_root)."
+        )
+    return Path(value).expanduser()
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments (see ``main``)."""
+    p = argparse.ArgumentParser(description="Generate swarm-video synthetic dataset.")
+    p.add_argument("--config", required=True, help="YAML config path.")
+    p.add_argument("--output_root", default=None,
+                   help="Absolute output directory; overrides the config's `dataset` name.")
+    p.add_argument("--total_scenes", type=int, default=None)
+    p.add_argument("--start_idx", type=int, default=None)
+    p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--num_workers", type=int, default=None)
+    p.add_argument("--save_gifs", type=str, default=None,
+                   help="Override save_gifs (true/false).")
+    p.add_argument("--data-root", dest="data_root_dir", default=None,
+                   help="Directory holding the datasets (default: $LSL_DATA_ROOT).")
+    return p.parse_args(argv)
+
+
+def _str2bool(s: str) -> bool:
+    return s.strip().lower() in ("1", "true", "yes", "y")
+
+
+def _worker_entry(args: tuple) -> None:
+    start_idx, batch_size, gen_kwargs, save_gifs, fps = args
+    gen = DataGenerator(**gen_kwargs)
+    worker(start_idx=start_idx, batch_size=batch_size, generator=gen,
+           save_gifs=save_gifs, fps=fps)
+
+
+_KNOWN_YAML_KEYS = {
+    # Generator constructor keys
+    "n_frames", "image_size", "shape", "square_edge", "radius", "speeds",
+    "n_circles", "samedir",
+    "target_sampler", "chip_size", "chip_nonempty_range", "chip_target_count_range",
+    # v2 grf_cluster generator keys
+    "grf_fraction_range", "grf_fraction_beta", "grf_corr_length",
+    "grf_count_range", "grf_count_noise_sigma", "grf_jitter",
+    "grf_absent_modulo",
+    # Orchestration / I/O keys
+    "total_scenes", "start_idx", "batch_size", "num_workers",
+    "save_gifs", "fps", "output_root", "dataset",
+}
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Generate a dataset from a YAML config.
+
+    Output goes to ``<data root>/<dataset>`` (data root from ``--data-root``
+    or ``LSL_DATA_ROOT``), or to ``--output_root`` when given.
+
+    Args:
+        argv: Argument list (default: ``sys.argv[1:]``).
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    args = _parse_args(argv)
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    unknown_keys = set(cfg.keys()) - _KNOWN_YAML_KEYS
+    if unknown_keys:
+        raise ValueError(
+            f"Unknown YAML keys in {args.config}: {sorted(unknown_keys)}. "
+            f"Known keys: {sorted(_KNOWN_YAML_KEYS)}."
+        )
+
+    if args.output_root is not None:
+        cfg["output_root"] = args.output_root
+    if args.total_scenes is not None:
+        cfg["total_scenes"] = args.total_scenes
+    if args.start_idx is not None:
+        cfg["start_idx"] = args.start_idx
+    if args.batch_size is not None:
+        cfg["batch_size"] = args.batch_size
+    if args.num_workers is not None:
+        cfg["num_workers"] = args.num_workers
+    if args.save_gifs is not None:
+        cfg["save_gifs"] = _str2bool(args.save_gifs)
+
+    if args.output_root is None and "dataset" in cfg:
+        cfg["output_root"] = str(_resolve_data_root(args.data_root_dir) / cfg["dataset"])
+    if "output_root" not in cfg:
+        raise ValueError("config names no `dataset` and no --output_root was given")
+    output_root = Path(cfg["output_root"])
+    data_all = output_root / "data_all"
+    label_msk = output_root / "label_msk"
+
+    gen_kwargs = dict(
+        n_frames=cfg["n_frames"],
+        n_circles=cfg["n_circles"],
+        image_size=tuple(cfg["image_size"]),
+        radius=cfg["radius"],
+        speeds=cfg["speeds"],
+        dat_lab_paths=[data_all, label_msk],
+        samedir=cfg["samedir"],
+        shape=cfg.get("shape", "disk"),
+        square_edge=cfg.get("square_edge", 2),
+        target_sampler=cfg.get("target_sampler", "single"),
+        chip_size=cfg.get("chip_size", 128),
+        chip_nonempty_range=tuple(cfg.get("chip_nonempty_range", (24, 40))),
+        chip_target_count_range=tuple(cfg.get("chip_target_count_range", (1, 10))),
+        grf_fraction_range=tuple(cfg.get("grf_fraction_range", (0.1, 2.0 / 3.0))),
+        grf_fraction_beta=tuple(cfg.get("grf_fraction_beta", (2.0, 5.0))),
+        grf_corr_length=tuple(cfg.get("grf_corr_length", (1.5, 1.5))),
+        grf_count_range=tuple(cfg.get("grf_count_range", (1, 10))),
+        grf_count_noise_sigma=cfg.get("grf_count_noise_sigma", 1.0),
+        grf_jitter=cfg.get("grf_jitter", 1e-6),
+        grf_absent_modulo=cfg.get("grf_absent_modulo", 4),
+    )
+
+    total_scenes = cfg["total_scenes"]
+    batch_size = cfg["batch_size"]
+    num_workers = cfg["num_workers"]
+    start_idx = cfg.get("start_idx", 0)
+    save_gifs = bool(cfg.get("save_gifs", False))
+    fps = cfg.get("fps", 10)
+
+    start_indices = list(range(start_idx, start_idx + total_scenes, batch_size))
+    work = [
+        (s, min(batch_size, start_idx + total_scenes - s), gen_kwargs, save_gifs, fps)
+        for s in start_indices
+    ]
+    logging.info(
+        "Dispatching %d batches (start_idx=%d, batch_size=%d, total=%d, workers=%d, save_gifs=%s)",
+        len(work), start_idx, batch_size, total_scenes, num_workers, save_gifs,
+    )
+    if num_workers <= 1:
+        for item in work:
+            _worker_entry(item)
+    else:
+        with Pool(num_workers) as pool:
+            for _ in pool.imap_unordered(_worker_entry, work):
+                pass
+    logging.info("Dataset complete: %d scenes in %s", total_scenes, output_root)
+
+
+if __name__ == "__main__":
+    main()

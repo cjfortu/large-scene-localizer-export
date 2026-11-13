@@ -1,0 +1,44 @@
+"""Shared building blocks.
+
+``DoubleConv3D`` is used by both the gate (``localizer.gate.model``) and the
+segmenter (``localizer.segmenter.model``). It lives here so that neither
+stage depends on the other.
+"""
+
+import torch
+import torch.nn as nn
+
+
+class DoubleConv3D(nn.Module):
+    """Two Conv3d 3x3x3 + BatchNorm3d + ReLU in series.
+
+    ``padding_mode`` is threaded through to both ``Conv3d`` layers. The
+    default ``'zeros'`` preserves the original behavior bit-identically
+    (Stage 2 volseg and every pre-existing Stage 1 caller are unchanged);
+    Stage 1's gate-precision ladder (§4.2 of the 512 gate-precision spec)
+    passes ``'replicate'`` to remove the zero-padding perimeter flood.
+    """
+
+    def __init__(
+        self, in_ch: int, out_ch: int, padding_mode: str = "zeros",
+    ) -> None:
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, 3, padding=1, padding_mode=padding_mode),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_ch, out_ch, 3, padding=1, padding_mode=padding_mode),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply both conv layers.
+
+        Args:
+            x: Input ``(B, in_ch, T, H, W)``.
+
+        Returns:
+            ``(B, out_ch, T, H, W)``.
+        """
+        return self.conv(x)

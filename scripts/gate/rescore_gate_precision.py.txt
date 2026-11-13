@@ -1,0 +1,148 @@
+"""Re-score a saved Stage 1 checkpoint's detection/gate metrics under a
+chosen proposal-patch size (Phase 2 §5 item 7 / item 3).
+
+The trainer's ``scripts/evaluate_stage1_seg.py`` is v0-only (hardcoded
+PureConvSegmenter3D); it cannot score the v0.6/v0.7 hybrid low-res arms
+or take a configurable patch. This script rebuilds the model via the
+same factory dispatch the trainer uses, loads the state_dict, rebuilds
+the exact val split via ``make_dataloaders``, and runs the validation
+metric path (native + NN-upsampled full-res) with
+``DetectionEpochAccumulator`` at the requested ``--proposal_patch``.
+
+Reports, native and full-res:
+  precision_present, redundancy_present, mean_proposals_absent,
+  mean_proposals_present, recall@<secondary_k>.
+
+Use at patch=128 to reproduce a run's logged (patch-128) metrics
+(plumbing regression guard); at patch=16 (128² rung) to read the
+1/8-of-field gate precision the Phase 2 verdict anchors on (the full-res
+column is the faithful 1/8 estimate).
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+import yaml
+
+from localizer.common.checkpoint_io import load_weights
+from localizer.common.paths import add_root_args, resolve_config_paths, resolve_under
+from localizer.gate.train import Stage1SegTrainConfig
+from localizer.gate.metrics import (
+    DetectionEpochAccumulator,
+)
+from localizer.gate.model import (
+    build_segmenter_v0_5, build_segmenter_v0_6,
+    build_segmenter_v0_7, build_segmenter_v0_8,
+)
+from localizer.common.data import make_dataloaders
+
+
+def _build_model(cfg: Stage1SegTrainConfig, low_res_pool_t):
+    """Replicate the trainer's model_factory dispatch (lines 859-910)."""
+    if cfg.model_factory == "v0_8":
+        return build_segmenter_v0_8(
+            arm=cfg.arm, nfeats=cfg.nfeats, fusion=cfg.fusion,
+            stem_stride=cfg.stem_stride, dt_init_std=cfg.dt_init_std,
+            gradient_checkpoint=cfg.gradient_checkpoint,
+            pool_factor=low_res_pool_t,
+        )
+    if cfg.model_factory == "v0_7":
+        return build_segmenter_v0_7(
+            arm=cfg.arm, nfeats=cfg.nfeats, fusion=cfg.fusion,
+            stem_stride=cfg.stem_stride, dt_init_std=cfg.dt_init_std,
+        )
+    if cfg.arm is not None:
+        return build_segmenter_v0_6(arm=cfg.arm, nfeats=cfg.nfeats)
+    return build_segmenter_v0_5(
+        temporal_variant=cfg.temporal_variant,
+        bottleneck_variant=cfg.bottleneck_variant, nfeats=cfg.nfeats,
+    )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--proposal_patch", type=int, required=True,
+                    help="Patch H=W in input voxels (16 at 128², 64 at 512²).")
+    ap.add_argument("--cluster_chip_size", type=int, default=None,
+                    help="Full-res chip size for cluster_recall (32 @128²).")
+    ap.add_argument("--data_root", default=None,
+                    help="Absolute dataset directory; overrides the config's `dataset`.")
+    add_root_args(ap, ("data", "runs", "ckpt"))
+    args = ap.parse_args()
+    args.checkpoint = str(resolve_under("ckpt", args.checkpoint, args.ckpt_root_dir))
+
+    with open(args.config) as f:
+        cfg_dict = yaml.safe_load(f)
+    if args.data_root:
+        cfg_dict.pop("dataset", None)
+        cfg_dict["data_root"] = args.data_root
+    cfg_dict.pop("run_name", None)  # scoring only; no run output
+    cfg = Stage1SegTrainConfig(**resolve_config_paths(cfg_dict, args.data_root_dir, args.runs_root_dir))
+    low_res_pool_t = tuple(cfg.low_res_pool)
+    secondary_k = int(cfg.secondary_recall_k)
+    det_ks = tuple(sorted(set(tuple(cfg.detection_recall_ks) + (secondary_k,))))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = _build_model(cfg, low_res_pool_t).to(device)
+    load_weights(model, args.checkpoint, map_location=device, strict=True)
+    model.eval()
+
+    _, val_loader, datshape = make_dataloaders(
+        data_root=cfg.data_root, subset_size=cfg.subset_size,
+        batch_size=1, num_workers=cfg.num_workers,
+        val_split=cfg.val_split, val_split_seed=cfg.val_split_seed,
+        output_resolution=cfg.output_resolution,
+        soft_target=(cfg.loss_target == "soft_gaussian"),
+        low_res_pool=low_res_pool_t,
+    )
+
+    p = args.proposal_patch
+    nat = DetectionEpochAccumulator(ks=det_ks, patch_h=p, patch_w=p)
+    full = DetectionEpochAccumulator(ks=det_ks, patch_h=p, patch_w=p,
+                                     cluster_chip_size=args.cluster_chip_size)
+
+    with torch.no_grad():
+        for sample in val_loader:
+            videos = sample["volume"].to(device)
+            masks_hard = sample.get("mask_hard", sample["mask"]).to(device)
+            outputs = model(videos).float()
+            masks_full = sample["mask_full"].to(device)
+            outputs_full = F.interpolate(
+                outputs, size=tuple(masks_full.shape[-3:]), mode="nearest",
+            )
+            for b in range(videos.size(0)):
+                nat.update(outputs[b], masks_hard[b])
+                full.update(outputs_full[b], masks_full[b])
+
+    ns, fs = nat.summarize(), full.summarize()
+    rk = f"recall@{secondary_k}"
+    print(f"== Re-score gate metrics @ patch {p}x{p} ==")
+    print(f"config={args.config}")
+    print(f"checkpoint={Path(args.checkpoint).name}")
+    print(f"val scenes: present={int(ns['n_present'])} absent={int(ns['n_absent'])} "
+          f"datshape={datshape}\n")
+    hdr = f"{'metric':<26}{'native':>12}{'full(1/8)':>12}"
+    print(hdr)
+    rows = [
+        ("precision_present", "precision_present"),
+        ("redundancy_present", "redundancy_present"),
+        ("mean_proposals_absent", "mean_proposals_per_scene_absent"),
+        ("mean_proposals_present", "mean_proposals_per_scene_present"),
+        (rk, rk),
+        ("cluster_recall", "cluster_recall"),
+    ]
+    for label, key in rows:
+        nv, fv = ns.get(key, float("nan")), fs.get(key, float("nan"))
+        print(f"{label:<26}{nv:>12.4f}{fv:>12.4f}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

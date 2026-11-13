@@ -1,0 +1,13 @@
+"""Large-scene localizer: gate -> classifier -> segmenter pipeline for small movers in large video volumes.
+
+Subpackages are imported explicitly (no eager imports here):
+
+* ``localizer.gate`` -- Stage 1, the region-proposal gate (CNN+Mamba hybrid).
+* ``localizer.classifier`` -- Stage 2, the 128x128x64 chip classifier.
+* ``localizer.segmenter`` -- Stage 3, the volumetric segmenter (not yet integrated).
+* ``localizer.synth`` -- the synthetic swarm-video generator.
+* ``localizer.pipeline`` -- gate -> classifier end-to-end evaluation.
+* ``localizer.common`` -- data loading, shared blocks, metrics and plotting.
+"""
+
+__version__ = "0.2.0"

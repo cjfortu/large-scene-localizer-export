@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "large-scene-localizer"
+version = "0.2.0"
+description = "Gate -> classifier -> segmenter pipeline for detecting small movers in large spatiotemporal video volumes"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "pyyaml>=6.0",
+    "torch>=2.4",
+    "scikit-learn>=1.3",
+    "imageio>=2.31",
+    "matplotlib>=3.7",
+    "pandas>=2.0",
+    "einops>=0.7",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+# Compiled CUDA kernels for the gate's Mamba blocks (Linux + CUDA only).
+# Without them the gate uses the pure-PyTorch reference in
+# localizer.gate.mamba_ref (correct, slow). These are the Tier 1 versions;
+# they compile from source against the installed torch, so install them with
+# --no-build-isolation after torch (docs/environment.md, "Tier 1 from source").
+cuda-ssm = [
+    "mamba-ssm==2.3.2.post1",
+    "causal-conv1d==1.6.2.post1",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+]
+
+[project.scripts]
+lsl-train-gate = "localizer.gate.train:main"
+lsl-train-classifier = "localizer.classifier.train:main"
+lsl-train-segmenter = "localizer.segmenter.train:main"
+lsl-generate = "localizer.synth.swarm:main"
+lsl-system-eval = "localizer.pipeline.system_eval:main"
+lsl-per-target-recall = "localizer.pipeline.per_target_recall:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+markers = [
+    "gpu: needs CUDA and mamba_ssm (run in GPU validation)",
+]

@@ -1,0 +1,146 @@
+"""Convert PyTorch ``.pth`` / ``.pt`` state_dicts to ``.safetensors`` and verify.
+
+For each input file this writes ``<stem>.safetensors`` next to it (or into
+``--out-dir``), then reloads both files and checks, tensor by tensor, that the
+names, dtypes, shapes and raw bytes are identical. Any difference fails the
+run (exit code 1) and the bad output file is removed.
+
+Usage:
+    python scripts/checkpoints/to_safetensors.py RUN/models/best_gate_model.pth
+    python scripts/checkpoints/to_safetensors.py --checkpoints-root DIR \\
+        gate_A_stem2_bs1_ep42.pth classifier_baseline_30k_ep64.pt --record convert.json
+
+A relative input is resolved against the checkpoints root (``--checkpoints-root``
+or ``LSL_CKPT_ROOT``) when it does not exist relative to the working
+directory. The record (optional JSON) lists per file: tensor count, total
+elements, dtypes, both sha256 values and sizes, and the equality result.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import torch
+
+from localizer.common.checkpoint_io import save_safetensors
+from localizer.common.paths import add_root_args, resolve_under
+
+
+def _sha256(path: Path) -> str:
+    """Return the hex sha256 of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 22), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _raw_bytes(t: torch.Tensor) -> torch.Tensor:
+    """View a tensor's storage as a flat uint8 tensor (bit-exact comparison)."""
+    return t.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+
+
+def compare_state_dicts(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> list[str]:
+    """Return a list of differences between two state_dicts (empty if identical).
+
+    Args:
+        a: Reference ``{name: tensor}``.
+        b: Candidate ``{name: tensor}``.
+
+    Returns:
+        Human-readable difference lines: missing or extra names, dtype or
+        shape mismatches, and tensors whose raw bytes differ.
+    """
+    diffs: list[str] = []
+    for k in sorted(set(a) - set(b)):
+        diffs.append(f"missing in candidate: {k}")
+    for k in sorted(set(b) - set(a)):
+        diffs.append(f"extra in candidate: {k}")
+    for k in sorted(set(a) & set(b)):
+        x, y = a[k], b[k]
+        if x.dtype != y.dtype:
+            diffs.append(f"{k}: dtype {x.dtype} != {y.dtype}")
+        elif tuple(x.shape) != tuple(y.shape):
+            diffs.append(f"{k}: shape {tuple(x.shape)} != {tuple(y.shape)}")
+        elif not torch.equal(_raw_bytes(x), _raw_bytes(y)):
+            diffs.append(f"{k}: values differ")
+    return diffs
+
+
+def convert_one(src: Path, out_dir: Path | None) -> dict:
+    """Convert one file, verify the round trip, and return its record.
+
+    Args:
+        src: Existing ``.pth`` / ``.pt`` state_dict file.
+        out_dir: Output directory, or ``None`` for ``src``'s directory.
+
+    Returns:
+        Record dict (see the module docstring); ``record["identical"]`` is
+        ``True`` only if every tensor round-trips bit-exactly.
+    """
+    sd = torch.load(src, map_location="cpu", weights_only=True)
+    if isinstance(sd, dict) and "state_dict" in sd and "model" not in sd:
+        sd = sd["state_dict"]
+    dst = (out_dir or src.parent) / (src.stem + ".safetensors")
+    save_safetensors(sd, dst, metadata={"format": "pt", "source_sha256": _sha256(src)})
+
+    from safetensors.torch import load_file
+
+    back = load_file(str(dst), device="cpu")
+    again = torch.load(src, map_location="cpu", weights_only=True)
+    if isinstance(again, dict) and "state_dict" in again and "model" not in again:
+        again = again["state_dict"]
+    diffs = compare_state_dicts(again, back)
+    rec = {
+        "source": src.name,
+        "source_sha256": _sha256(src),
+        "source_bytes": src.stat().st_size,
+        "safetensors": dst.name,
+        "safetensors_sha256": _sha256(dst),
+        "safetensors_bytes": dst.stat().st_size,
+        "n_tensors": len(sd),
+        "n_elements": int(sum(t.numel() for t in sd.values())),
+        "dtypes": sorted({str(t.dtype) for t in sd.values()}),
+        "identical": not diffs,
+        "differences": diffs[:50],
+    }
+    if diffs:
+        dst.unlink()
+    return rec
+
+
+def main() -> int:
+    """CLI entry point; returns the process exit code."""
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("inputs", nargs="+", help=".pth / .pt state_dict files")
+    p.add_argument("--out-dir", default=None, help="output directory (default: next to each input)")
+    p.add_argument("--record", default=None, help="write the per-file records to this JSON file")
+    add_root_args(p, ("ckpt",))
+    args = p.parse_args()
+
+    out_dir = Path(args.out_dir) if args.out_dir else None
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    for name in args.inputs:
+        src = Path(name)
+        if not src.is_file():
+            src = resolve_under("ckpt", name, args.ckpt_root_dir)
+        rec = convert_one(src, out_dir)
+        records.append(rec)
+        status = "IDENTICAL" if rec["identical"] else f"DIFFERENT ({len(rec['differences'])}+)"
+        print(f"{rec['source']} -> {rec['safetensors']}: {rec['n_tensors']} tensors, "
+              f"{rec['n_elements']} elements, {status}, sha256 {rec['safetensors_sha256']}")
+        for d in rec["differences"]:
+            print(f"    {d}")
+    if args.record:
+        Path(args.record).write_text(json.dumps(records, indent=2) + "\n")
+    return 0 if all(r["identical"] for r in records) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

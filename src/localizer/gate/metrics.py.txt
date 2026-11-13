@@ -1,0 +1,695 @@
+"""Stage 1 v0 detection + sparsity-aware segmentation metrics.
+
+Owns:
+
+* The §6 patch-extraction pipeline (sigmoid -> threshold -> 3D
+  connected components -> spatial centroid -> 128x128x64 patch crop).
+* The detection-level metrics of §8.1 (recall@K, precision@K, mean
+  proposals per scene, FP-per-scene) via ``DetectionEpochAccumulator``.
+* The sparsity-aware segmentation diagnostics of §5.2 / §8.2
+  (per-target-presence Dice/IoU, per-voxel P/R on target-present
+  scenes, mean predicted-positive-voxel count on target-absent
+  scenes) via ``SplitSegmentationAccumulator`` and the
+  ``voxel_pr_present_scene`` / ``predicted_positive_count`` helpers.
+
+The Dice/IoU computations in ``SplitSegmentationAccumulator`` call
+the recovered segmenter's ``get_dice_batch_sum`` /
+``get_iou_batch_sum`` on single-scene tensors to keep the math
+bit-for-bit consistent with the segmenter; splitting by target
+presence is the only new behavior.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+from scipy import ndimage
+
+from localizer.common.metrics import (
+    get_dice_batch_sum, get_iou_batch_sum,
+)
+
+
+_DEFAULT_STRUCTURE = np.ones((3, 3, 3), dtype=np.int8)
+# v0.9 §7.1 — target-centroid connectivity. 6-connectivity (face
+# neighbors only) in 3D is the spec's "no-diagonal" / "corner-
+# touching is separation" intent. Generated once and reused so we
+# don't pay the construction cost per-scene.
+_TARGET_CONNECTIVITY_STRUCTURE = ndimage.generate_binary_structure(
+    rank=3, connectivity=1,
+)
+# 4-connectivity (face neighbors) on the 2D chip-occupancy grid, matching
+# the dataset-spec GRF cluster CC test (build_multi_target_swarm_128_metadata).
+_FOUR_CONN_2D = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
+
+
+@dataclass
+class PatchProposal:
+    """One proposed patch from the §6 pipeline.
+
+    Attributes:
+        centroid_hw: Spatial centroid ``(h_c, w_c)`` (float, in input
+            voxel coordinates), the spatial projection of the 3D
+            connected component's center of mass.
+        score: Mean sigmoid probability over the component's voxels in
+            ``[0, 1]``. Used to rank proposals for top-K metrics.
+        patch_bounds_hw: Tuple ``(h_lo, h_hi, w_lo, w_hi)`` after
+            in-bounds clamping. The patch covers the full T extent.
+        component_voxel_count: Number of voxels in the source component.
+    """
+
+    centroid_hw: tuple[float, float]
+    score: float
+    patch_bounds_hw: tuple[int, int, int, int]
+    component_voxel_count: int
+
+
+def _clamp_patch_bounds(
+    center: float, patch_size: int, axis_size: int,
+) -> tuple[int, int]:
+    """Return ``(lo, hi)`` for an axis-centered patch, clamped in-bounds.
+
+    Args:
+        center: Float centroid coordinate along this axis.
+        patch_size: Desired patch extent along this axis (e.g. 128).
+        axis_size: Size of the axis being cropped (e.g. 128 for H or W).
+
+    Returns:
+        ``(lo, hi)`` integer half-open interval with ``hi - lo``
+        guaranteed equal to ``min(patch_size, axis_size)``.
+    """
+    if patch_size >= axis_size:
+        return 0, axis_size
+    half = patch_size // 2
+    lo = int(round(center)) - half
+    lo = max(0, min(lo, axis_size - patch_size))
+    return lo, lo + patch_size
+
+
+def extract_proposals(
+    logits: torch.Tensor,
+    threshold: float = 0.5,
+    patch_h: int = 128,
+    patch_w: int = 128,
+    connectivity_structure: np.ndarray | None = None,
+) -> list[PatchProposal]:
+    """Run the §6 patch-extraction pipeline on a single segmentation volume.
+
+    Vectorized via ``scipy.ndimage.center_of_mass`` /
+    ``scipy.ndimage.sum_labels`` over the full component-id list. The
+    original per-component loop (preserved as
+    ``extract_proposals_legacy``) was O(N_components x N_voxels) in
+    memory + compute because each iteration materialized a boolean
+    ``labeled == comp_id`` mask over the entire labeled volume and then
+    walked it via ``argwhere``. This blows up to hours on a 1M-voxel
+    volume when an untrained model thresholds into tens of thousands of
+    tiny components (the Arm 3 epoch-1 hang signature). The vectorized
+    path runs in O(N_voxels) regardless of component count.
+
+    The two paths produce the same ``PatchProposal`` set within float
+    tolerance on the per-component score (sum-of-probs divided by
+    voxel-count vs ``probs[mask].mean()`` — bit-identical for typical
+    component sizes; tested in
+    ``tests/test_stage1_seg_metrics_proposals.py``).
+
+    Args:
+        logits: ``(1, T, H, W)`` or ``(T, H, W)`` raw model logits for one
+            scene (no batch dim — call per-scene from the validation loop).
+            CPU or CUDA tensor; sigmoid is computed inside.
+        threshold: Sigmoid-probability cutoff for the binary mask.
+            Initial choice 0.5 per §6 step 2.
+        patch_h: Patch height in input voxels.
+        patch_w: Patch width in input voxels.
+        connectivity_structure: scipy structuring element. Default is
+            ``np.ones((3, 3, 3))`` (full 26-connectivity in 3D).
+
+    Returns:
+        List of ``PatchProposal`` instances, one per connected component
+        in the thresholded binary volume. Ordered by descending score
+        (highest-confidence proposal first).
+    """
+    if connectivity_structure is None:
+        connectivity_structure = _DEFAULT_STRUCTURE
+
+    probs_t = torch.sigmoid(logits.detach())
+    if probs_t.dim() == 4:
+        probs_t = probs_t.squeeze(0)
+    probs = probs_t.cpu().numpy()
+    _, H, W = probs.shape
+    binary = probs >= threshold
+    labeled, n_components = ndimage.label(binary, structure=connectivity_structure)
+    proposals: list[PatchProposal] = []
+    if n_components > 0:
+        comp_ids = np.arange(1, n_components + 1)
+        # center_of_mass uses the binary as the "weights" -> with
+        # weights=1 on positive voxels, this is the unweighted
+        # centroid (equivalent to coords.mean(axis=0) per component).
+        centroids = ndimage.center_of_mass(
+            binary.astype(np.float32), labeled, comp_ids,
+        )
+        voxel_counts = ndimage.sum_labels(
+            np.ones_like(labeled, dtype=np.int32), labeled, comp_ids,
+        ).astype(int)
+        scores = ndimage.sum_labels(probs, labeled, comp_ids) / np.maximum(
+            voxel_counts, 1,
+        )
+        for (t_c, h_c, w_c), voxel_count, score in zip(
+            centroids, voxel_counts, scores,
+        ):
+            if voxel_count == 0:
+                continue
+            h_lo, h_hi = _clamp_patch_bounds(float(h_c), patch_h, H)
+            w_lo, w_hi = _clamp_patch_bounds(float(w_c), patch_w, W)
+            proposals.append(PatchProposal(
+                centroid_hw=(float(h_c), float(w_c)),
+                score=float(score),
+                patch_bounds_hw=(h_lo, h_hi, w_lo, w_hi),
+                component_voxel_count=int(voxel_count),
+            ))
+    proposals.sort(key=lambda p: p.score, reverse=True)
+    return proposals
+
+
+def extract_proposals_legacy(
+    logits: torch.Tensor,
+    threshold: float = 0.5,
+    patch_h: int = 128,
+    patch_w: int = 128,
+    connectivity_structure: np.ndarray | None = None,
+) -> list[PatchProposal]:
+    """Original per-component-loop implementation of
+    :func:`extract_proposals`, preserved for parity tests.
+
+    Do not call from production code paths — pathologically slow on
+    high-component-count outputs (see :func:`extract_proposals` docstring
+    for the Arm 3 incident).
+    """
+    if connectivity_structure is None:
+        connectivity_structure = _DEFAULT_STRUCTURE
+
+    probs_t = torch.sigmoid(logits.detach())
+    if probs_t.dim() == 4:
+        probs_t = probs_t.squeeze(0)
+    probs = probs_t.cpu().numpy()
+    _, H, W = probs.shape
+    binary = probs >= threshold
+    labeled, n_components = ndimage.label(binary, structure=connectivity_structure)
+    proposals: list[PatchProposal] = []
+    for comp_id in range(1, n_components + 1):
+        comp_mask = labeled == comp_id
+        voxel_count = int(comp_mask.sum())
+        if voxel_count == 0:
+            continue
+        coords = np.argwhere(comp_mask)
+        t_c, h_c, w_c = coords.mean(axis=0)
+        score = float(probs[comp_mask].mean())
+        h_lo, h_hi = _clamp_patch_bounds(float(h_c), patch_h, H)
+        w_lo, w_hi = _clamp_patch_bounds(float(w_c), patch_w, W)
+        proposals.append(PatchProposal(
+            centroid_hw=(float(h_c), float(w_c)),
+            score=score,
+            patch_bounds_hw=(h_lo, h_hi, w_lo, w_hi),
+            component_voxel_count=voxel_count,
+        ))
+    proposals.sort(key=lambda p: p.score, reverse=True)
+    return proposals
+
+
+def _target_centroid_hw(mask: torch.Tensor) -> tuple[float, float] | None:
+    """Spatial centroid (h, w) of *all* target voxels in a binary mask.
+
+    Retained for backward-compat use (v0.6/v0.7/v0.8 single-target
+    semantics). Multi-target callers should use
+    :func:`_target_centroids_hw` instead — on a multi-target scene this
+    single-centroid value is the center-of-mass of all targets, which
+    can be near no actual target.
+
+    Args:
+        mask: ``(1, T, H, W)`` or ``(T, H, W)`` float/bool mask. Voxels
+            with value > 0.5 are treated as positive.
+
+    Returns:
+        ``(h, w)`` float spatial centroid, or ``None`` if the mask is
+        all-zero (target-absent scene).
+    """
+    if mask.dim() == 4:
+        mask = mask.squeeze(0)
+    bin_np = (mask.detach().cpu().numpy() > 0.5)
+    if not bin_np.any():
+        return None
+    coords = np.argwhere(bin_np)
+    _, h_c, w_c = coords.mean(axis=0)
+    return float(h_c), float(w_c)
+
+
+def _target_centroids_hw(mask: torch.Tensor) -> list[tuple[float, float]]:
+    """Per-target spatial (h, w) centroids in a binary mask via 3D
+    connected-components.
+
+    v0.9 §7.1 multi-target metric extension. Each connected component
+    is treated as one true target; its (h, w) centroid is the spatial
+    projection of its 3D center of mass.
+
+    Uses **6-connectivity** (face-neighbors only; ``connectivity=1`` in
+    scipy terms) so corner-touching targets are treated as two separate
+    components per §7.1(vi) — corner-contact at pixel resolution is a
+    quantization artifact rather than meaningful target merging.
+    Edge-touching produces one component regardless of connectivity.
+
+    On single-target masks this returns a list of one centroid that is
+    *byte-identical* to :func:`_target_centroid_hw`'s return (single
+    connected component → ``coords.mean(axis=0)`` over the same pixel
+    set). See ``tests/gate/test_stage1_seg_metrics_proposals.py`` for the equivalence
+    test.
+
+    Args:
+        mask: ``(1, T, H, W)`` or ``(T, H, W)`` float/bool mask. Voxels
+            with value > 0.5 are treated as positive.
+
+    Returns:
+        List of ``(h, w)`` float tuples — one per connected component.
+        Empty list for target-absent scenes.
+    """
+    if mask.dim() == 4:
+        mask = mask.squeeze(0)
+    bin_np = (mask.detach().cpu().numpy() > 0.5)
+    if not bin_np.any():
+        return []
+    labeled, n_components = ndimage.label(
+        bin_np, structure=_TARGET_CONNECTIVITY_STRUCTURE,
+    )
+    centroids: list[tuple[float, float]] = []
+    if n_components == 0:
+        return centroids
+    comp_ids = np.arange(1, n_components + 1)
+    # center_of_mass with weights=bin_np gives the unweighted centroid
+    # over the positive voxels of each component, matching the
+    # single-target ``coords.mean(axis=0)`` semantics bit-identically.
+    # Passing an array index always returns a list (even of length 1).
+    coms = ndimage.center_of_mass(bin_np.astype(np.float32), labeled, comp_ids)
+    for (_, h_c, w_c) in coms:
+        centroids.append((float(h_c), float(w_c)))
+    return centroids
+
+
+def _proposal_contains_target(
+    proposal: PatchProposal, target_hw: tuple[float, float],
+) -> bool:
+    """True iff the target spatial centroid falls inside the proposal's patch."""
+    h_lo, h_hi, w_lo, w_hi = proposal.patch_bounds_hw
+    h, w = target_hw
+    return (h_lo <= h < h_hi) and (w_lo <= w < w_hi)
+
+
+@dataclass
+class DetectionEpochAccumulator:
+    """Per-epoch accumulator for detection-level metrics on the val set.
+
+    Build one, call ``update`` once per scene with the model logits and
+    ground-truth mask, then call ``summarize`` to produce a dict of
+    headline metrics: recall@K and precision@K for K in {1, 3, 5}, mean
+    proposals per scene (split by target-present / target-absent), and
+    mean FP-per-scene.
+
+    "FP-per-scene" definition: for target-present scenes, FP = (total
+    proposals) - (1 if any proposal contained the target else 0); for
+    target-absent scenes, FP = total proposals. Aggregated as the mean
+    across all val scenes.
+    """
+
+    ks: tuple[int, ...] = (1, 3, 5)
+    threshold: float = 0.5
+    patch_h: int = 128
+    patch_w: int = 128
+    # Phase 2 Section A: GRF-cluster-level coverage recall. When
+    # ``cluster_chip_size`` is set (full-res chip size in input voxels:
+    # 32 at 128², 128 at 512²/1024²), each present scene's frame-0
+    # chip-occupancy mask is 4-connectivity-labeled into GRF clusters,
+    # and a cluster counts as "covered" if any top-``cluster_recall_k``
+    # proposal contains a target belonging to it (the dataset-spec CC
+    # test). This is the coverage verdict metric -- robust to the
+    # sub-chip-crop artifact that depresses per-component recall@K at the
+    # tight 1/8 rung (see the K1 @patch-16 characterization). ``None``
+    # disables it (native low-res accumulator, where the full-res chip
+    # grid is degenerate).
+    cluster_chip_size: int | None = None
+
+    def __post_init__(self) -> None:
+        self.n_present: int = 0
+        self.n_absent: int = 0
+        self.proposals_present_total: int = 0
+        self.proposals_absent_total: int = 0
+        # v0.9 §7.1 multi-target hit accounting: topk_hits counts
+        # **per-target hits** summed across scenes, and topk_target_total
+        # counts the total number of true targets across scenes.
+        # Aggregated recall@K = topk_hits[k] / topk_target_total[k].
+        # On single-target data this reduces to v0.8 semantics bit-
+        # identically (each scene contributes 1 to topk_target_total).
+        self.topk_hits: dict[int, int] = {k: 0 for k in self.ks}
+        self.topk_target_total: dict[int, int] = {k: 0 for k in self.ks}
+        self.topk_considered_total: dict[int, int] = {k: 0 for k in self.ks}
+        self.fp_total: int = 0
+        # Phase 2 (§5 item 6): proposal-centric gate-precision counters,
+        # accumulated on target-present scenes only. ``proposals_hit_total``
+        # counts proposals that contain >=1 true target (each proposal
+        # once, regardless of how many targets it covers);
+        # ``distinct_targets_hit_total`` counts true targets covered by
+        # >=1 proposal. These give a multi-target-safe present-side
+        # precision that the slot-denominator ``precision@K`` cannot
+        # (numerator counts target hits, denominator counts proposal
+        # slots — they no longer cancel for N>1).
+        self.proposals_hit_total: int = 0
+        self.distinct_targets_hit_total: int = 0
+        # Phase 2 Section A cluster-coverage counters (present scenes,
+        # only when cluster_chip_size is set). cluster_recall_k = max(ks)
+        # so the coverage check uses the same top-K horizon as the
+        # secondary recall@K (e.g. 15).
+        self.clusters_total: int = 0
+        self.clusters_hit_total: int = 0
+        self.cluster_recall_k: int = max(self.ks)
+
+    def update(self, logits: torch.Tensor, mask: torch.Tensor) -> None:
+        """Add one scene to the accumulator.
+
+        Args:
+            logits: ``(1, T, H, W)`` or ``(T, H, W)`` model logits.
+            mask: ``(1, T, H, W)`` or ``(T, H, W)`` ground-truth mask.
+        """
+        proposals = extract_proposals(
+            logits,
+            threshold=self.threshold,
+            patch_h=self.patch_h,
+            patch_w=self.patch_w,
+        )
+        # v0.9 §7.1: per-target centroids via 3D connected components.
+        # Empty list on target-absent scenes.
+        target_centroids = _target_centroids_hw(mask)
+        n_proposals = len(proposals)
+        n_targets = len(target_centroids)
+        if n_targets == 0:
+            self.n_absent += 1
+            self.proposals_absent_total += n_proposals
+            self.fp_total += n_proposals
+            return
+        self.n_present += 1
+        self.proposals_present_total += n_proposals
+        for k in self.ks:
+            self.topk_considered_total[k] += min(k, n_proposals)
+        # FP accounting: a "successful proposal" is any proposal that
+        # contains any true target; the rest are FPs. Preserves the
+        # v0.8 FP definition (was: one slot subtracted if any target
+        # was hit; rest are FP) generalized to multi-target.
+        any_target_hit_anywhere = any(
+            _proposal_contains_target(p, tgt_hw)
+            for p in proposals
+            for tgt_hw in target_centroids
+        )
+        if any_target_hit_anywhere:
+            self.fp_total += max(0, n_proposals - 1)
+        else:
+            self.fp_total += n_proposals
+        # Phase 2 (§5 item 6) gate-precision counters (present scenes).
+        # Count each proposal once if it contains any true target.
+        self.proposals_hit_total += sum(
+            1 for p in proposals
+            if any(_proposal_contains_target(p, tgt_hw)
+                   for tgt_hw in target_centroids)
+        )
+        # Count each distinct target once if covered by any proposal.
+        self.distinct_targets_hit_total += sum(
+            1 for tgt_hw in target_centroids
+            if any(_proposal_contains_target(p, tgt_hw) for p in proposals)
+        )
+        # Phase 2 Section A: GRF-cluster-level coverage recall. A cluster
+        # (4-conn group of occupied frame-0 chips) is covered if any of
+        # the top-cluster_recall_k proposals contains a target assigned to
+        # it. Robust to the sub-chip-crop artifact in per-component recall.
+        if self.cluster_chip_size is not None:
+            mnp = mask.detach().cpu().numpy()
+            while mnp.ndim > 3:
+                mnp = mnp[0]
+            f0 = mnp[0] > 0.5                      # (H, W) frame-0 occupancy
+            cs = self.cluster_chip_size
+            nch_h = max(1, f0.shape[0] // cs)
+            nch_w = max(1, f0.shape[1] // cs)
+            chip_mask = np.zeros((nch_h, nch_w), dtype=bool)
+            rr, cc = np.nonzero(f0)
+            if rr.size:
+                chip_mask[np.minimum(rr // cs, nch_h - 1),
+                          np.minimum(cc // cs, nch_w - 1)] = True
+            clab, _ = ndimage.label(chip_mask, structure=_FOUR_CONN_2D)
+            top_c = proposals[:self.cluster_recall_k]
+            cluster_hit: dict[int, bool] = {}
+            for (h, w) in target_centroids:
+                cid = int(clab[min(int(h) // cs, nch_h - 1),
+                               min(int(w) // cs, nch_w - 1)])
+                if cid == 0:
+                    continue
+                hit = any(_proposal_contains_target(p, (h, w)) for p in top_c)
+                cluster_hit[cid] = cluster_hit.get(cid, False) or hit
+            self.clusters_total += len(cluster_hit)
+            self.clusters_hit_total += sum(1 for v in cluster_hit.values() if v)
+        # Per-target hit counting at each K. A true target is "hit at K"
+        # if any of the top-K proposals contains it. Sum across targets
+        # gives per-scene hits at K, accumulated into topk_hits[k].
+        for k in self.ks:
+            top = proposals[:k]
+            scene_hits_at_k = sum(
+                1 for tgt_hw in target_centroids
+                if any(_proposal_contains_target(p, tgt_hw) for p in top)
+            )
+            self.topk_hits[k] += scene_hits_at_k
+            self.topk_target_total[k] += n_targets
+
+    def summarize(self) -> dict[str, float]:
+        """Compute headline detection metrics from the accumulated counts.
+
+        Returns:
+            Dict with keys:
+                ``recall@K`` (for K in ``self.ks``),
+                ``precision@K`` (for K in ``self.ks``),
+                ``mean_proposals_per_scene_present``,
+                ``mean_proposals_per_scene_absent``,
+                ``mean_fp_per_scene``,
+                ``n_present``, ``n_absent``.
+
+            v0.9 §7.1: ``recall@K`` is the **per-target hit rate**
+            (``topk_hits[k] / topk_target_total[k]``) — the fraction of
+            true targets across present scenes covered by at least one
+            top-K proposal. On single-target data this reduces bit-
+            identically to v0.8 "fraction of present scenes hit"
+            (each scene contributes 1 target). ``precision@K`` is
+            ``topk_hits[k] / sum(min(K, n_proposals))`` over target-
+            present scenes only — diagnostic on multi-target data
+            (the denominator counts proposal slots while the numerator
+            counts target hits; the two can no longer cancel cleanly
+            when N>1). Returns NaN where a denominator is zero.
+        """
+        out: dict[str, float] = {
+            "n_present": float(self.n_present),
+            "n_absent": float(self.n_absent),
+        }
+        n_total = self.n_present + self.n_absent
+        for k in self.ks:
+            target_denom = self.topk_target_total[k]
+            recall = (
+                self.topk_hits[k] / target_denom
+                if target_denom > 0 else float("nan")
+            )
+            denom = self.topk_considered_total[k]
+            precision = (
+                self.topk_hits[k] / denom if denom > 0 else float("nan")
+            )
+            out[f"recall@{k}"] = recall
+            out[f"precision@{k}"] = precision
+        out["mean_proposals_per_scene_present"] = (
+            self.proposals_present_total / self.n_present
+            if self.n_present > 0 else float("nan")
+        )
+        out["mean_proposals_per_scene_absent"] = (
+            self.proposals_absent_total / self.n_absent
+            if self.n_absent > 0 else float("nan")
+        )
+        out["mean_fp_per_scene"] = (
+            self.fp_total / n_total if n_total > 0 else float("nan")
+        )
+        # Phase 2 (§5 item 6) gate-precision metrics (present scenes).
+        # precision_present: fraction of present-scene proposals that
+        # actually contain a target (proposal trustworthiness).
+        # redundancy_present: proposals per distinct target hit
+        # (efficiency; >1 means multiple proposals per covered target).
+        out["precision_present"] = (
+            self.proposals_hit_total / self.proposals_present_total
+            if self.proposals_present_total > 0 else float("nan")
+        )
+        out["redundancy_present"] = (
+            self.proposals_present_total / self.distinct_targets_hit_total
+            if self.distinct_targets_hit_total > 0 else float("nan")
+        )
+        # Phase 2 Section A: GRF-cluster coverage recall (the coverage
+        # verdict metric). NaN when cluster_chip_size disabled or no
+        # present clusters accumulated.
+        out["cluster_recall"] = (
+            self.clusters_hit_total / self.clusters_total
+            if self.clusters_total > 0 else float("nan")
+        )
+        return out
+
+
+def voxel_pr_present_scene(
+    logits: torch.Tensor,
+    mask: torch.Tensor,
+    threshold: float = 0.5,
+) -> tuple[float, float] | None:
+    """Per-voxel precision and recall on a single target-present scene.
+
+    Args:
+        logits: ``(1, T, H, W)`` or ``(T, H, W)`` model logits.
+        mask: same shape, ground-truth binary mask.
+        threshold: sigmoid probability cutoff.
+
+    Returns:
+        ``(precision, recall)`` tuple. Returns ``None`` if the mask
+        is all-zero (target-absent — caller should not invoke this
+        on target-absent scenes; it is a programming error if they
+        do). Both values in ``[0, 1]``. Precision = 0 if no positive
+        predictions; recall = 0 if no positives can be matched.
+    """
+    truth_bin = (mask.detach() > 0.5)
+    if not bool(truth_bin.any().item()):
+        return None
+    pred_bin = (torch.sigmoid(logits.detach()) >= threshold)
+    truth_bin = truth_bin.to(pred_bin.device)
+    tp = float((pred_bin & truth_bin).sum().item())
+    pred_pos = float(pred_bin.sum().item())
+    truth_pos = float(truth_bin.sum().item())
+    precision = tp / pred_pos if pred_pos > 0 else 0.0
+    recall = tp / truth_pos if truth_pos > 0 else 0.0
+    return precision, recall
+
+
+def predicted_positive_count(
+    logits: torch.Tensor,
+    threshold: float = 0.5,
+) -> int:
+    """Count of voxels predicted positive in a single scene.
+
+    Args:
+        logits: ``(1, T, H, W)`` or ``(T, H, W)`` model logits.
+        threshold: sigmoid probability cutoff.
+
+    Returns:
+        Integer count of voxels with sigmoid(logits) >= threshold.
+        Intended for use on target-absent scenes — there it is the
+        scene's contribution to
+        ``mean_predicted_positives_per_scene_absent``. Caller can
+        invoke on target-present scenes too if desired; the function
+        does not check.
+    """
+    pred_bin = (torch.sigmoid(logits.detach()) >= threshold)
+    return int(pred_bin.sum().item())
+
+
+class SplitSegmentationAccumulator:
+    """Per-epoch accumulator for segmentation diagnostics split by target presence.
+
+    Tracks per-target-presence Dice and IoU plus per-voxel precision
+    and recall on target-present scenes and mean predicted-positive
+    voxel count on target-absent scenes. The Dice/IoU computations
+    call the recovered segmenter's ``get_dice_batch_sum`` /
+    ``get_iou_batch_sum`` on single-scene tensors so the math stays
+    bit-for-bit consistent with the segmenter; the only new behavior
+    is the split-by-target-presence aggregation.
+
+    Build one per epoch (train or val); call ``update`` once per
+    scene with the model logits, ground-truth mask, and the scene's
+    label (1 = target-present, 0 = target-absent). Call
+    ``summarize`` at epoch end.
+    """
+
+    def __init__(self, threshold: float = 0.5) -> None:
+        self.threshold = float(threshold)
+        self.n_present: int = 0
+        self.n_absent: int = 0
+        self.dice_present_sum: float = 0.0
+        self.iou_present_sum: float = 0.0
+        self.dice_absent_sum: float = 0.0
+        self.iou_absent_sum: float = 0.0
+        self.vox_p_present_sum: float = 0.0
+        self.vox_r_present_sum: float = 0.0
+        self.pos_vox_absent_sum: int = 0
+
+    def update(self, logits: torch.Tensor, mask: torch.Tensor, label: int) -> None:
+        """Add one scene to the accumulator.
+
+        Args:
+            logits: ``(1, T, H, W)`` or ``(T, H, W)`` model logits.
+            mask: same shape, ground-truth mask.
+            label: 1 for target-present, 0 for target-absent.
+        """
+        # get_{dice,iou}_batch_sum expect ``(B, 1, T, H, W)`` and
+        # return a per-batch sum. Wrap a single scene into that
+        # batch-of-1 shape so a single call gives the per-scene
+        # value directly.
+        log = logits.detach()
+        msk = mask.detach()
+        if log.dim() == 3:
+            log = log.unsqueeze(0)
+        if msk.dim() == 3:
+            msk = msk.unsqueeze(0)
+        log_b = log.unsqueeze(0)
+        msk_b = msk.unsqueeze(0)
+        dice = float(get_dice_batch_sum(log_b, msk_b).item())
+        iou = float(get_iou_batch_sum(log_b, msk_b).item())
+        if int(label) == 1:
+            self.n_present += 1
+            self.dice_present_sum += dice
+            self.iou_present_sum += iou
+            pr = voxel_pr_present_scene(log, msk, threshold=self.threshold)
+            if pr is not None:
+                vp, vr = pr
+                self.vox_p_present_sum += vp
+                self.vox_r_present_sum += vr
+        else:
+            self.n_absent += 1
+            self.dice_absent_sum += dice
+            self.iou_absent_sum += iou
+            self.pos_vox_absent_sum += predicted_positive_count(
+                log, threshold=self.threshold,
+            )
+
+    def summarize(self) -> dict[str, float]:
+        """Return per-epoch split-by-presence segmentation metrics.
+
+        Returns:
+            Dict with keys ``dice_present``, ``iou_present``,
+            ``vox_p_present``, ``vox_r_present``, ``dice_absent``,
+            ``iou_absent``, ``mean_pos_vox_absent``, ``n_present``,
+            ``n_absent``. NaN where a denominator is zero.
+        """
+        nan = float("nan")
+        out: dict[str, float] = {
+            "n_present": float(self.n_present),
+            "n_absent": float(self.n_absent),
+        }
+        if self.n_present > 0:
+            out["dice_present"] = self.dice_present_sum / self.n_present
+            out["iou_present"] = self.iou_present_sum / self.n_present
+            out["vox_p_present"] = self.vox_p_present_sum / self.n_present
+            out["vox_r_present"] = self.vox_r_present_sum / self.n_present
+        else:
+            out["dice_present"] = nan
+            out["iou_present"] = nan
+            out["vox_p_present"] = nan
+            out["vox_r_present"] = nan
+        if self.n_absent > 0:
+            out["dice_absent"] = self.dice_absent_sum / self.n_absent
+            out["iou_absent"] = self.iou_absent_sum / self.n_absent
+            out["mean_pos_vox_absent"] = self.pos_vox_absent_sum / self.n_absent
+        else:
+            out["dice_absent"] = nan
+            out["iou_absent"] = nan
+            out["mean_pos_vox_absent"] = nan
+        return out

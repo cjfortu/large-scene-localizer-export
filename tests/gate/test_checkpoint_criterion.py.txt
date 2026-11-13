@@ -1,0 +1,158 @@
+"""Tests for the v0.5 ``checkpoint_criterion`` selection logic.
+
+Per ``documents/history/specs/stage1_v0_5_design.md`` §5.1 and §9 step 4, v0.5
+introduces an explicit ``checkpoint_criterion`` config field with two
+values:
+
+* ``"best_val_loss"`` — v0 behavior (minimize val loss); kept as
+  default for v0 reproducibility.
+* ``"best_unsplit_dice"`` — v0.5 behavior (maximize
+  ``0.5 * dice_present + 0.5 * dice_absent``).
+
+These tests cover the selection helpers
+(``_criterion_initial_value``, ``_is_new_best``, ``_criterion_value``)
+and the ``Stage1SegTrainConfig`` field plumbing. They do not invoke
+``run_training`` end-to-end (that requires a real dataset and GPU,
+exercised in the smoke-test session that follows).
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+_ROOT = Path(__file__).resolve().parents[2]
+
+from localizer.gate.train import (  # noqa: E402
+    _VALID_CHECKPOINT_CRITERIA,
+    _criterion_initial_value,
+    _criterion_value,
+    _is_new_best,
+    Stage1SegTrainConfig,
+)
+
+
+def test_valid_criteria_listing() -> None:
+    """The valid-criteria tuple lists the supported values (v0/v0.5/v0.7
+    pair plus v0.8's ``best_dice_product``)."""
+    assert _VALID_CHECKPOINT_CRITERIA == (
+        "best_val_loss", "best_unsplit_dice", "best_dice_product",
+    )
+
+
+def test_initial_value_best_val_loss_is_positive_infinity() -> None:
+    """Minimize-loss criterion starts at ``+inf``."""
+    assert _criterion_initial_value("best_val_loss") == float("inf")
+
+
+def test_initial_value_best_unsplit_dice_is_negative_infinity() -> None:
+    """Maximize-dice criterion starts at ``-inf``."""
+    assert _criterion_initial_value("best_unsplit_dice") == float("-inf")
+
+
+def test_initial_value_invalid_raises() -> None:
+    with pytest.raises(ValueError, match="checkpoint_criterion"):
+        _criterion_initial_value("not_a_real_criterion")
+
+
+def test_is_new_best_val_loss_minimizes() -> None:
+    """For loss: smaller is better; ties don't trigger re-save."""
+    assert _is_new_best("best_val_loss", best_so_far=1.0, candidate=0.5)
+    assert not _is_new_best("best_val_loss", best_so_far=1.0, candidate=1.5)
+    assert not _is_new_best("best_val_loss", best_so_far=1.0, candidate=1.0)  # tie
+
+
+def test_is_new_best_unsplit_dice_maximizes() -> None:
+    """For dice: larger is better; ties don't trigger re-save."""
+    assert _is_new_best("best_unsplit_dice", best_so_far=0.5, candidate=0.8)
+    assert not _is_new_best("best_unsplit_dice", best_so_far=0.5, candidate=0.3)
+    assert not _is_new_best("best_unsplit_dice", best_so_far=0.5, candidate=0.5)  # tie
+
+
+def test_is_new_best_invalid_raises() -> None:
+    with pytest.raises(ValueError, match="checkpoint_criterion"):
+        _is_new_best("garbage", best_so_far=0.0, candidate=0.0)
+
+
+def test_first_epoch_always_improves_under_either_criterion() -> None:
+    """The initial sentinel guarantees epoch 1 saves a checkpoint."""
+    # Loss: any finite candidate beats +inf.
+    assert _is_new_best(
+        "best_val_loss",
+        best_so_far=_criterion_initial_value("best_val_loss"),
+        candidate=1e6,
+    )
+    # Dice: any value (even 0.0) beats -inf.
+    assert _is_new_best(
+        "best_unsplit_dice",
+        best_so_far=_criterion_initial_value("best_unsplit_dice"),
+        candidate=0.0,
+    )
+
+
+def test_criterion_value_best_val_loss_reads_val_loss_scalar() -> None:
+    """``best_val_loss`` ignores val_metrics and returns the loss scalar."""
+    val_m = {"dice_present": 0.9, "dice_absent": 0.1, "noise": 42}
+    assert _criterion_value("best_val_loss", val_loss=0.123, val_metrics=val_m) == 0.123
+
+
+def test_criterion_value_best_unsplit_dice_uses_50_50_combination() -> None:
+    """``best_unsplit_dice`` is ``0.5*dice_present + 0.5*dice_absent``."""
+    val_m = {"dice_present": 0.80, "dice_absent": 0.60}
+    v = _criterion_value("best_unsplit_dice", val_loss=999.0, val_metrics=val_m)
+    assert v == pytest.approx(0.70)
+
+
+def test_criterion_value_best_unsplit_dice_extremes() -> None:
+    val_m = {"dice_present": 1.0, "dice_absent": 1.0}
+    assert _criterion_value("best_unsplit_dice", 0.0, val_m) == pytest.approx(1.0)
+    val_m_zero = {"dice_present": 0.0, "dice_absent": 0.0}
+    assert _criterion_value("best_unsplit_dice", 0.0, val_m_zero) == pytest.approx(0.0)
+
+
+def test_criterion_value_invalid_raises() -> None:
+    with pytest.raises(ValueError, match="checkpoint_criterion"):
+        _criterion_value("nope", 0.0, {"dice_present": 0.5, "dice_absent": 0.5})
+
+
+def test_config_default_checkpoint_criterion_is_best_val_loss() -> None:
+    """Default preserves v0 behavior so unchanged v0 configs reproduce v0."""
+    cfg = Stage1SegTrainConfig()
+    assert cfg.checkpoint_criterion == "best_val_loss"
+
+
+def test_config_default_temporal_variant_is_baseline() -> None:
+    """Default ``temporal_variant="baseline"`` preserves v0 behavior."""
+    cfg = Stage1SegTrainConfig()
+    assert cfg.temporal_variant == "baseline"
+
+
+def test_config_accepts_new_v0_5_fields() -> None:
+    """Config constructor accepts the new fields as kwargs."""
+    cfg = Stage1SegTrainConfig(
+        bottleneck_variant="D",
+        temporal_variant="wide_t_kernel",
+        checkpoint_criterion="best_unsplit_dice",
+    )
+    assert cfg.bottleneck_variant == "D"
+    assert cfg.temporal_variant == "wide_t_kernel"
+    assert cfg.checkpoint_criterion == "best_unsplit_dice"
+
+
+def test_v0_config_still_loads_unchanged() -> None:
+    """An existing v0 YAML config still constructs a valid config object.
+
+    Regression guard: the v0 configs (frozen copy ``tests/data/stage1_seg_v0_variant_D.yaml``)
+    must continue to load via ``Stage1SegTrainConfig(**yaml.safe_load(...))``
+    without any modification.
+    """
+    import yaml
+    cfg_path = _ROOT / "tests" / "data" / "stage1_seg_v0_variant_D.yaml"
+    with cfg_path.open() as f:
+        cfg_dict = yaml.safe_load(f)
+    cfg = Stage1SegTrainConfig(**cfg_dict)
+    assert cfg.bottleneck_variant == "D"
+    assert cfg.temporal_variant == "baseline"  # default kicks in
+    assert cfg.checkpoint_criterion == "best_val_loss"  # default kicks in

@@ -1,0 +1,34 @@
+# Volumetric segmenter default config.
+
+seed: 0
+
+# Architecture
+nfeats: 32
+
+# Loss
+# pos_weight = (H * W) / target_positive_pixels_per_frame.
+# For radius=2 disk: pi * 2**2 ~= 12.6 -> 13 positive pixels per frame.
+# At 128x128 spatial, pos_weight ~= 16384 / 13 ~= 1260.
+target_positive_pixels_per_frame: 13
+
+# Optimizer
+lr: 1.0e-3
+weight_decay: 1.0e-2
+
+# Scheduler
+scheduler_factor: 0.5
+scheduler_patience: 10
+
+# Training
+batch_size: 8
+num_epochs: 150
+subset_size: 2500
+num_workers: 4
+
+# Data
+dataset: swarm_128x128x64            # resolved under $LSL_DATA_ROOT
+val_split: 0.1
+val_split_seed: 0
+
+# Output
+run_name: segmenter/default            # resolved under $LSL_RUNS_ROOT

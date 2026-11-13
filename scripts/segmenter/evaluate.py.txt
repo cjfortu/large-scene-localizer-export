@@ -1,0 +1,128 @@
+"""Evaluate a saved segmenter (Stage 3) checkpoint on its validation split (inference only).
+
+Rebuilds the exact validation membership the trainer used (the first
+``subset_size`` scenes by index, split by ``train_test_split`` with
+``val_split`` / ``val_split_seed`` from the config) and computes the same
+quantities ``localizer.segmenter.train._validate`` logs each epoch: mean
+BCE-with-logits loss (same ``pos_weight`` formula), mean per-sample Dice and
+mean per-sample IoU at threshold 0.5. No training, no scheduler, no files
+written except the optional ``--out`` JSON.
+
+The shipped checkpoint ``segmenter_volseg_ep19`` was selected by best
+val_loss at epoch 19; its logged val metrics are loss 0.0339, Dice 0.3909,
+IoU 0.3183 (see ``checkpoints/segmenter_volseg_ep19.json``).
+
+Usage::
+
+    python scripts/segmenter/evaluate.py --config configs/segmenter/default.yaml \
+        --checkpoint segmenter_volseg_ep19.safetensors --out segmenter_eval.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import yaml
+
+from localizer.common.data import make_dataloaders
+from localizer.common.metrics import get_dice_batch_sum, get_iou_batch_sum
+from localizer.common.checkpoint_io import load_weights
+from localizer.common.paths import add_root_args, resolve_under
+from localizer.segmenter.model import VolumetricUNet
+
+
+def evaluate(cfg: dict, data_root: str, checkpoint: str, batch_size: int,
+             num_workers: int) -> dict:
+    """Score one checkpoint on the config's validation split.
+
+    Args:
+        cfg: Parsed segmenter YAML config (uses ``nfeats``, ``subset_size``,
+            ``val_split``, ``val_split_seed``, ``target_positive_pixels_per_frame``).
+        data_root: Dataset directory holding ``data_all/`` and ``label_msk/``.
+        checkpoint: Path to a raw ``state_dict`` file.
+        batch_size: Validation batch size (metrics are per-sample, so this
+            does not change Dice/IoU; loss is batch-mean weighted by batch size,
+            as in the trainer).
+        num_workers: DataLoader workers.
+
+    Returns:
+        Dict with ``n_val``, ``val_loss``, ``val_dice``, ``val_iou`` and the
+        inputs that define the split.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _, val_loader, datshape = make_dataloaders(
+        data_root=data_root, subset_size=cfg["subset_size"], batch_size=batch_size,
+        num_workers=num_workers, val_split=cfg["val_split"],
+        val_split_seed=cfg["val_split_seed"],
+    )
+    model = VolumetricUNet(cfg["nfeats"]).to(device)
+    load_weights(model, checkpoint, map_location=device, strict=True)
+    model.eval()
+
+    h, w = datshape[-2], datshape[-1]
+    pos_weight = torch.tensor([(h * w) / cfg["target_positive_pixels_per_frame"]], device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    loss_sum = 0.0
+    dice_sum = torch.tensor(0.0, device=device)
+    iou_sum = torch.tensor(0.0, device=device)
+    with torch.no_grad():
+        for sample in val_loader:
+            videos = sample["volume"].to(device)
+            masks = sample["mask"].to(device)
+            outputs = model(videos)
+            loss_sum += criterion(outputs, masks).item() * videos.size(0)
+            dice_sum += get_dice_batch_sum(outputs, masks)
+            iou_sum += get_iou_batch_sum(outputs, masks)
+    n = len(val_loader.dataset)
+    return {
+        "device": str(device), "host": socket.gethostname(),
+        "checkpoint": str(checkpoint), "data_root": str(data_root),
+        "subset_size": cfg["subset_size"], "val_split": cfg["val_split"],
+        "val_split_seed": cfg["val_split_seed"], "n_val": n,
+        "pos_weight": float(pos_weight.item()),
+        "val_loss": loss_sum / n, "val_dice": float(dice_sum.item()) / n,
+        "val_iou": float(iou_sum.item()) / n,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Command-line entry point; prints the metrics and optionally writes JSON."""
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--config", default="configs/segmenter/default.yaml")
+    p.add_argument("--checkpoint", default="segmenter_volseg_ep19.safetensors",
+                   help="checkpoint name under the checkpoints root, or an absolute path")
+    p.add_argument("--dataset", default=None,
+                   help="dataset name under the data root, or an absolute path "
+                        "(default: the config's `dataset`)")
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--out", default=None, help="optional output JSON path")
+    add_root_args(p, ("data", "ckpt"))
+    args = p.parse_args(argv)
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+    data_root = resolve_under("data", args.dataset or cfg["dataset"], args.data_root_dir)
+    ckpt = resolve_under("ckpt", args.checkpoint, args.ckpt_root_dir)
+    res = evaluate(cfg, str(data_root), str(ckpt), args.batch_size, args.num_workers)
+    print(f"device={res['device']} host={res['host']}")
+    print(f"val N={res['n_val']} (subset_size={res['subset_size']}, "
+          f"val_split={res['val_split']}, seed={res['val_split_seed']})")
+    print(f"val: loss={res['val_loss']:.4f} dice={res['val_dice']:.4f} iou={res['val_iou']:.4f}")
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(res, indent=2))
+        print(f"wrote {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

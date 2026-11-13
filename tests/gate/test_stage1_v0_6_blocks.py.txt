@@ -1,0 +1,112 @@
+"""Unit tests for the Stage 1 v0.6 shared building blocks.
+
+Tests cover input/output shape, NaN-freedom on random input, gradient
+flow (backward produces finite gradients on every parameter), and the
+TokenMerge3D / TokenSplit3D round-trip shape contract.
+
+Mamba blocks require CUDA (the fast scan kernel is CUDA-only); tests are
+skipped on CPU-only machines.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from localizer.gate.blocks import (
+    PatchEmbed3D, TemporalMambaBlock, TokenMambaBlock,
+    TokenMerge3D, TokenSplit3D,
+)
+
+
+CUDA_REQUIRED = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Mamba selective-scan kernel requires CUDA",
+)
+
+
+@CUDA_REQUIRED
+def test_temporal_mamba_block_shape_and_grad():
+    """``TemporalMambaBlock`` preserves ``(B, C, T, H, W)`` and produces
+    finite forward output + finite gradients on every parameter.
+
+    Uses a small shape ``(2, 8, 16, 8, 8)`` rather than the full v0.6
+    geometry to keep the test fast and CPU-memory light during CI; the
+    block's shape contract is independent of the exact spatial extent.
+    """
+    block = TemporalMambaBlock(channels=8).cuda()
+    x = torch.randn(2, 8, 16, 8, 8, device="cuda", requires_grad=True)
+    y = block(x)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+    loss = y.sum()
+    loss.backward()
+    for name, p in block.named_parameters():
+        assert p.grad is not None, f"missing grad for {name}"
+        assert torch.isfinite(p.grad).all(), f"non-finite grad for {name}"
+
+
+@CUDA_REQUIRED
+def test_token_mamba_block_shape_and_grad():
+    """``TokenMambaBlock`` preserves ``(B, T_tok, H_tok, W_tok, C)`` and
+    produces finite forward + finite gradients.
+    """
+    block = TokenMambaBlock(channels=16).cuda()
+    x = torch.randn(2, 16, 4, 4, 16, device="cuda", requires_grad=True)
+    y = block(x)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+    loss = y.sum()
+    loss.backward()
+    for name, p in block.named_parameters():
+        assert p.grad is not None, f"missing grad for {name}"
+        assert torch.isfinite(p.grad).all(), f"non-finite grad for {name}"
+
+
+def test_patch_embed_3d_shape():
+    """``PatchEmbed3D`` with patch ``(4, 4, 4)`` produces
+    ``(B, T/4, H/4, W/4, embed_dim)`` channels-last.
+    """
+    embed = PatchEmbed3D(in_channels=1, embed_dim=64, patch_size=(4, 4, 4))
+    x = torch.randn(2, 1, 64, 128, 128)
+    y = embed(x)
+    assert y.shape == (2, 16, 32, 32, 64), f"got {y.shape}"
+    assert torch.isfinite(y).all()
+
+
+def test_token_merge_3d_shape():
+    """``TokenMerge3D`` halves spatial dims and doubles channels."""
+    merge = TokenMerge3D(channels=64)
+    x = torch.randn(2, 16, 32, 32, 64)
+    y = merge(x)
+    assert y.shape == (2, 16, 16, 16, 128), f"got {y.shape}"
+    assert torch.isfinite(y).all()
+
+
+def test_token_merge_rejects_odd_spatial():
+    """``TokenMerge3D`` requires even H, W; raises ``ValueError``
+    otherwise."""
+    merge = TokenMerge3D(channels=8)
+    x = torch.randn(1, 4, 5, 8, 8)  # H=5 odd
+    with pytest.raises(ValueError):
+        merge(x)
+
+
+def test_token_split_3d_shape():
+    """``TokenSplit3D`` doubles spatial dims and halves channels."""
+    split = TokenSplit3D(channels=128)
+    x = torch.randn(2, 16, 16, 16, 128)
+    y = split(x)
+    assert y.shape == (2, 16, 32, 32, 64), f"got {y.shape}"
+    assert torch.isfinite(y).all()
+
+
+def test_token_merge_split_shape_roundtrip():
+    """``TokenMerge3D`` followed by ``TokenSplit3D`` recovers the
+    spatial/channel shape (values are NOT bit-identical because both
+    apply ``Linear`` projections — only the shape contract is tested)."""
+    merge = TokenMerge3D(channels=32)
+    split = TokenSplit3D(channels=64)
+    x = torch.randn(1, 8, 16, 16, 32)
+    y = split(merge(x))
+    assert y.shape == x.shape

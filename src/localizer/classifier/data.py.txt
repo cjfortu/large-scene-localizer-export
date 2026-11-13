@@ -1,0 +1,121 @@
+"""Classifier dataset + dataloader builders (recovered from earlier Stage 2 work).
+
+Reads ``vid{idx}_{label}.npy`` files from ``data_root/data_all/`` and parses
+the binary label from the filename suffix. Per-sample output is
+``(volume, label)`` where ``volume`` is ``(1, T, H, W) = (1, 64, 128, 128)``
+float32 in [0, 1] and ``label`` is a scalar 0 or 1.
+
+Recovery adaptations:
+* Replaces the original ``pickle``-based loader (``data_5k.bin`` /
+  ``data_5klabel.bin``) with direct ``np.load`` from the shared swarm
+  generator output. Same files the segmenter consumes.
+* Drops the ``torchvision.transforms.Resize((128, 128))`` op — the
+  recovery's swarm data is already 128x128.
+* Stratified 90/10 split with ``train_test_split(stratify=labels,
+  random_state=91)`` matching the original engineer's convention.
+"""
+
+from __future__ import annotations
+
+import glob
+import logging
+import os
+import re
+from pathlib import Path
+
+import numpy as np
+import torch
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+
+
+logger = logging.getLogger(__name__)
+_LABEL_RE = re.compile(r"vid\d+_([01])\.npy$")
+_VID_IDX_RE = re.compile(r"vid(\d+)_[01]\.npy$")
+
+
+def _vid_idx(basename: str) -> int:
+    m = _VID_IDX_RE.match(basename)
+    if m is None:
+        raise ValueError(f"Cannot parse vid index from filename: {basename}")
+    return int(m.group(1))
+
+
+class MoverDataset(Dataset):
+    """Binary scene-level classifier dataset over swarm NPY files."""
+
+    def __init__(self, file_list: list[str], data_dir: str | Path) -> None:
+        """Args:
+            file_list: List of ``vid{idx}_{label}.npy`` basenames.
+            data_dir: Directory containing those files.
+        """
+        self.file_list = list(file_list)
+        self.data_dir = str(data_dir)
+
+    def __len__(self) -> int:
+        return len(self.file_list)
+
+    def __getitem__(self, idx: int):
+        file_name = self.file_list[idx]
+        path = os.path.join(self.data_dir, file_name)
+        video = np.load(path)  # (T, H, W) uint8
+        video = torch.tensor(video, dtype=torch.float32) / 255.0  # (T, H, W) float
+        video = video.unsqueeze(0)  # (1, T, H, W)
+        match = _LABEL_RE.search(file_name)
+        if match is None:
+            raise ValueError(f"Cannot parse label from filename: {file_name}")
+        label = torch.tensor(float(match.group(1)), dtype=torch.float32)
+        return video, label
+
+
+def make_dataloaders(
+    data_root: str | Path,
+    batch_size: int,
+    num_workers: int = 4,
+    val_split: float = 0.1,
+    val_split_seed: int = 91,
+    max_samples: int | None = None,
+) -> tuple[DataLoader, DataLoader, int]:
+    """Build stratified train + val DataLoaders.
+
+    Args:
+        data_root: Directory containing ``data_all/`` (mirrors the segmenter).
+        batch_size: DataLoader batch size.
+        num_workers: DataLoader workers.
+        val_split: Fraction held out for validation.
+        val_split_seed: ``random_state`` for stratified split. The original
+            engineer used 91 — preserved.
+        max_samples: Cap the dataset to the first N samples (sorted by
+            filename). Useful for smoke tests; ``None`` uses all samples.
+
+    Returns:
+        ``(train_loader, val_loader, n_samples)``.
+    """
+    data_dir = Path(data_root) / "data_all"
+    file_list = sorted(
+        [os.path.basename(f) for f in glob.glob(os.path.join(str(data_dir), "vid*.npy"))],
+        key=_vid_idx,
+    )
+    if not file_list:
+        raise FileNotFoundError(f"No vid*.npy files found in {data_dir}")
+    if max_samples is not None:
+        file_list = file_list[:max_samples]
+    labels = [int(_LABEL_RE.search(f).group(1)) for f in file_list]
+    logger.info(
+        "Found %d samples in %s; label distribution: 0=%d, 1=%d",
+        len(file_list), data_dir, labels.count(0), labels.count(1),
+    )
+    train_files, val_files, _, _ = train_test_split(
+        file_list, labels, test_size=val_split, random_state=val_split_seed, stratify=labels,
+    )
+    train_dataset = MoverDataset(train_files, data_dir)
+    val_dataset = MoverDataset(val_files, data_dir)
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        drop_last=False,
+    )
+    return train_loader, val_loader, len(file_list)

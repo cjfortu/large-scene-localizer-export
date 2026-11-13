@@ -1,0 +1,273 @@
+"""Tests for the multi-target chip-aware swarm generator (spec §6).
+
+Covers the five required tests from
+documents/history/specs/multi_target_swarm_1024x1024x64_dataset_spec.md §6:
+
+- 6.1: test_swarm_chip_aware_n_distribution
+- 6.2: test_swarm_chip_aware_empty_fraction
+- 6.3: test_swarm_multi_target_mask_union
+- 6.4: test_swarm_multi_target_velocity_independence
+- 6.5: test_swarm_backward_compat_v0_5_v0_6
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+import pytest
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+from localizer.synth.swarm import DataGenerator, worker  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_test_gen(tmp_path: Path, n_circles: int = 2000) -> DataGenerator:
+    """Reduced-size chip-aware gen for fast tests (256², chip=64, 16 chips)."""
+    return DataGenerator(
+        n_frames=64,
+        n_circles=n_circles,
+        image_size=(256, 256),
+        radius=2,
+        speeds=[0.5, 1.0, 2.0],
+        dat_lab_paths=[tmp_path / "data_all", tmp_path / "label_msk"],
+        samedir=True,
+        shape="square",
+        square_edge=2,
+        target_sampler="chip_aware",
+        chip_size=64,
+        chip_nonempty_range=(6, 10),
+        chip_target_count_range=(1, 5),
+    )
+
+
+def _make_prod_size_gen(tmp_path: Path) -> DataGenerator:
+    """Production-size gen for sampler-only tests (no rendering)."""
+    return DataGenerator(
+        n_frames=64,
+        n_circles=10,
+        image_size=(1024, 1024),
+        radius=2,
+        speeds=[0.5, 1.0, 2.0],
+        dat_lab_paths=[tmp_path / "data_all", tmp_path / "label_msk"],
+        samedir=True,
+        shape="square",
+        square_edge=2,
+        target_sampler="chip_aware",
+        chip_size=128,
+        chip_nonempty_range=(24, 40),
+        chip_target_count_range=(1, 10),
+    )
+
+
+def _vel_to_dir(vel: Tuple[float, float]) -> str:
+    vx, vy = vel
+    if vx < 0 and vy == 0: return "left"
+    if vx > 0 and vy == 0: return "right"
+    if vx == 0 and vy < 0: return "up"
+    if vx == 0 and vy > 0: return "down"
+    if vx < 0 and vy < 0: return "upleft"
+    if vx > 0 and vy < 0: return "upright"
+    if vx < 0 and vy > 0: return "downleft"
+    if vx > 0 and vy > 0: return "downright"
+    raise ValueError(f"Cannot map vel {vel} to direction string")
+
+
+def _chips_seen(positions: np.ndarray, chip_size: int) -> dict:
+    chips: dict = {}
+    for cx, cy in positions:
+        key = (int(cy) // chip_size, int(cx) // chip_size)
+        chips[key] = chips.get(key, 0) + 1
+    return chips
+
+
+# ---------------------------------------------------------------------------
+# 6.1 — N distribution
+# ---------------------------------------------------------------------------
+
+def test_swarm_chip_aware_n_distribution(tmp_path: Path) -> None:
+    gen = _make_prod_size_gen(tmp_path)
+    n_realized, k_realized, m_c_observations = [], [], []
+    for seed in range(100):
+        rng = np.random.default_rng(seed)
+        positions = gen._sample_chip_aware_targets(rng)
+        chips = _chips_seen(positions, gen.chip_size)
+        n_realized.append(positions.shape[0])
+        k_realized.append(len(chips))
+        m_c_observations.extend(chips.values())
+
+    n_realized = np.asarray(n_realized)
+    k_realized = np.asarray(k_realized)
+    m_c = np.asarray(m_c_observations)
+
+    assert k_realized.min() >= 24, f"k min {k_realized.min()} < 24"
+    assert k_realized.max() <= 40, f"k max {k_realized.max()} > 40"
+
+    assert n_realized.min() >= 24, f"N min {n_realized.min()} < 24 (k_min · m_min)"
+    assert n_realized.max() <= 400, f"N max {n_realized.max()} > 400 (k_max · m_max)"
+
+    n_mean = float(n_realized.mean())
+    assert 150 <= n_mean <= 200, f"E[N] {n_mean:.1f} out of [150, 200] (target 176)"
+
+    assert m_c.min() >= 1, f"m_c min {m_c.min()} < 1"
+    assert m_c.max() <= 10, f"m_c max {m_c.max()} > 10"
+
+
+# ---------------------------------------------------------------------------
+# 6.2 — Empty-chip fraction
+# ---------------------------------------------------------------------------
+
+def test_swarm_chip_aware_empty_fraction(tmp_path: Path) -> None:
+    gen = _make_prod_size_gen(tmp_path)
+    n_chips = 64
+    fracs = []
+    for seed in range(100):
+        rng = np.random.default_rng(seed)
+        positions = gen._sample_chip_aware_targets(rng)
+        k = len(_chips_seen(positions, gen.chip_size))
+        fracs.append((n_chips - k) / n_chips)
+    fracs = np.asarray(fracs)
+    assert fracs.min() >= 0.375 - 1e-9
+    assert fracs.max() <= 0.625 + 1e-9
+    mean = float(fracs.mean())
+    assert 0.4 <= mean <= 0.6, f"empty-chip mean {mean:.3f} far from 0.5"
+
+
+# ---------------------------------------------------------------------------
+# 6.3 — Mask union (single small chip-aware scene)
+# ---------------------------------------------------------------------------
+
+def test_swarm_multi_target_mask_union(tmp_path: Path) -> None:
+    gen = _make_test_gen(tmp_path, n_circles=2000)
+
+    captured: dict = {}
+    orig = gen._sample_chip_aware_targets
+
+    def _wrap(rng_in):
+        out = orig(rng_in)
+        captured["positions"] = out
+        return out
+
+    gen._sample_chip_aware_targets = _wrap
+
+    rng = np.random.default_rng(0)
+    _a, m_path = gen._generate_video(0, rng)
+    N = int(captured["positions"].shape[0])
+    m_video = np.load(m_path)
+    assert m_video.shape == (64, 256, 256)
+    assert m_video.dtype == np.uint8
+
+    frame0_pos = int((m_video[0] > 0).sum())
+    assert frame0_pos <= N * 4, f"frame 0 pos {frame0_pos} > N·4 = {N*4}"
+    assert frame0_pos >= int(N * 4 * 0.9), (
+        f"frame 0 pos {frame0_pos} < 0.9·N·4 = {int(N*4*0.9)}"
+    )
+
+    has_pos = bool((m_video > 0).any())
+    if N > 0:
+        assert has_pos, "N>0 but mask is all zeros"
+    else:
+        assert not has_pos
+
+    # Target-absent: mask must be all zeros
+    rng = np.random.default_rng(1)
+    _a, m_path = gen._generate_video(1, rng)
+    m_video = np.load(m_path)
+    assert m_video.shape == (64, 256, 256)
+    assert (m_video == 0).all(), "target-absent scene produced non-zero mask"
+
+
+# ---------------------------------------------------------------------------
+# 6.4 — Velocity independence
+# ---------------------------------------------------------------------------
+
+def test_swarm_multi_target_velocity_independence(tmp_path: Path) -> None:
+    gen = _make_test_gen(tmp_path)
+
+    tuple_counts: dict = {}
+    saw_distinct_within_scene = False
+    n_scenes_n_ge_2 = 0
+
+    for scene_idx in range(0, 100, 2):  # 50 even scenes
+        rng = np.random.default_rng(scene_idx)
+        positions = gen._sample_chip_aware_targets(rng)
+        N = int(positions.shape[0])
+        bg_vel, tgt_vels, tgt_dirs = gen._sample_multi_target_velocities(N, rng)
+
+        bg_dir = _vel_to_dir(bg_vel)
+        bg_spd = float(max(abs(bg_vel[0]), abs(bg_vel[1])))
+
+        per_target = []
+        for v, d in zip(tgt_vels, tgt_dirs):
+            spd = float(max(abs(v[0]), abs(v[1])))
+            per_target.append((str(d), spd))
+
+        for tup in per_target:
+            assert tup != (bg_dir, bg_spd), (
+                f"target tuple {tup} equals bg tuple — anomalous constraint violated"
+            )
+            tuple_counts[tup] = tuple_counts.get(tup, 0) + 1
+
+        if N >= 2:
+            n_scenes_n_ge_2 += 1
+            if len(set(per_target)) >= 2:
+                saw_distinct_within_scene = True
+
+    assert n_scenes_n_ge_2 > 0, "no scenes with N>=2 — test config too sparse"
+    assert saw_distinct_within_scene, (
+        "no scene had two targets with distinct (dir, spd) — sampler not independent"
+    )
+
+    total_obs = sum(tuple_counts.values())
+    expected_per_tuple = total_obs / 24.0
+    for t, c in tuple_counts.items():
+        assert c < 3 * expected_per_tuple, (
+            f"tuple {t} observed {c} > 3 · expected {expected_per_tuple:.1f}"
+        )
+    assert len(tuple_counts) >= 20, (
+        f"only {len(tuple_counts)} of 24 tuples observed; expected >=20"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6.5 — Backward-compat with v0.5/v0.6 single-target path
+# ---------------------------------------------------------------------------
+
+def test_swarm_backward_compat_v0_5_v0_6(tmp_path: Path) -> None:
+    fixture_dir = _REPO_ROOT / "tests" / "data" / "swarm_compat_ref"
+    assert fixture_dir.exists(), f"missing fixture dir: {fixture_dir}"
+    for fname in ("vid0_1.npy", "vid1_0.npy", "vid0_1_mask.npy", "vid1_0_mask.npy"):
+        assert (fixture_dir / fname).exists(), f"missing fixture file: {fname}"
+
+    gen = DataGenerator(
+        n_frames=64,
+        n_circles=30000,
+        image_size=(128, 128),
+        radius=2,
+        speeds=[0.0625, 0.125, 0.25],
+        dat_lab_paths=[tmp_path / "data_all", tmp_path / "label_msk"],
+        samedir=True,
+        shape="square",
+        square_edge=2,
+        # target_sampler defaults to "single" — must be unchanged
+    )
+    worker(start_idx=0, batch_size=2, generator=gen, save_gifs=False, fps=10)
+
+    for fname in ("vid0_1.npy", "vid1_0.npy"):
+        ref = np.load(fixture_dir / fname)
+        got = np.load(tmp_path / "data_all" / fname)
+        assert ref.shape == got.shape
+        assert ref.dtype == got.dtype
+        assert np.array_equal(ref, got), f"data {fname} not byte-identical"
+    for fname in ("vid0_1_mask.npy", "vid1_0_mask.npy"):
+        ref = np.load(fixture_dir / fname)
+        got = np.load(tmp_path / "label_msk" / fname)
+        assert ref.shape == got.shape
+        assert ref.dtype == got.dtype
+        assert np.array_equal(ref, got), f"mask {fname} not byte-identical"

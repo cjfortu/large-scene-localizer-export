@@ -1,0 +1,60 @@
+{
+  "name": "classifier_baseline_30k_ep64",
+  "file": "classifier_baseline_30k_ep64.pt",
+  "role": "classifier (Stage 2)",
+  "sha256": "03639c422e21e6ddff968f59db3dd9a371e212701f4eed8e2191ef800c59d5d6",
+  "bytes": 69112200,
+  "safetensors_sha256": "2f9c96d643b6321465cc7bd92b19c2d6e9d98196ef32a742e9b0147c362a989f",
+  "safetensors_bytes": 69099252,
+  "epoch": 64,
+  "selection_criterion": "best val_acc (train.log: '[epoch 64] saved best checkpoint (val_acc=0.9973)')",
+  "config_path": "configs/classifier/baseline_30k.yaml",
+  "config_path_at_training": "recovered/stage2_classifier/configs/baseline_30k.yaml",
+  "config_commit": "487f385",
+  "config_note": "config_path is the current equivalent of config_path_at_training (same hyperparameters; dataset/run locations made relative).",
+  "source_path": "<runs root>/runs/stage2_classifier_30k_baseline/models/best_classifier.pt",
+  "train_start": "2026-05-13T16:59:07-04:00",
+  "host": "gb10-node-1 (NVIDIA GB10, aarch64)",
+  "torch": "2.12.0.dev20260322+cu128",
+  "mamba_ssm": null,
+  "causal_conv1d": null,
+  "dataset": "swarm_128x128x64 (30000 scenes, 15000/15000 labels; 1687/188 train/val batches; read from the canonical copy)",
+  "model_build": null,
+  "val_metrics": {
+    "val_acc": 0.9973,
+    "val_loss": 0.0077,
+    "train_acc": 0.9956,
+    "specificity_eval": {
+      "TP": 1494,
+      "TN": 1498,
+      "FP": 2,
+      "FN": 6,
+      "source": "scripts/tier1_stage2_spec.py, gate-viability handoff section 2(d)"
+    }
+  },
+  "notes": "Raw state_dict (49 tensors, 17,273,730 params). Run deliberately stopped after ep65 of 100. Three other runs share this byte size with different hashes; never substitute by size.",
+  "inferred_fields": {
+    "config_commit": "= main HEAD at launch (2026-05-13 16:58); last commit touching the config",
+    "host": "wrapper runs/stage2_classifier_30k_baseline/run_classifier_baseline.sh comment names the first GB10 training node (= gb10-node-1); not otherwise recorded",
+    "torch": "gb10-node-1 localizer env torch dist-info dates to 2026-04-01, before this run; taken as the training stack"
+  },
+  "promoted": "2026-11-05",
+  "reproduced_on_x86": {
+    "date": "2026-11-05",
+    "platform": "Linux x86-64, NVIDIA RTX PRO 5000 Blackwell (24 GB), driver 595.84",
+    "environment": "Tier 1: Python 3.11.18, torch 2.12.0+cu130, mamba_ssm 2.3.2.post1, causal_conv1d 1.6.2.post1, numpy 2.4.6 (requirements/cuda-linux-x86_64.txt)",
+    "code_commit": "dfd6b28 plus scripts/segmenter/evaluate.py (committed with this record)",
+    "status": "reproduced exactly (on the canonical swarm_128x128x64 copy)",
+    "command": "python scripts/classifier/specificity.py --dataset <canonical swarm_128x128x64>",
+    "specificity_eval": {
+      "TP": 1494,
+      "TN": 1498,
+      "FP": 2,
+      "FN": 6,
+      "specificity": 0.9987,
+      "sensitivity": 0.996,
+      "accuracy": 0.9973
+    },
+    "note": "A second local copy of swarm_128x128x64 that differs from the canonical one for about two thirds of scene indices gave TP=1491 TN=1499 FP=1 FN=9; the difference is the data, not the platform (no sample within 0.04 of the threshold; batch size and TF32 settings do not change the counts)."
+  }
+}

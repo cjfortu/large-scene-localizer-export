@@ -1,0 +1,62 @@
+# Phase 2 gate-precision collapse-onset study — 512² rung, REQUIRED arm.
+# Spec: stage1_hybrid_collapse_isolation_diagnostic_spec.md § Phase 2.
+#
+# stem2/bs1 (the operationally relevant 1024² config: stride-2 stem,
+# batch_size=1 forced at scale). v0.7 factory (strided stem), fp32,
+# hard-binary, on the 512² GRF multi-target set at 1024²-equal per-pixel
+# density. Measures whether K1's clean 128² gate behavior
+# (proposals_absent 0.16, precision_present 0.78) survives at 512².
+#
+# proposal_patch 64 = the 512² rung of the 1/8-of-field schedule
+# (64/512 = 1/8; the full-res precision_present is the faithful
+# 1024²-localization estimate).
+#
+# pos_weight (target_positive_pixels_per_frame) is anchored EMPIRICALLY
+# by the short grid in launch_gatediag_512_grid.sh — NOT derived from
+# density (v0.9 §6.3 derivation was 3-8x wrong). The value below is the
+# grid placeholder; production uses the grid winner.
+model_factory: "v0_7"
+arm: 2
+stem_stride: 2
+output_resolution: "low_res"
+checkpoint_criterion: "best_unsplit_dice"
+seed: 0
+nfeats: 32
+target_positive_pixels_per_frame: 512   # placeholder; set by grid winner
+lr: 1.0e-3
+weight_decay: 1.0e-2
+weight_decay_ssm: 0.0
+scheduler_factor: 0.5
+scheduler_patience: 10
+batch_size: 1
+num_epochs: 18
+# 3000 to match K1's 128² baseline (2250 present / 750 absent at the
+# idx%4==3 parity rule) — NOT halved, so data quantity is not a second
+# uncontrolled variable vs the field-size axis Phase 2 isolates.
+subset_size: 3000
+dataset: multi_target_swarm_512x512x64            # resolved under $LSL_DATA_ROOT
+val_split: 0.1
+val_split_seed: 0
+run_name: gate/gatediag_512_base            # resolved under $LSL_RUNS_ROOT
+num_workers: 4
+
+low_res_pool: [2, 4, 4]
+detection_recall_ks: [1, 3, 5, 15]
+secondary_recall_k: 15
+
+# Phase 2 §5 item 7: 512² rung patch = 64x64 (1/8 of 512).
+proposal_patch_h: 64
+proposal_patch_w: 64
+
+# Phase 2 Section A: full-res chip size for val_cluster_recall (the
+# coverage verdict metric). 512² uses chip_size 128 (4x4 grid), so the
+# GRF clusters are 4-conn groups of the 128px chips.
+cluster_chip_size: 128
+
+# Gate-aware checkpoint selection (fixes best_recall@K rewarding the ep2
+# transient spike seen in the settle50 runs). best_gate_model.pth = the
+# settled epoch (>= 30, past the absent-side rise-and-recover) with the
+# highest cluster_recall that holds abs_pos_frac <= 0.25. last_epoch_model.pth
+# is also always saved. Required for the eventual 1024² run.
+gate_settle_min_epoch: 30
+gate_abs_frac_bar: 0.25

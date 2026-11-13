@@ -1,0 +1,78 @@
+# multi_target_swarm_128 — 128×128×64 GRF-clustered multi-target dataset
+# at the v0.6-success scale (slow velocities, saturated background swarm,
+# 2x2-square objects), with the v2 GRF clustering rescaled to a 4x4 chip
+# grid.
+#
+# Purpose: controlled-isolation diagnostic instrument paired with a
+# four-arm training spec (1 hybrid + 3 pure-Mamba) to attribute the
+# v0.6 -> v0.8 performance collapse to scene complexity, architecture,
+# or scale. Holds resolution, object geometry, motion regime, and
+# background density at v0.6-success values; changes only the target
+# distribution from single to GRF-clustered multi.
+#
+# Spec: documents/specs/multi_target_swarm_128_dataset_spec.md
+#
+# Inherited from slow_swarm.yaml (v0.6-success values):
+#   - image_size, shape, square_edge, n_circles, samedir, speeds
+#
+# Inherited from multi_target_swarm_1024_v2.yaml (clustering machinery):
+#   - target_sampler: grf_cluster
+#   - grf_fraction_range, grf_fraction_beta, grf_count_noise_sigma,
+#     grf_jitter, grf_absent_modulo
+#
+# Rescaled for 128^2 (derived in spec §3.2):
+#   - chip_size: 32 (gives 4x4 grid, was 128 on the 1024^2 8x8 grid)
+#   - grf_corr_length: [0.75, 0.75] (preserves cluster-as-fraction-of-scene
+#     at 0.1875, was [1.5, 1.5] on the 8x8 grid)
+#   - grf_count_range: [1, 3] (preserves per-pixel target density within
+#     ~6x of v2, was [1, 10] at 1024^2)
+
+n_frames: 64
+image_size: [128, 128]
+shape: square
+square_edge: 2
+radius: 2          # unused when shape="square", kept for backward-compat
+speeds: [0.0625, 0.125, 0.25]
+n_circles: 30000
+samedir: true
+total_scenes: 3000
+save_gifs: true
+fps: 10
+
+# Multi-target sampler -- grf_cluster per spec §3.2.
+target_sampler: grf_cluster
+
+# 4x4 chip grid at 128^2 (32-pixel cells).
+chip_size: 32
+
+# Per-scene non-empty-chip fraction p ~ Beta(alpha, beta) scaled to [p_lo, p_hi].
+grf_fraction_range: [0.10, 0.6666666666666666]
+grf_fraction_beta: [2.0, 5.0]
+
+# GRF kernel length scales [l_y, l_x] in units of chips on the 4x4 grid.
+# Rescaled from v2's [1.5, 1.5] on the 8x8 grid to preserve
+# cluster-as-fraction-of-scene at 0.1875 (= 1.5/8 = 0.75/4).
+grf_corr_length: [0.75, 0.75]
+
+# Per-chip target count: linear-by-field-value mapping into [1, 3],
+# plus Gaussian noise sigma_count, clipped and rounded. Range reduced from
+# v2's [1, 10] to keep per-pixel target density commensurate with v2 at
+# 1024^2 (see spec §3.2.3). Core-to-edge gradient is preserved automatically
+# by the linear mapping in _sample_grf_cluster_targets Stage D.
+grf_count_range: [1, 3]
+grf_count_noise_sigma: 1.0
+
+# GRF Cholesky jitter -- small diagonal added for numerical stability.
+grf_jitter: 1.0e-6
+
+# Parity rule modulus -- idx % grf_absent_modulo == grf_absent_modulo - 1 => absent.
+# 4 => 25% absent (750 scenes of 3000).
+grf_absent_modulo: 4
+
+# Parallelism.
+batch_size: 250
+num_workers: 12
+
+# Output: <data root>/<dataset>; data root from --data-root or $LSL_DATA_ROOT
+# (or an absolute --output_root).
+dataset: multi_target_swarm_128x128x64

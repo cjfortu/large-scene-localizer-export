@@ -1,0 +1,144 @@
+"""v0.9 §5.4 parametric low_res_pool tests.
+
+Covers:
+- Default ``low_res_pool=(2, 4, 4)`` produces ``(32, 32, 32)`` output and
+  preserves all v0.6/v0.7/v0.8 behavior bit-identically.
+- Explicit ``low_res_pool=(1, 2, 2)`` produces ``(64, 64, 64)`` output
+  and the dataloader pool factor matches.
+- Shape consistency: a single batch passes through dataloader → model
+  → loss without shape errors at both pool factors.
+- Mask-preservation: a 2×2 target in the raw mask survives max-pool
+  at both factors with at least one positive cell in the pooled output.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+import torch.nn.functional as F
+
+_ROOT = Path(__file__).resolve().parents[2]
+
+from localizer.gate.model import (  # noqa: E402
+    _v07_low_res_target_shape, build_segmenter_v0_8,
+)
+from localizer.common.data import (  # noqa: E402
+    MoverDataset, _LOW_RES_POOL,
+)
+
+
+@pytest.fixture
+def tiny_dataset(tmp_path):
+    """Build a 4-scene tiny dataset on disk."""
+    data_dir = tmp_path / "data_all"
+    label_dir = tmp_path / "label_msk"
+    data_dir.mkdir()
+    label_dir.mkdir()
+    files: list[str] = []
+    rng = np.random.default_rng(0)
+    for i in range(4):
+        label = 1 if i % 2 == 0 else 0
+        # 16x16 spatial, 8 temporal — tiny to keep tests fast.
+        vol = (rng.random((8, 16, 16)) * 255).astype(np.uint8)
+        mask = np.zeros((8, 16, 16), dtype=np.uint8)
+        if label == 1:
+            # 2x2 target footprint at fixed grid location for half the frames
+            mask[2:6, 4:6, 4:6] = 255
+        name = f"vid{i}_{label}.npy"
+        np.save(data_dir / name, vol)
+        np.save(label_dir / f"vid{i}_{label}_mask.npy", mask)
+        files.append(name)
+    return data_dir, label_dir, files
+
+
+def test_default_low_res_pool_is_2_4_4(tiny_dataset):
+    """Default constructor preserves (2, 4, 4) bit-identical behavior."""
+    data_dir, label_dir, files = tiny_dataset
+    ds = MoverDataset(data_dir, label_dir, files,
+                       output_resolution="low_res")
+    assert ds.low_res_pool == (2, 4, 4)
+    sample = ds[0]
+    # 8/2=4, 16/4=4 → mask shape (1, 4, 4, 4)
+    assert sample["mask"].shape == (1, 4, 4, 4)
+
+
+def test_explicit_1_2_2_low_res_pool(tiny_dataset):
+    """Explicit (1, 2, 2) produces the spec-§3.3 output shape."""
+    data_dir, label_dir, files = tiny_dataset
+    ds = MoverDataset(data_dir, label_dir, files,
+                       output_resolution="low_res",
+                       low_res_pool=(1, 2, 2))
+    assert ds.low_res_pool == (1, 2, 2)
+    sample = ds[0]
+    # 8/1=8, 16/2=8 → mask shape (1, 8, 8, 8)
+    assert sample["mask"].shape == (1, 8, 8, 8)
+
+
+def test_module_constant_unchanged():
+    """The module-level ``_LOW_RES_POOL`` is preserved at (2,4,4) for any
+    external code that imports it."""
+    assert _LOW_RES_POOL == (2, 4, 4)
+
+
+def test_v07_low_res_target_shape_default():
+    """Default pool_factor=(2,4,4) preserves the prior return value."""
+    shape = (8, 1, 64, 128, 128)
+    out = _v07_low_res_target_shape(shape)
+    assert out == (32, 32, 32)
+
+
+def test_v07_low_res_target_shape_1_2_2():
+    """pool_factor=(1,2,2) yields the v0.9 M-supgrid shape."""
+    shape = (8, 1, 64, 128, 128)
+    out = _v07_low_res_target_shape(shape, pool_factor=(1, 2, 2))
+    assert out == (64, 64, 64)
+
+
+def test_v07_low_res_target_shape_rejects_bad_input():
+    """Wrong rank or non-positive factor raises ValueError."""
+    with pytest.raises(ValueError):
+        _v07_low_res_target_shape((1, 2, 3))  # rank 3
+    with pytest.raises(ValueError):
+        _v07_low_res_target_shape((1, 1, 4, 4, 4), pool_factor=(0, 1, 1))
+
+
+def test_mask_2x2_target_preserved_under_both_pools(tiny_dataset):
+    """A 2x2 target in the raw 16x16 mask survives both pool factors
+    with at least one positive cell in the pooled output."""
+    data_dir, label_dir, files = tiny_dataset
+    # Pick the present scene (i=0, label=1)
+    ds_2_4_4 = MoverDataset(data_dir, label_dir, [files[0]],
+                              output_resolution="low_res",
+                              low_res_pool=(2, 4, 4))
+    ds_1_2_2 = MoverDataset(data_dir, label_dir, [files[0]],
+                              output_resolution="low_res",
+                              low_res_pool=(1, 2, 2))
+    m_244 = ds_2_4_4[0]["mask"]
+    m_122 = ds_1_2_2[0]["mask"]
+    # Both pooled masks should have at least one positive cell from the
+    # 2x2 raw target. (Hard binary > 0 in both regimes.)
+    assert (m_244 > 0).sum() >= 1
+    assert (m_122 > 0).sum() >= 1
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="pure-Mamba model requires CUDA for the selective-scan kernel",
+)
+def test_model_dataloader_shape_consistency_1_2_2(tmp_path):
+    """End-to-end shape check at (1,2,2): model output matches mask shape."""
+    device = torch.device("cuda")
+    model = build_segmenter_v0_8(
+        arm=4, fusion="sum", dt_init_std=0.001,
+        pool_factor=(1, 2, 2),
+    ).to(device)
+    model.eval()
+    x = torch.randn(1, 1, 64, 128, 128, device=device)
+    with torch.no_grad():
+        y = model(x)
+    # (1, 2, 2) over (64, 128, 128) → (64, 64, 64)
+    assert tuple(y.shape) == (1, 1, 64, 64, 64)

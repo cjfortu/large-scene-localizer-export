@@ -1,0 +1,175 @@
+"""Tests for the Stage 1 v0.6 trainer additions.
+
+Covers:
+* ``_split_optimizer_param_groups`` correctly partitions SSM
+  parameters into a separate group with the right ``weight_decay``.
+* The SSM group's parameters are the union of ``A_log``, ``D``, and
+  ``dt_proj.bias`` for every Mamba block in the model.
+* For a v0.5 model (no Mamba blocks), the SSM groups are empty and the
+  single non-SSM group carries all parameters.
+* ``Stage1SegTrainConfig`` accepts the new v0.6 fields (``arm``,
+  ``output_resolution``, ``weight_decay_ssm``) and their v0/v0.5
+  defaults preserve the existing config schema.
+* ``_build_history_payload`` round-trips through JSON.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+import torch
+
+from localizer.gate.model import (
+    PureConvSegmenter3D, Stage1V06Arm1CnnMambaUnet,
+)
+from localizer.gate.train import (
+    Stage1SegTrainConfig, _build_history_payload,
+    _split_optimizer_param_groups,
+)
+
+
+CUDA_REQUIRED = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="v0.6 arm 1 has Mamba which requires CUDA",
+)
+
+
+def test_config_v0_5_defaults_unchanged():
+    """v0/v0.5 ``Stage1SegTrainConfig`` defaults preserved (new fields
+    appear with non-disruptive defaults)."""
+    cfg = Stage1SegTrainConfig()
+    assert cfg.bottleneck_variant == "A"
+    assert cfg.temporal_variant == "baseline"
+    assert cfg.checkpoint_criterion == "best_val_loss"
+    # New v0.6 fields:
+    assert cfg.arm is None
+    assert cfg.output_resolution == "full"
+    assert cfg.weight_decay_ssm == 0.0
+
+
+def test_config_accepts_v0_6_fields():
+    """v0.6 configs (with ``arm``, ``output_resolution``,
+    ``weight_decay_ssm``) instantiate cleanly."""
+    cfg = Stage1SegTrainConfig(
+        arm=1,
+        output_resolution="full",
+        weight_decay_ssm=0.0,
+        checkpoint_criterion="best_unsplit_dice",
+        target_positive_pixels_per_frame=4,
+    )
+    assert cfg.arm == 1
+    assert cfg.output_resolution == "full"
+
+
+def test_param_groups_v0_5_no_ssm():
+    """For a v0.5 model (no Mamba blocks), only the non-SSM group has
+    parameters; SSM groups are absent (not even empty entries)."""
+    model = PureConvSegmenter3D(bottleneck_variant="D", nfeats=8)
+    groups = _split_optimizer_param_groups(
+        model, weight_decay=1e-2, weight_decay_ssm=0.0,
+    )
+    assert len(groups) == 1, (
+        "v0.5 model should produce a single param group (no SSM)"
+    )
+    n_params = sum(p.numel() for p in groups[0]["params"])
+    expected = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    assert n_params == expected
+    assert groups[0]["weight_decay"] == 1e-2
+
+
+@CUDA_REQUIRED
+def test_param_groups_v0_6_arm_1_splits_ssm():
+    """Arm 1 has one Mamba block: SSM params split from the rest with
+    the right ``weight_decay`` per group."""
+    model = Stage1V06Arm1CnnMambaUnet(nfeats=8).cuda()
+    groups = _split_optimizer_param_groups(
+        model, weight_decay=1e-2, weight_decay_ssm=0.0,
+    )
+    assert len(groups) >= 2, "Arm 1 should have at least one SSM group"
+    # Identify SSM groups by weight_decay value:
+    non_ssm = [g for g in groups if g["weight_decay"] == 1e-2]
+    ssm = [g for g in groups if g["weight_decay"] == 0.0]
+    assert len(non_ssm) == 1
+    assert len(ssm) >= 1
+    # SSM params should be a small minority of total params:
+    n_ssm = sum(p.numel() for g in ssm for p in g["params"])
+    n_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    assert n_ssm > 0
+    assert n_ssm < n_total // 100, (
+        f"SSM params should be << 1% of total; got {n_ssm}/{n_total}"
+    )
+    # Sum-conservation: every parameter ends up in exactly one group.
+    n_grouped = sum(
+        p.numel() for g in groups for p in g["params"]
+    )
+    assert n_grouped == n_total
+
+
+@CUDA_REQUIRED
+def test_param_groups_ssm_contains_expected_leaves():
+    """SSM groups contain exactly the parameters whose leaf name is
+    ``A_log`` or ``D``, plus ``dt_proj.bias``."""
+    model = Stage1V06Arm1CnnMambaUnet(nfeats=8).cuda()
+    expected_ssm_names: set[str] = set()
+    for name, p in model.named_parameters():
+        leaf = name.split(".")[-1]
+        if leaf in {"A_log", "D"}:
+            expected_ssm_names.add(name)
+        elif "dt_proj" in name and leaf == "bias":
+            expected_ssm_names.add(name)
+    assert expected_ssm_names, "expected at least one SSM-leaf parameter"
+    # Walk the groups, find the IDs of params in non-ssm groups vs ssm:
+    groups = _split_optimizer_param_groups(
+        model, weight_decay=1e-2, weight_decay_ssm=0.0,
+    )
+    ssm_ids = set()
+    for g in groups:
+        if g["weight_decay"] == 0.0:
+            for p in g["params"]:
+                ssm_ids.add(id(p))
+    actual_ssm_names = {
+        name for name, p in model.named_parameters() if id(p) in ssm_ids
+    }
+    assert actual_ssm_names == expected_ssm_names
+
+
+def test_build_history_payload_round_trips_json():
+    """The end-of-epoch incremental writer must produce JSON-serializable
+    payloads (everything in there is a primitive or list of primitives)."""
+    cfg = Stage1SegTrainConfig(
+        arm=1, output_resolution="full",
+        checkpoint_criterion="best_unsplit_dice",
+    )
+    payload = _build_history_payload(
+        cfg,
+        epochs=[1, 2], train_losses=[0.5, 0.4], val_losses=[0.6, 0.5],
+        avg_val_DSC=[0.1, 0.2], avg_val_IoU=[0.05, 0.1],
+        dice_present=[0.1, 0.2], iou_present=[0.05, 0.1],
+        vox_p_present=[0.5, 0.6], vox_r_present=[0.4, 0.5],
+        dice_absent=[0.9, 0.95], iou_absent=[0.85, 0.9],
+        mean_pos_vox_absent=[3.0, 2.5], unsplit_dice=[0.5, 0.575],
+        val_recall_at_3=[0.2, 0.3], val_precision_at_3=[0.1, 0.15],
+        val_mean_proposals_present=[5.0, 4.0],
+        val_mean_proposals_absent=[5.0, 4.5],
+        val_mean_fp_per_scene=[4.5, 4.0],
+        full_dice_present=[0.1, 0.2], full_dice_absent=[0.9, 0.95],
+        full_unsplit_dice=[0.5, 0.575],
+        full_val_recall_at_3=[0.2, 0.3], full_val_precision_at_3=[0.1, 0.15],
+        full_val_mean_proposals_absent=[5.0, 4.5],
+        full_val_mean_fp_per_scene=[4.5, 4.0],
+        grad_norm_max_per_epoch=[0.0, 0.0],
+        walltimes_per_epoch=[180.0, 178.0],
+        dice_product=[0.09, 0.19],
+        best_criterion_epoch=2, best_criterion_value=0.575,
+        best_recall_at_3_epoch=2, best_recall_at_3_value=0.3,
+        early_stop_reason=None,
+    )
+    # round-trip:
+    encoded = json.dumps(payload, default=str)
+    decoded = json.loads(encoded)
+    assert decoded["arm"] == 1
+    assert decoded["output_resolution"] == "full"
+    assert decoded["epochs"] == [1, 2]
+    assert decoded["best_epoch_by_best_unsplit_dice"] == 2
+    assert decoded["full_dice_present"] == [0.1, 0.2]

@@ -1,0 +1,381 @@
+"""Tests for the v2 grf_cluster multi-target swarm generator (spec §6).
+
+Covers the six required tests from
+documents/specs/multi_target_swarm_1024_v2_dataset_spec.md §6:
+
+- 6.1: test_swarm_grf_n_distribution
+- 6.2: test_swarm_grf_fraction_distribution_shape
+- 6.3: test_swarm_grf_field_contiguity
+- 6.4: test_swarm_grf_count_gradient
+- 6.5: test_swarm_grf_mask_and_absent_parity
+- 6.6: test_swarm_backward_compat_chip_aware
+       (single-target half of §6.6 is already covered by
+        tests/test_swarm_multi_target_1024.py::test_swarm_backward_compat_v0_5_v0_6)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
+import pytest
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+from localizer.synth.swarm import DataGenerator, worker  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_prod_sampler_gen(tmp_path: Path) -> DataGenerator:
+    """Production-grf sampler-only generator (no full rendering).
+
+    n_circles=10 is a deliberate floor so the constructor passes; the
+    sampler-only tests never call generate_data_samples, so the swarm
+    rendering cost never matters here.
+    """
+    return DataGenerator(
+        n_frames=64,
+        n_circles=10,
+        image_size=(1024, 1024),
+        radius=2,
+        speeds=[0.5, 1.0, 2.0],
+        dat_lab_paths=[tmp_path / "data_all", tmp_path / "label_msk"],
+        samedir=True,
+        shape="square",
+        square_edge=2,
+        target_sampler="grf_cluster",
+        chip_size=128,
+        grf_fraction_range=(0.1, 2.0 / 3.0),
+        grf_fraction_beta=(2.0, 5.0),
+        grf_corr_length=(1.5, 1.5),
+        grf_count_range=(1, 10),
+        grf_count_noise_sigma=1.0,
+        grf_jitter=1e-6,
+        grf_absent_modulo=4,
+    )
+
+
+def _chip_indices_for_positions(
+    positions: np.ndarray, chip_size: int, n_chips_per_side: int,
+) -> List[int]:
+    """Map (N, 2) [cx, cy] positions -> list of chip indices (row*n + col)."""
+    indices: List[int] = []
+    for cx, cy in positions:
+        chip_row = int(cy) // chip_size
+        chip_col = int(cx) // chip_size
+        indices.append(chip_row * n_chips_per_side + chip_col)
+    return indices
+
+
+# ---------------------------------------------------------------------------
+# 6.1 -- per-scene realized k and N distribution shape
+# ---------------------------------------------------------------------------
+
+def test_swarm_grf_n_distribution(tmp_path: Path) -> None:
+    """Spec §6.1: 200-trial sweep of the grf_cluster sampler. Verify per-scene
+    k in [6, 43], per-chip count in [1, 10], N in [6, 430], and the empirical
+    means are in the §3.2.2 predicted range with ±30% tolerance."""
+    gen = _make_prod_sampler_gen(tmp_path)
+    n_chips_per_side = 8
+    chip_size = 128
+    n_trials = 200
+
+    k_list: List[int] = []
+    N_list: List[int] = []
+    m_c_all: List[int] = []
+
+    for seed in range(n_trials):
+        rng = np.random.default_rng(seed)
+        positions = gen._sample_grf_cluster_targets(rng)
+        N = int(positions.shape[0])
+        chip_indices = _chip_indices_for_positions(positions, chip_size, n_chips_per_side)
+        unique_chips, counts = np.unique(chip_indices, return_counts=True)
+        k = int(unique_chips.size)
+
+        assert 6 <= k <= 43, f"seed={seed}: k={k} not in [6, 43]"
+        assert 6 <= N <= 430, f"seed={seed}: N={N} not in [6, 430]"
+        for m_c in counts:
+            assert 1 <= m_c <= 10, f"seed={seed}: m_c={m_c} not in [1, 10]"
+
+        k_list.append(k)
+        N_list.append(N)
+        m_c_all.extend(counts.tolist())
+
+    mean_k = float(np.mean(k_list))
+    mean_N = float(np.mean(N_list))
+    assert 14 <= mean_k <= 22, f"mean k={mean_k:.2f} not in [14, 22] (target ~17)"
+    assert 50 <= mean_N <= 90, f"mean N={mean_N:.2f} not in [50, 90] (target ~68)"
+
+
+# ---------------------------------------------------------------------------
+# 6.2 -- Beta(2,5) draw shape verification
+# ---------------------------------------------------------------------------
+
+def test_swarm_grf_fraction_distribution_shape(tmp_path: Path) -> None:
+    """Spec §6.2: 200-run sweep of u ~ Beta(2,5). Verify left-bins ≥30%,
+    right-bins ≤5%, mean in [0.22, 0.36]."""
+    gen = _make_prod_sampler_gen(tmp_path)
+    alpha, beta_param = gen.grf_fraction_beta
+    n_trials = 200
+
+    u_list: List[float] = []
+    for seed in range(n_trials):
+        rng = np.random.default_rng(seed)
+        u = float(rng.beta(alpha, beta_param))
+        u_list.append(u)
+
+    u_arr = np.array(u_list)
+    hist, _ = np.histogram(u_arr, bins=10, range=(0.0, 1.0))
+    left_mass = float((hist[0] + hist[1])) / float(n_trials)
+    right_mass = float((hist[8] + hist[9])) / float(n_trials)
+    mean_u = float(np.mean(u_arr))
+
+    assert left_mass >= 0.30, f"left-bins mass {left_mass:.3f} < 0.30 (Beta(2,5) CDF@0.2 ~ 0.34)"
+    assert right_mass <= 0.05, f"right-bins mass {right_mass:.3f} > 0.05 (Beta(2,5) SF@0.8 ~ 0.0016)"
+    assert 0.22 <= mean_u <= 0.36, f"mean u {mean_u:.3f} not in [0.22, 0.36] (Beta(2,5) mean 2/7~0.286)"
+
+
+# ---------------------------------------------------------------------------
+# 6.3 -- field contiguity (non-empty chips form contiguous clusters)
+# ---------------------------------------------------------------------------
+
+def test_swarm_grf_field_contiguity(tmp_path: Path) -> None:
+    """Spec §6.3: 50-scene sweep. Empirical mean connected-component
+    count ≤ 4 (4-connectivity on 8x8 chip mask); at least 30/50 scenes
+    have ≤3 components. Fails clearly if the GRF mechanism collapses
+    to salt-shaker scatter."""
+    try:
+        from scipy.ndimage import label as ndi_label
+    except ImportError:
+        pytest.skip("scipy not available")
+
+    gen = _make_prod_sampler_gen(tmp_path)
+    n_chips_per_side = 8
+    chip_size = 128
+    n_scenes = 50
+    struct = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
+    n_components_list: List[int] = []
+    for seed in range(n_scenes):
+        rng = np.random.default_rng(seed)
+        positions = gen._sample_grf_cluster_targets(rng)
+        chip_mask = np.zeros((n_chips_per_side, n_chips_per_side), dtype=bool)
+        for cx, cy in positions:
+            chip_row = int(cy) // chip_size
+            chip_col = int(cx) // chip_size
+            chip_mask[chip_row, chip_col] = True
+        _, n_components = ndi_label(chip_mask, structure=struct)
+        n_components_list.append(int(n_components))
+
+    mean_components = float(np.mean(n_components_list))
+    n_le_3 = int(sum(1 for c in n_components_list if c <= 3))
+    assert mean_components <= 4.0, (
+        f"mean connected components {mean_components:.2f} > 4.0 -- "
+        f"GRF may be producing scattered chips instead of contiguous clusters"
+    )
+    assert n_le_3 >= 30, (
+        f"only {n_le_3}/50 scenes have <=3 components; expected >=30"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6.4 -- per-chip count correlates with GRF field value
+# ---------------------------------------------------------------------------
+
+def test_swarm_grf_count_gradient(tmp_path: Path) -> None:
+    """Spec §6.4: 200-scene Spearman rho between field value and per-chip
+    count, median >= 0.5. Top vs bottom quartile mean m_c ratio >= 1.5."""
+    try:
+        from scipy.stats import spearmanr
+    except ImportError:
+        pytest.skip("scipy not available")
+
+    gen = _make_prod_sampler_gen(tmp_path)
+    n_chips_per_side = 8
+    chip_size = 128
+    T_chips = n_chips_per_side * n_chips_per_side
+    alpha, beta_param = gen.grf_fraction_beta
+    p_lo, p_hi = gen.grf_fraction_range
+    L = gen._grf_chol_L
+
+    rho_list: List[float] = []
+    quartile_top_m: List[float] = []
+    quartile_bot_m: List[float] = []
+
+    for seed in range(200):
+        # Mirror Stages A-C with rng_mirror, then run sampler with rng_real.
+        rng_mirror = np.random.default_rng(seed)
+        rng_real = np.random.default_rng(seed)
+        _u = rng_mirror.beta(alpha, beta_param)
+        z = rng_mirror.standard_normal(size=T_chips)
+        f = L @ z
+
+        positions = gen._sample_grf_cluster_targets(rng_real)
+        chip_indices = _chip_indices_for_positions(positions, chip_size, n_chips_per_side)
+        unique_chips, counts = np.unique(chip_indices, return_counts=True)
+        k = int(unique_chips.size)
+        if k < 4:
+            continue
+        f_at_chips = f[unique_chips]
+        rho_res = spearmanr(f_at_chips, counts)
+        rho = rho_res.statistic if hasattr(rho_res, "statistic") else rho_res[0]
+        if not np.isnan(rho):
+            rho_list.append(float(rho))
+
+        # Quartile binning by normalized field rank within the scene.
+        f_min = f_at_chips.min()
+        f_max = f_at_chips.max()
+        if f_max > f_min:
+            normed = (f_at_chips - f_min) / (f_max - f_min)
+            top_mask = normed >= 0.75
+            bot_mask = normed < 0.25
+            if top_mask.any() and bot_mask.any():
+                quartile_top_m.append(float(counts[top_mask].mean()))
+                quartile_bot_m.append(float(counts[bot_mask].mean()))
+
+    assert len(rho_list) >= 100, (
+        f"too few k>=4 scenes for Spearman ({len(rho_list)} < 100)"
+    )
+    median_rho = float(np.median(rho_list))
+    assert median_rho >= 0.5, f"median Spearman rho {median_rho:.3f} < 0.5"
+
+    if quartile_top_m and quartile_bot_m:
+        ratio = float(np.mean(quartile_top_m) / np.mean(quartile_bot_m))
+        assert ratio >= 1.5, (
+            f"top/bottom quartile m_c ratio {ratio:.2f} < 1.5"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6.5 -- mask + absent-parity reduced-size end-to-end test
+# ---------------------------------------------------------------------------
+
+def test_swarm_grf_mask_and_absent_parity(tmp_path: Path) -> None:
+    """Spec §6.5: reduced-size end-to-end test (256x256, chip=64, 4x4 chips).
+    Verify mask shapes, presence/absence parity, frame-0 voxel counts, and
+    per-scene determinism on the absent branch."""
+
+    def _build_gen(out_root: Path) -> DataGenerator:
+        return DataGenerator(
+            n_frames=64,
+            n_circles=2000,
+            image_size=(256, 256),
+            radius=2,
+            speeds=[0.5, 1.0, 2.0],
+            dat_lab_paths=[out_root / "data_all", out_root / "label_msk"],
+            samedir=True,
+            shape="square",
+            square_edge=2,
+            target_sampler="grf_cluster",
+            chip_size=64,
+            grf_fraction_range=(0.1, 2.0 / 3.0),
+            grf_fraction_beta=(2.0, 5.0),
+            grf_corr_length=(1.5, 1.5),
+            grf_count_range=(1, 5),
+            grf_count_noise_sigma=1.0,
+            grf_jitter=1e-6,
+            grf_absent_modulo=4,
+        )
+
+    run_a = tmp_path / "run_a"
+    gen_a = _build_gen(run_a)
+    worker(start_idx=0, batch_size=4, generator=gen_a, save_gifs=False, fps=10)
+
+    for fname in ("vid0_1.npy", "vid1_1.npy", "vid2_1.npy", "vid3_0.npy"):
+        assert (run_a / "data_all" / fname).exists(), f"missing {fname}"
+
+    for fname, expected_label in (
+        ("vid0_1_mask.npy", 1), ("vid1_1_mask.npy", 1),
+        ("vid2_1_mask.npy", 1), ("vid3_0_mask.npy", 0),
+    ):
+        mask = np.load(run_a / "label_msk" / fname)
+        assert mask.shape == (64, 256, 256), f"{fname} shape {mask.shape}"
+        assert mask.dtype == np.uint8
+        frame0_positive = int((mask[0] > 0).sum())
+        if expected_label == 0:
+            assert mask.sum() == 0, f"{fname} target-absent but mask nonzero"
+        else:
+            # Per-target footprint is 2x2 = 4 pixels; targets may overlap
+            # for up to ~10% reduction. Frame-0 voxel count should be in
+            # [N*4*0.9, N*4] where N is the realized target count per scene.
+            # We just sanity-check positivity here; the §6.1 sampler tests
+            # already cover N range expectations.
+            assert frame0_positive > 0, f"{fname} target-present but frame-0 mask zero"
+
+    # Determinism re-run with fresh generator on the same seed.
+    run_b = tmp_path / "run_b"
+    gen_b = _build_gen(run_b)
+    worker(start_idx=0, batch_size=4, generator=gen_b, save_gifs=False, fps=10)
+
+    target_absent_a = np.load(run_a / "data_all" / "vid3_0.npy")
+    target_absent_b = np.load(run_b / "data_all" / "vid3_0.npy")
+    assert np.array_equal(target_absent_a, target_absent_b), (
+        "target-absent scene not deterministic across runs with same seed"
+    )
+
+    # And the present scenes must also be deterministic.
+    for fname in ("vid0_1.npy", "vid1_1.npy", "vid2_1.npy"):
+        a = np.load(run_a / "data_all" / fname)
+        b = np.load(run_b / "data_all" / fname)
+        assert np.array_equal(a, b), f"{fname} not deterministic across runs"
+
+
+# ---------------------------------------------------------------------------
+# 6.6(b) -- backward-compat regression: chip_aware path bit-identical to v1
+# ---------------------------------------------------------------------------
+
+def test_swarm_backward_compat_chip_aware(tmp_path: Path) -> None:
+    """Spec §6.6(b): regenerate the 2-scene chip-aware fixture and assert
+    SHA256 hashes match the committed reference. Single-target half
+    (§6.6(a)) is covered by test_swarm_multi_target_1024.py::test_swarm_backward_compat_v0_5_v0_6.
+    """
+    fixture_hashes_path = (
+        _REPO_ROOT / "tests" / "data" / "swarm_chip_aware_compat_ref_hashes.json"
+    )
+    assert fixture_hashes_path.exists(), (
+        f"missing chip-aware fixture hashes: {fixture_hashes_path}"
+    )
+    with open(fixture_hashes_path) as f:
+        ref = json.load(f)
+
+    cli = _REPO_ROOT / "scripts" / "data" / "generate.py"
+    config = (
+        _REPO_ROOT / "tests" / "data" / "multi_target_swarm_1024_v1.yaml"
+    )
+    out_root = tmp_path / "chip_aware_compat"
+    cmd = [
+        sys.executable, str(cli),
+        "--config", str(config),
+        "--total_scenes", "2",
+        "--batch_size", "2",
+        "--num_workers", "1",
+        "--output_root", str(out_root),
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    assert res.returncode == 0, (
+        f"generator CLI failed: rc={res.returncode}\nstderr:\n{res.stderr}"
+    )
+
+    for fname, ref_hash in ref.items():
+        if fname.startswith("_"):
+            continue
+        if fname.endswith("_mask.npy"):
+            path = out_root / "label_msk" / fname
+        else:
+            path = out_root / "data_all" / fname
+        assert path.exists(), f"missing generated {fname}: {path}"
+        with open(path, "rb") as fh:
+            got_hash = hashlib.sha256(fh.read()).hexdigest()
+        assert got_hash == ref_hash, (
+            f"{fname}: hash {got_hash} != reference {ref_hash} -- "
+            f"v2 refactor regressed v1 chip_aware bit-identity"
+        )

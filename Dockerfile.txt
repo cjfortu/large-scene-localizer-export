@@ -1,0 +1,76 @@
+# Tier 1 image, built from source: Linux x86-64 + NVIDIA CUDA 13.0, training.
+#
+# Same environment as requirements/cuda-linux-x86_64.txt: Python 3.11,
+# torch 2.12.0+cu130, and the fused Mamba kernels (mamba_ssm 2.3.2.post1,
+# causal_conv1d 1.6.2.post1) COMPILED HERE from the PyPI sdists named by the
+# --hash pins, with the CUDA 13.0 toolkit (nvcc) of the devel base image. No
+# prebuilt binary wheel of either kernel package is used. The upstream
+# setup.py files fix the GPU architecture list (sm_75 to sm_121; see
+# docs/environment.md); TORCH_CUDA_ARCH_LIST has no effect on them.
+#
+# Build from the repository root (needs network access to PyPI and
+# download.pytorch.org; no GPU is needed to build):
+#   docker build -t large-scene-localizer:tier1 .
+# The kernel compile dominates the build time (docs/environment.md gives the
+# measured figure). MAX_JOBS / NVCC_THREADS bound the parallel nvcc jobs and
+# memory use: --build-arg MAX_JOBS=8 builds faster on a larger machine.
+# Run with a GPU, mounting datasets and a run-output directory:
+#   docker run --rm -it --gpus all --shm-size=8g \
+#     -v /path/to/datasets:/data -v /path/to/runs:/runs \
+#     large-scene-localizer:tier1
+# The host needs an NVIDIA driver that supports CUDA 13.0 and the NVIDIA
+# Container Toolkit.
+
+FROM nvidia/cuda:13.0.2-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Python 3.11 (the pinned set is CPython 3.11). build-essential and the
+# Python headers are needed to compile the kernels, and at run time by
+# Triton, which compiles small launchers.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      software-properties-common gpg-agent ca-certificates \
+ && add-apt-repository -y ppa:deadsnakes/ppa \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3.11 python3.11-venv python3.11-dev build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN python3.11 -m venv /opt/lsl
+ENV PATH=/opt/lsl/bin:$PATH
+
+WORKDIR /workspace/large-scene-localizer
+
+# Dependencies first, so code edits do not invalidate these layers.
+# 1. torch and the build tools (hash-checked).
+COPY requirements/ requirements/
+RUN python -m pip install -r requirements/cuda-linux-x86_64-build.txt \
+ && nvcc --version | tail -2 \
+ && python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+# 2. Everything else, compiling mamba_ssm and causal_conv1d from source
+#    against the torch above. FORCE_BUILD stops their setup.py from fetching
+#    a prebuilt binary. The import check fails the build if they did not
+#    compile (torch first: the extension modules link against its libraries).
+ARG MAX_JOBS=4
+ARG NVCC_THREADS=2
+RUN MAMBA_FORCE_BUILD=TRUE CAUSAL_CONV1D_FORCE_BUILD=TRUE \
+    MAX_JOBS=${MAX_JOBS} NVCC_THREADS=${NVCC_THREADS} \
+    python -m pip install --no-build-isolation -r requirements/cuda-linux-x86_64.txt \
+ && python -c "import torch, selective_scan_cuda, causal_conv1d_cuda, mamba_ssm, causal_conv1d; print('kernels built:', mamba_ssm.__version__, causal_conv1d.__version__)"
+
+COPY . .
+RUN python -m pip install -e . --no-deps \
+ && python -c "import localizer.gate.blocks as b; assert b.MAMBA_BACKEND == 'mamba_ssm', b.MAMBA_BACKEND; print('MAMBA_BACKEND', b.MAMBA_BACKEND)"
+
+# The three locations every script resolves against. Weights ship in
+# checkpoints/ next to their manifests.
+ENV LSL_DATA_ROOT=/data \
+    LSL_RUNS_ROOT=/runs \
+    LSL_CKPT_ROOT=/workspace/large-scene-localizer/checkpoints
+
+CMD ["bash"]

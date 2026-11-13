@@ -1,0 +1,61 @@
+# swarm_128 -- 128x128x64 single-target swarm dataset `swarm_128x128x64`,
+# the 30k-scene training set of the Stage 2 classifier (baseline_30k) and the
+# Stage 3 segmenter.
+#
+# Recovered from the retired generator config
+# recovered/synth_swarm/configs/default.yaml @ 609f1fe (tag pre-reorg-2026-11).
+# Generation parameters are verbatim; only the output path changed (the
+# absolute output_root became the relative `dataset` name) and two
+# builder-only keys were added (see below). The canonical copy was generated
+# with the generator recovered/synth_swarm/data_generator.py @ fa96d5f
+# (unchanged through 609f1fe) driven by scripts/recovered/generate_swarm_data.py
+# @ 3ebf5b2; the single-target path of localizer.synth.swarm is the same code.
+#
+# Scenes: 30000, indices 0..29999. Even index -> target present (label 1,
+# file vid{idx}_1.npy), odd index -> target absent (label 0, all-zero mask):
+# 15000 present / 15000 absent. Disks of radius 2, 10000 per frame, uint8.
+#
+# Seeds: each worker batch is seeded with np.random.default_rng(start_idx of
+# that batch) and draws its scenes sequentially from that one stream, so the
+# scenes depend on the batch layout, not only on the index. The canonical
+# copy was NOT generated as one 0..29999 run. It is the union of six
+# invocations, each split into batch_size-250 batches from its own start
+# (the last batch of each is short):
+#
+#   --start_idx 0     --total_scenes 3334   (batches 0, 250, ..., 3250)
+#   --start_idx 3334  --total_scenes 3333   (batches 3334, 3584, ..., 6584)
+#   --start_idx 6667  --total_scenes 3333   (batches 6667, 6917, ..., 9917)
+#   --start_idx 10000 --total_scenes 6667   (batches 10000, ..., 16500)
+#   --start_idx 16667 --total_scenes 6667   (batches 16667, ..., 23167)
+#   --start_idx 23334 --total_scenes 6666   (batches 23334, ..., 29834)
+#
+# To reproduce the canonical copy, run these six invocations with this
+# config. Running the config as-is (one run, start_idx 0, total_scenes 30000)
+# gives a different draw at indices 3334..9999 and 16667..29999 (identical at
+# 0..3333 and 10000..16666, where the batch starts coincide).
+
+n_frames: 64
+image_size: [128, 128]
+shape: disk
+radius: 2
+speeds: [0.5, 1.0, 2.0]
+n_circles: 10000
+samedir: true
+target_sampler: single
+total_scenes: 30000
+save_gifs: false
+fps: 10
+
+# Read only by scripts/data/build_metadata.py; the single-target sampler
+# ignores both. grf_absent_modulo 2 states this dataset's parity rule
+# (idx % 2 == 1 -> absent); chip_size 128 makes the whole scene one chip.
+grf_absent_modulo: 2
+chip_size: 128
+
+# Parallelism: batch_size scenes per worker process (one rng stream each).
+batch_size: 250
+num_workers: 20
+
+# Output: <data root>/<dataset>; data root from --data-root or $LSL_DATA_ROOT
+# (or an absolute --output_root).
+dataset: swarm_128x128x64

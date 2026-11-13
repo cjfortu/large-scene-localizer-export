@@ -1,0 +1,458 @@
+"""Shared building blocks for Stage 1 v0.6 SSM architectures.
+
+Implements the five reusable modules used by the four v0.6 arms per
+``documents/history/specs/stage1_v0_6_design.md`` §3:
+
+* ``TemporalMambaBlock`` (§3.1) — Vivim-style bidirectional Mamba block
+  on a 5D channels-first feature map ``(B, C, T, H, W)``. Used by Arms 1
+  and 2 (CNN+Mamba hybrid).
+* ``TokenMambaBlock`` (§3.5) — Bidirectional Mamba block on a 5D
+  channels-last token field ``(B, T_tok, H_tok, W_tok, C)``. Used by
+  Arms 3 and 4 (pure-Mamba). Scans temporal-first at each spatial-token
+  location, matching ``TemporalMambaBlock``'s scan strategy.
+* ``PatchEmbed3D`` (§3.4) — ``Conv3d(1, C_emb, kernel=(4,4,4),
+  stride=(4,4,4))`` patchifier that maps the input volume to an initial
+  token field.
+* ``TokenMerge3D`` (§3.4) — Spatial-only ``(1, 2, 2)`` 2x2 neighborhood
+  merge with a ``Linear(4C, 2C)`` projection. Channels-last input/output.
+* ``TokenSplit3D`` (§3.4) — Inverse of ``TokenMerge3D``: ``Linear(C,
+  4C')`` followed by a 2x2 spatial reshape, producing a ``(B, T, 2H, 2W,
+  C')`` token field. Channels-last input/output.
+
+The block contracts are committed in §11.7 (two distinct Mamba block
+classes, both scanning temporal-first). The minimum-sequence-length
+warning in §3.5 — ``d_conv=4`` requires ``T_tok >= 4`` (and effectively
+``>= 8`` for Vivim's rule of thumb) — is the caller's responsibility;
+these blocks accept any ``T`` but degenerate at very short sequences.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+
+import torch
+import torch.nn as nn
+
+_log = logging.getLogger(__name__)
+
+# Mamba backend selection. The CUDA kernels in ``mamba_ssm`` are used when the
+# package imports; otherwise (or when LSL_FORCE_MAMBA_REF=1) the pure-PyTorch
+# reference in ``localizer.gate.mamba_ref`` is used. Both expose the same
+# parameter names and shapes, so a checkpoint trained with one loads into the
+# other unchanged. The reference is for correctness and portability (CPU,
+# Windows), not speed. ``MAMBA_BACKEND`` records which one is active.
+if os.environ.get("LSL_FORCE_MAMBA_REF", "") not in ("", "0"):
+    from localizer.gate.mamba_ref import Mamba
+
+    MAMBA_BACKEND = "reference"
+    _log.warning("LSL_FORCE_MAMBA_REF is set: using the pure-PyTorch Mamba reference.")
+else:
+    try:
+        from mamba_ssm import Mamba
+
+        MAMBA_BACKEND = "mamba_ssm"
+    except ImportError:
+        from localizer.gate.mamba_ref import Mamba
+
+        MAMBA_BACKEND = "reference"
+        _log.warning(
+            "mamba_ssm is not importable: using the pure-PyTorch Mamba reference "
+            "(correct but slow; for training build the fused kernels: docs/environment.md, \"Tier 1 from source\")."
+        )
+
+
+def _dt_scale_for_target_std(d_model: int, dt_init_std: float) -> float:
+    """Convert a target ``dt_init_std`` to ``mamba_ssm.Mamba``'s
+    ``dt_scale`` constructor argument.
+
+    Background. v0.7 §5.3 specifies ``dt_init_std = 0.001`` as the
+    third leg of the pure-Mamba training-recipe trio (the d_model >=
+    2048 -> C_emb = 64 init-scale mismatch fix). The installed
+    ``mamba_ssm`` 2.3.1 does not expose ``dt_init_std`` directly;
+    instead Mamba's ``__init__`` computes
+    ``dt_init_std = dt_rank**-0.5 * dt_scale`` where
+    ``dt_rank = math.ceil(d_model / 16)`` when ``"auto"`` (the
+    default). Solving for ``dt_scale`` to hit a given target:
+    ``dt_scale = dt_init_std * sqrt(dt_rank)``.
+
+    Returns the converted ``dt_scale`` value. Calculating it
+    per-block (since ``dt_rank`` depends on each block's channel
+    width) so the actual init std hits ``dt_init_std`` across all
+    per-stage channel counts in Arm 4 (64 -> 128 -> 256 -> 512).
+    """
+    dt_rank = math.ceil(d_model / 16)
+    return float(dt_init_std) * math.sqrt(dt_rank)
+
+
+class TemporalMambaBlock(nn.Module):
+    """Vivim-style bidirectional temporal Mamba block on 5D channels-first
+    feature maps.
+
+    At each spatial location ``(r, c)`` in the input feature map, the
+    temporal sequence of length ``T`` is scanned forward and backward
+    with separate ``Mamba`` layers and the two passes are fused by sum.
+    A residual is added at the end. The whole block is shape-preserving
+    over the input ``(B, C, T, H, W)``.
+
+    Implementation note (Q12 §3.1): each forward pass calls ``Mamba(...)``
+    exactly once on the ``(B*H*W, T, C)`` tensor. At ``B=8, H=W=128,
+    T=64``, that is 131072 sequences of length 64 in a single kernel
+    launch — well inside the regime the optimized selective-scan kernel
+    is designed for. No per-spatial-location Python loop.
+
+    Args:
+        channels: Number of feature channels ``C``. Passed to
+            ``Mamba`` as ``d_model``.
+        d_state: SSM state dimension ``N``. Mamba default 16 per §3.1.
+        expand: SSM expansion factor. Mamba default 2.
+        d_conv: Depthwise causal-conv kernel. Mamba default 4. Note that
+            sequences shorter than ``d_conv`` see the conv kernel padded
+            more than its real signal and the block degenerates.
+
+    Shape:
+        Input: ``(B, C, T, H, W)``.
+        Output: ``(B, C, T, H, W)`` — same shape (residual block).
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        d_state: int = 16,
+        expand: int = 2,
+        d_conv: int = 4,
+    ) -> None:
+        super().__init__()
+        self.channels = channels
+        self.fwd = Mamba(
+            d_model=channels, d_state=d_state,
+            d_conv=d_conv, expand=expand,
+        )
+        self.bwd = Mamba(
+            d_model=channels, d_state=d_state,
+            d_conv=d_conv, expand=expand,
+        )
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass. ``x``: ``(B, C, T, H, W)``."""
+        B, C, T, H, W = x.shape
+        residual = x
+        # (B, C, T, H, W) -> (B, H, W, T, C) -> (B*H*W, T, C)
+        h = x.permute(0, 3, 4, 2, 1).contiguous().view(B * H * W, T, C)
+        h = self.norm(h)
+        f = self.fwd(h)                              # (B*H*W, T, C)
+        b = self.bwd(h.flip(dims=[1])).flip(dims=[1])
+        h = f + b
+        # (B*H*W, T, C) -> (B, H, W, T, C) -> (B, C, T, H, W)
+        h = h.view(B, H, W, T, C).permute(0, 4, 3, 1, 2).contiguous()
+        return residual + h
+
+
+class TokenMambaBlock(nn.Module):
+    """Bidirectional Mamba block on a 5D channels-last token field.
+
+    Used by Arms 3 and 4 (pure-Mamba). The temporal scan strategy is
+    committed in §11.7: scan temporal-first at each spatial-token
+    location, *not* over the flattened ``(T_tok, H_tok, W_tok)`` token
+    order. This holds the scan-strategy axis constant across Arms 1-4
+    so the architectural-family axis (CNN+Mamba vs pure-Mamba) is
+    isolated.
+
+    Args:
+        channels: Per-token channel count ``C``. Passed to ``Mamba`` as
+            ``d_model``.
+        d_state: SSM state dimension ``N``. Default 16.
+        expand: SSM expansion factor. Default 2.
+        d_conv: Depthwise causal-conv kernel. Default 4.
+
+    Shape:
+        Input: ``(B, T_tok, H_tok, W_tok, C)``.
+        Output: ``(B, T_tok, H_tok, W_tok, C)`` — same shape (residual block).
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        d_state: int = 16,
+        expand: int = 2,
+        d_conv: int = 4,
+    ) -> None:
+        super().__init__()
+        self.channels = channels
+        self.fwd = Mamba(
+            d_model=channels, d_state=d_state,
+            d_conv=d_conv, expand=expand,
+        )
+        self.bwd = Mamba(
+            d_model=channels, d_state=d_state,
+            d_conv=d_conv, expand=expand,
+        )
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass. ``x``: ``(B, T_tok, H_tok, W_tok, C)``."""
+        B, T, H, W, C = x.shape
+        residual = x
+        # (B, T, H, W, C) -> (B, H, W, T, C) -> (B*H*W, T, C)
+        h = x.permute(0, 2, 3, 1, 4).contiguous().view(B * H * W, T, C)
+        h = self.norm(h)
+        f = self.fwd(h)
+        b = self.bwd(h.flip(dims=[1])).flip(dims=[1])
+        h = f + b
+        # (B*H*W, T, C) -> (B, H, W, T, C) -> (B, T, H, W, C)
+        h = h.view(B, H, W, T, C).permute(0, 3, 1, 2, 4).contiguous()
+        return residual + h
+
+
+class PatchEmbed3D(nn.Module):
+    """3D patch embedding for the pure-Mamba arms (§3.4).
+
+    Applies a single ``Conv3d(in_channels, embed_dim, kernel=patch_size,
+    stride=patch_size)`` to the input volume, then permutes to
+    channels-last so the result composes naturally with ``nn.Linear``
+    layers in ``TokenMerge3D`` / ``TokenSplit3D``.
+
+    Args:
+        in_channels: Input volume channels (1 for slow-swarm).
+        embed_dim: Token embedding dimension ``C_emb``. v0.6 uses 64
+            per §3.4.
+        patch_size: 3-tuple ``(p_t, p_h, p_w)`` for the conv kernel and
+            stride. v0.6 uses ``(4, 4, 4)`` per §3.4.
+
+    Shape:
+        Input: ``(B, in_channels, T, H, W)``.
+        Output: ``(B, T/p_t, H/p_h, W/p_w, embed_dim)`` channels-last.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        embed_dim: int = 64,
+        patch_size: tuple[int, int, int] = (4, 4, 4),
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.proj = nn.Conv3d(
+            in_channels, embed_dim,
+            kernel_size=patch_size, stride=patch_size,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass. ``x``: ``(B, in_channels, T, H, W)``."""
+        h = self.proj(x)                              # (B, C, T', H', W')
+        return h.permute(0, 2, 3, 4, 1).contiguous()  # (B, T', H', W', C)
+
+
+class TokenMerge3D(nn.Module):
+    """Spatial-only ``(1, 2, 2)`` 2x2 token-merge with channel doubling.
+
+    Per §3.4, Arm 3's encoder merges along the spatial axes only (not
+    temporal) so the per-token sequence length ``T_tok`` stays at 16
+    throughout the encoder, well above the ``d_conv=4`` degenerate
+    threshold for the temporal scan.
+
+    Channel count doubles from ``C`` to ``2*C`` while spatial resolution
+    halves. Implemented as: rearrange the 2x2 spatial neighborhood into
+    channels (yielding ``4*C`` features), then ``Linear(4*C, 2*C)`` to
+    fuse them.
+
+    Args:
+        channels: Input channel count ``C``. Output channels are ``2*C``.
+
+    Shape:
+        Input: ``(B, T, H, W, C)``.
+        Output: ``(B, T, H/2, W/2, 2*C)``.
+    """
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.channels = channels
+        self.merge_linear = nn.Linear(4 * channels, 2 * channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass. ``x``: ``(B, T, H, W, C)`` with even H, W."""
+        B, T, H, W, C = x.shape
+        if H % 2 != 0 or W % 2 != 0:
+            raise ValueError(
+                f"TokenMerge3D requires even spatial dims; got H={H}, W={W}"
+            )
+        # rearrange 2x2 spatial neighborhoods into channels:
+        # (B, T, H, W, C) -> (B, T, H/2, 2, W/2, 2, C)
+        # -> (B, T, H/2, W/2, 2, 2, C) -> (B, T, H/2, W/2, 4*C)
+        x = x.reshape(B, T, H // 2, 2, W // 2, 2, C)
+        x = x.permute(0, 1, 2, 4, 3, 5, 6).contiguous()
+        x = x.reshape(B, T, H // 2, W // 2, 4 * C)
+        return self.merge_linear(x)
+
+
+class TokenMambaBlockConcatFusion(nn.Module):
+    """Bidirectional Mamba block on a 5D channels-last token field with
+    concat-then-project fusion (v0.7 arm B variant per design §3.2).
+
+    Identical to ``TokenMambaBlock`` except the bidirectional fusion is
+    ``self.fusion(torch.cat([f, b], dim=-1))`` with
+    ``self.fusion = nn.Linear(2*C, C)`` rather than ``f + b``. Also
+    threads an optional ``dt_init_std`` through to both ``Mamba``
+    sub-modules (the v0.7 §5.3 training-recipe-trio third leg, used to
+    cope with the ``C_emb = 64`` token-width mismatch against Mamba's
+    d_model >= 2048 defaults).
+
+    Args:
+        channels: Per-token channel count ``C``. Passed to ``Mamba`` as
+            ``d_model``.
+        d_state: SSM state dimension ``N``. Default 16.
+        expand: SSM expansion factor. Default 2.
+        d_conv: Depthwise causal-conv kernel. Default 4.
+        dt_init_std: Optional override for the Mamba ``dt`` initialization
+            std. ``None`` (default) preserves Mamba's library default;
+            v0.7 arms A and B pass ``0.001`` per §5.3.
+
+    Shape:
+        Input: ``(B, T_tok, H_tok, W_tok, C)``.
+        Output: ``(B, T_tok, H_tok, W_tok, C)`` — same shape (residual block).
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        d_state: int = 16,
+        expand: int = 2,
+        d_conv: int = 4,
+        dt_init_std: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.channels = channels
+        mamba_kwargs: dict = {
+            "d_model": channels, "d_state": d_state,
+            "d_conv": d_conv, "expand": expand,
+        }
+        if dt_init_std is not None:
+            mamba_kwargs["dt_scale"] = _dt_scale_for_target_std(
+                channels, dt_init_std,
+            )
+        self.fwd = Mamba(**mamba_kwargs)
+        self.bwd = Mamba(**mamba_kwargs)
+        self.norm = nn.LayerNorm(channels)
+        self.fusion = nn.Linear(2 * channels, channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass. ``x``: ``(B, T_tok, H_tok, W_tok, C)``."""
+        B, T, H, W, C = x.shape
+        residual = x
+        h = x.permute(0, 2, 3, 1, 4).contiguous().view(B * H * W, T, C)
+        h = self.norm(h)
+        f = self.fwd(h)
+        b = self.bwd(h.flip(dims=[1])).flip(dims=[1])
+        h = self.fusion(torch.cat([f, b], dim=-1))     # (B*H*W, T, C)
+        h = h.view(B, H, W, T, C).permute(0, 3, 1, 2, 4).contiguous()
+        return residual + h
+
+
+class TokenMambaBlockV07(nn.Module):
+    """v0.7 sum-fusion variant of ``TokenMambaBlock`` that additionally
+    accepts ``dt_init_std`` to override the Mamba ``dt`` init std per
+    §5.3.
+
+    Architectural contract is byte-identical to v0.6's ``TokenMambaBlock``
+    when ``dt_init_std`` is ``None``: same fused ``f + b`` bidirectional
+    pass, same channels-last token-field forward, same residual. The
+    only difference is that the constructor threads ``dt_init_std`` to
+    both Mamba sub-modules when set.
+
+    Args:
+        channels: Per-token channel count ``C``.
+        d_state: SSM state dimension. Default 16.
+        expand: SSM expansion factor. Default 2.
+        d_conv: Depthwise causal-conv kernel. Default 4.
+        dt_init_std: Optional Mamba ``dt`` init std override.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        d_state: int = 16,
+        expand: int = 2,
+        d_conv: int = 4,
+        dt_init_std: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.channels = channels
+        mamba_kwargs: dict = {
+            "d_model": channels, "d_state": d_state,
+            "d_conv": d_conv, "expand": expand,
+        }
+        if dt_init_std is not None:
+            mamba_kwargs["dt_scale"] = _dt_scale_for_target_std(
+                channels, dt_init_std,
+            )
+        self.fwd = Mamba(**mamba_kwargs)
+        self.bwd = Mamba(**mamba_kwargs)
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass. ``x``: ``(B, T_tok, H_tok, W_tok, C)``."""
+        B, T, H, W, C = x.shape
+        residual = x
+        h = x.permute(0, 2, 3, 1, 4).contiguous().view(B * H * W, T, C)
+        h = self.norm(h)
+        f = self.fwd(h)
+        b = self.bwd(h.flip(dims=[1])).flip(dims=[1])
+        h = f + b
+        h = h.view(B, H, W, T, C).permute(0, 3, 1, 2, 4).contiguous()
+        return residual + h
+
+
+class TokenSplit3D(nn.Module):
+    """Spatial-only ``(1, 2, 2)`` 2x2 token-split with channel projection.
+
+    Inverse operation to ``TokenMerge3D``. Produces a ``(B, T, 2*H, 2*W,
+    out_channels)`` token field from a ``(B, T, H, W, C)`` input via
+    ``Linear(C, 4*out_channels)`` followed by a 2x2 spatial reshape.
+
+    The default ``out_channels = C/2`` mirrors ``TokenMerge3D``'s
+    channel-doubling, which is the symmetric case used by the Arm 3
+    decoder (§3.4). Arm 4's two-stage head (§3.6) uses asymmetric
+    factors (512->128 then 128->64); pass ``out_channels`` explicitly
+    for those cases.
+
+    Args:
+        channels: Input channel count ``C``.
+        out_channels: Optional explicit output channel count. Defaults
+            to ``channels // 2`` (``channels`` must be even when
+            defaulting).
+
+    Shape:
+        Input: ``(B, T, H, W, C)``.
+        Output: ``(B, T, 2*H, 2*W, out_channels)``.
+    """
+
+    def __init__(self, channels: int, out_channels: int | None = None) -> None:
+        super().__init__()
+        if out_channels is None:
+            if channels % 2 != 0:
+                raise ValueError(
+                    f"TokenSplit3D requires even channels when "
+                    f"out_channels is not given; got {channels}"
+                )
+            out_channels = channels // 2
+        self.channels = channels
+        self.out_channels = out_channels
+        self.split_linear = nn.Linear(channels, 4 * out_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass. ``x``: ``(B, T, H, W, C)``."""
+        B, T, H, W, C = x.shape
+        # (B, T, H, W, C) -> (B, T, H, W, 4*C') via Linear
+        h = self.split_linear(x)
+        # (B, T, H, W, 4*C') -> (B, T, H, 2, W, 2, C')
+        #   -> (B, T, H, 2, W, 2, C') with permute to put 2x2 next to spatial
+        #   -> (B, T, 2*H, 2*W, C')
+        C_out = self.out_channels
+        h = h.reshape(B, T, H, W, 2, 2, C_out)
+        h = h.permute(0, 1, 2, 4, 3, 5, 6).contiguous()
+        h = h.reshape(B, T, 2 * H, 2 * W, C_out)
+        return h

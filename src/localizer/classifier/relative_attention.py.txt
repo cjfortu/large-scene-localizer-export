@@ -1,0 +1,87 @@
+"""Relative-position attention block (recovered from earlier Stage 2 work).
+
+Single-block attention with a learned 1-D relative position bias indexed by
+``(i - j + max_len - 1)``. Operates on flattened ``(B, C, T*H*W)`` token
+sequences from the 3D CNN encoder; the block restores the ``(B, C, T, H, W)``
+shape before returning.
+
+Recovery note: default ``max_len`` increased from 1200 to 2200 to accommodate
+8 * 16 * 16 = 2048 tokens (native 64-frame input, after three 2x2 max-pools
+in the encoder gives T/8 = 8). The original 1200 was sized for 4*16*16 =
+1024 tokens (32-frame input after 8x temporal downsample).
+"""
+
+import torch
+import torch.nn as nn
+
+
+class RelativeAttentionBlock(nn.Module):
+    """Single-pair MHA + FFN block with 1D relative position bias.
+
+    Args:
+        dim: Channel dimension (must divide num_heads).
+        num_heads: Number of attention heads.
+        max_len: Maximum sequence length supported by the relative-bias
+            table (must be >= the actual ``T*H*W`` of the flattened tokens).
+        dropout: Dropout applied to attention weights, projection output,
+            and FFN.
+    """
+
+    def __init__(self, dim: int, num_heads: int, max_len: int = 2200, dropout: float = 0.1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.out_proj = nn.Sequential(nn.Linear(dim, dim), nn.Dropout(dropout))
+        self.dropout = nn.Dropout(dropout)
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(dropout),
+        )
+
+        self.max_len = max_len
+        self.relative_bias = nn.Parameter(
+            torch.zeros((2 * max_len - 1, num_heads), dtype=torch.float32)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, T, H, W = x.shape
+        x = x.view(B, C, -1).transpose(1, 2)  # (B, N, C)
+        N = x.size(1)
+
+        residual = x
+        x = self.norm1(x)
+
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        position_ids = torch.arange(N, dtype=torch.long, device=x.device)
+        rel_pos = position_ids[None, :] - position_ids[:, None] + self.max_len - 1
+        assert rel_pos.max().item() < self.relative_bias.shape[0], (
+            f"rel_pos max {int(rel_pos.max())} >= relative_bias len {self.relative_bias.shape[0]};"
+            f" increase max_len above {N}"
+        )
+        bias = self.relative_bias[rel_pos]
+        bias = bias.permute(2, 0, 1)
+        attn_scores = attn_scores + bias.unsqueeze(0)
+
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        out = torch.matmul(attn_weights, v)
+        out = out.transpose(1, 2).reshape(B, N, C)
+        x = residual + self.out_proj(out)
+
+        residual = x
+        x = self.norm2(x)
+        x = residual + self.ffn(x)
+        return x.transpose(1, 2).view(B, C, T, H, W)

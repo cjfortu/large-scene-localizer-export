@@ -1,0 +1,1 @@
+"""Stage 3 segmenter: volumetric U-Net + 3D Swin per-voxel mover segmentation (validated standalone, not integrated)."""

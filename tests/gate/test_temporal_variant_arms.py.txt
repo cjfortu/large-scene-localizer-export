@@ -1,0 +1,218 @@
+"""Shape, param-count, and gradient sanity tests for v0.5 Arms 2-4.
+
+Per ``documents/history/specs/stage1_v0_5_design.md`` §9 step 1 (shape on
+synthetic ``(1, 1, 64, 128, 128)`` input) and step 3 (shape and
+param-count tests for the three non-baseline variants). Pure CPU,
+small-batch where possible.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+_ROOT = Path(__file__).resolve().parents[2]
+
+from localizer.gate.model import (  # noqa: E402
+    PureConvSegmenter3D, TemporalVariantSegmenter3D, build_segmenter_v0_5,
+)
+
+
+NON_BASELINE_VARIANTS = ("wide_t_kernel", "delayed_t_pool", "dilated_t")
+
+
+@pytest.mark.parametrize("temporal_variant", NON_BASELINE_VARIANTS)
+def test_factory_returns_temporal_variant_class(temporal_variant: str) -> None:
+    """Non-baseline arms instantiate ``TemporalVariantSegmenter3D``."""
+    m = build_segmenter_v0_5(temporal_variant=temporal_variant, nfeats=32)
+    assert type(m) is TemporalVariantSegmenter3D
+    assert m.temporal_variant == temporal_variant
+    assert m.nfeats == 32
+
+
+@pytest.mark.parametrize("temporal_variant", NON_BASELINE_VARIANTS)
+def test_forward_output_shape_full_input(temporal_variant: str) -> None:
+    """Forward pass on ``(1, 1, 64, 128, 128)`` returns the same shape."""
+    m = build_segmenter_v0_5(temporal_variant=temporal_variant, nfeats=32)
+    m.eval()
+    x = torch.randn(1, 1, 64, 128, 128)
+    with torch.no_grad():
+        y = m(x)
+    assert tuple(y.shape) == (1, 1, 64, 128, 128), (
+        f"variant={temporal_variant} produced shape {tuple(y.shape)}; "
+        "expected (1, 1, 64, 128, 128)"
+    )
+
+
+@pytest.mark.parametrize("temporal_variant", NON_BASELINE_VARIANTS)
+def test_forward_output_shape_small_input(temporal_variant: str) -> None:
+    """Small input ``(1, 1, 16, 32, 32)`` keeps the seg-output ``(T, H, W)`` shape."""
+    m = build_segmenter_v0_5(temporal_variant=temporal_variant, nfeats=32)
+    m.eval()
+    x = torch.randn(1, 1, 16, 32, 32)
+    with torch.no_grad():
+        y = m(x)
+    assert tuple(y.shape) == (1, 1, 16, 32, 32), (
+        f"variant={temporal_variant} small-input shape {tuple(y.shape)}"
+    )
+
+
+@pytest.mark.parametrize("temporal_variant", NON_BASELINE_VARIANTS)
+def test_backward_pass_runs(temporal_variant: str) -> None:
+    """All trainable params get finite, mostly non-zero gradients."""
+    torch.manual_seed(0)
+    m = build_segmenter_v0_5(temporal_variant=temporal_variant, nfeats=32)
+    # Input shape must survive four 2× pools (min T=16, H=W=16).
+    x = torch.randn(1, 1, 16, 16, 16)
+    y = m(x)
+    y.sum().backward()
+    nonzero = 0
+    total = 0
+    for name, p in m.named_parameters():
+        if not p.requires_grad:
+            continue
+        total += 1
+        assert p.grad is not None, f"variant={temporal_variant}: no grad for {name}"
+        assert torch.isfinite(p.grad).all().item(), (
+            f"variant={temporal_variant}: non-finite grad in {name}"
+        )
+        if p.grad.abs().sum().item() > 0:
+            nonzero += 1
+    assert nonzero > 0, (
+        f"variant={temporal_variant}: zero gradient norm across all "
+        f"{total} trainable params"
+    )
+
+
+def test_wide_t_kernel_param_count_relative_to_baseline() -> None:
+    """Wide-T-kernel has MORE params than baseline-D (5×3×3 vs 3×3×3 encoder)."""
+    base = build_segmenter_v0_5(
+        temporal_variant="baseline", bottleneck_variant="D", nfeats=32,
+    )
+    wide = build_segmenter_v0_5(temporal_variant="wide_t_kernel", nfeats=32)
+    n_base = sum(p.numel() for p in base.parameters())
+    n_wide = sum(p.numel() for p in wide.parameters())
+    assert n_wide > n_base, (
+        f"wide_t_kernel ({n_wide:,}) should exceed baseline-D ({n_base:,})"
+    )
+    # Encoder convs are the wide ones; ratio bounded loosely below 5/3 since
+    # the decoder convs and batchnorms / 1×1×1 final head are unchanged.
+    ratio = n_wide / n_base
+    assert 1.05 < ratio < 1.7, (
+        f"wide_t_kernel / baseline-D ratio = {ratio:.3f}; "
+        "expected modest growth (1.05 < r < 1.7)"
+    )
+
+
+def test_dilated_t_param_count_equals_baseline() -> None:
+    """Dilated-T uses 3×3×3 kernels at every stage — identical param count to baseline-D."""
+    base = build_segmenter_v0_5(
+        temporal_variant="baseline", bottleneck_variant="D", nfeats=32,
+    )
+    dilated = build_segmenter_v0_5(temporal_variant="dilated_t", nfeats=32)
+    n_base = sum(p.numel() for p in base.parameters())
+    n_dilated = sum(p.numel() for p in dilated.parameters())
+    assert n_dilated == n_base, (
+        f"dilated_t param count {n_dilated:,} must equal baseline-D {n_base:,} "
+        "(dilation adds no weights)"
+    )
+
+
+def test_delayed_t_pool_param_count_close_to_baseline() -> None:
+    """Delayed-T-pool has the same encoder/decoder kernel sizes as baseline-D
+    except for ``up1`` which uses an asymmetric ``(1, 2, 2)`` kernel; param
+    count differs only by the up1 weight delta.
+    """
+    base = build_segmenter_v0_5(
+        temporal_variant="baseline", bottleneck_variant="D", nfeats=32,
+    )
+    delayed = build_segmenter_v0_5(temporal_variant="delayed_t_pool", nfeats=32)
+    n_base = sum(p.numel() for p in base.parameters())
+    n_delayed = sum(p.numel() for p in delayed.parameters())
+    # up1 is ConvTranspose3d(c2=64 in, c1=32 out). Weights = in_ch * out_ch * prod(kernel).
+    # Baseline kernel (2,2,2) = 8; delayed kernel (1,2,2) = 4. Bias is unchanged.
+    expected_delta = 64 * 32 * (8 - 4)
+    assert n_base - n_delayed == expected_delta, (
+        f"delayed_t_pool param delta {n_base - n_delayed:,} != expected "
+        f"{expected_delta:,} (driven by up1 kernel (1,2,2) vs (2,2,2))"
+    )
+
+
+def test_dilated_t_uses_temporal_dilation_at_deep_stages() -> None:
+    """Dilated-T's stage 3 and stage 4 encoder convs have dilation (2, 1, 1)."""
+    m = build_segmenter_v0_5(temporal_variant="dilated_t", nfeats=32)
+    # down1/down2: dilation_t=1
+    for blk_name in ("down1", "down2"):
+        blk = getattr(m, blk_name)
+        convs = [c for c in blk.conv if isinstance(c, torch.nn.Conv3d)]
+        for c in convs:
+            assert c.dilation == (1, 1, 1), (
+                f"{blk_name} conv has dilation {c.dilation}; expected (1, 1, 1)"
+            )
+    # down3/down4: dilation_t=2
+    for blk_name in ("down3", "down4"):
+        blk = getattr(m, blk_name)
+        convs = [c for c in blk.conv if isinstance(c, torch.nn.Conv3d)]
+        for c in convs:
+            assert c.dilation == (2, 1, 1), (
+                f"{blk_name} conv has dilation {c.dilation}; expected (2, 1, 1)"
+            )
+
+
+def test_wide_t_kernel_uses_temporal_kernel_5_at_all_stages() -> None:
+    """Wide-T-kernel uses temporal kernel size 5 at every encoder stage."""
+    m = build_segmenter_v0_5(temporal_variant="wide_t_kernel", nfeats=32)
+    for blk_name in ("down1", "down2", "down3", "down4"):
+        blk = getattr(m, blk_name)
+        convs = [c for c in blk.conv if isinstance(c, torch.nn.Conv3d)]
+        for c in convs:
+            assert c.kernel_size == (5, 3, 3), (
+                f"{blk_name} conv kernel {c.kernel_size}; expected (5, 3, 3)"
+            )
+
+
+def test_delayed_t_pool_first_pool_is_spatial_only() -> None:
+    """Delayed-T-pool ``pool1`` is ``MaxPool3d(kernel=(1, 2, 2))``."""
+    m = build_segmenter_v0_5(temporal_variant="delayed_t_pool", nfeats=32)
+    assert isinstance(m.pool1, torch.nn.MaxPool3d)
+    assert m.pool1.kernel_size == (1, 2, 2), (
+        f"pool1 kernel {m.pool1.kernel_size}; expected (1, 2, 2)"
+    )
+    # Mirroring up1 must be asymmetric so the d1 skip concat shape-matches.
+    assert isinstance(m.up1, torch.nn.ConvTranspose3d)
+    assert m.up1.kernel_size == (1, 2, 2)
+    assert m.up1.stride == (1, 2, 2)
+
+
+def test_non_baseline_bottleneck_is_identity() -> None:
+    """Per §2.5, the bottleneck is held at Variant D (identity) for Arms 2-4."""
+    for tv in NON_BASELINE_VARIANTS:
+        m = build_segmenter_v0_5(temporal_variant=tv, nfeats=32)
+        assert isinstance(m.bottleneck, torch.nn.Identity), (
+            f"variant={tv} bottleneck is {type(m.bottleneck).__name__}; expected Identity"
+        )
+
+
+def test_invalid_temporal_variant_raises() -> None:
+    """Bad temporal_variant raises ``ValueError`` from both factory and class."""
+    with pytest.raises(ValueError, match="temporal_variant"):
+        build_segmenter_v0_5(temporal_variant="not_a_real_variant", nfeats=32)
+    with pytest.raises(ValueError, match="temporal_variant"):
+        TemporalVariantSegmenter3D(temporal_variant="not_a_real_variant", nfeats=32)
+
+
+def test_temporal_variant_segmenter_rejects_baseline() -> None:
+    """``TemporalVariantSegmenter3D`` rejects the baseline arm by design."""
+    with pytest.raises(ValueError, match="baseline"):
+        TemporalVariantSegmenter3D(temporal_variant="baseline", nfeats=32)
+
+
+def test_baseline_factory_param_count_matches_v0_variant_d() -> None:
+    """Baseline arm has the same param count as v0 Variant D (~11.4 M)."""
+    a = PureConvSegmenter3D(bottleneck_variant="D", nfeats=32)
+    b = build_segmenter_v0_5(temporal_variant="baseline", nfeats=32)
+    assert sum(p.numel() for p in a.parameters()) \
+        == sum(p.numel() for p in b.parameters())

@@ -1,0 +1,227 @@
+"""Classifier training loop (recovered from earlier Stage 2 work).
+
+Combines cells [11] (model + device) and [13] (training loop) from
+``mover_trans_Jun16.ipynb`` into a single ``run_training`` library function.
+
+Loss: ``BCELoss`` by default (model outputs post-sigmoid via ``forward``)
+to match the original engineer's setup and the recovered-validation
+milestone. Setting ``return_logits=True`` switches the model to emit raw
+logits and selects ``BCEWithLogitsLoss`` here for numerical stability — used
+by the regularization-variant ablation alongside ``weight_decay``.
+
+Optimizer: ``Adam(lr, weight_decay)``. ``weight_decay`` defaults to 0.0
+(unregularized, original behavior); set to e.g. ``1e-4`` for the
+regularization-variant ablation. No scheduler. No augmentation. Save best
+checkpoint by val accuracy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import yaml
+
+import logging
+import random
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from localizer.classifier.data import make_dataloaders
+from localizer.common.paths import add_root_args, resolve_config_paths, require_path
+from localizer.classifier.model import Mover3DCNNTrans
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ClassifierTrainConfig:
+    """Classifier training hyperparameters."""
+
+    seed: int = 0
+    n_frames: int = 64
+    dropout_rate: float = 0.5
+    attn_dropout: float = 0.1
+    max_attn_len: int = 2200
+    head_type: str = "flatten"
+    return_logits: bool = False
+    attn_type: str = "full"
+    weight_decay: float = 0.0
+    lr: float = 1e-3
+    batch_size: int = 16
+    num_epochs: int = 75
+    data_root: str | None = None  # required; from the config `dataset:` key
+    val_split: float = 0.1
+    val_split_seed: int = 91
+    output_root: str | None = None  # required; from the config `run_name:` key
+    num_workers: int = 4
+    max_samples: int | None = None  # Cap for smoke tests.
+
+
+def run_training(cfg: ClassifierTrainConfig) -> dict:
+    """Train the classifier end-to-end. Returns history + best val acc."""
+    require_path(cfg.data_root, "data_root")
+    require_path(cfg.output_root, "output_root")
+    torch.manual_seed(cfg.seed)
+    random.seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+
+    output_root = Path(cfg.output_root)
+    (output_root / "models").mkdir(parents=True, exist_ok=True)
+
+    train_loader, val_loader, n_samples = make_dataloaders(
+        data_root=cfg.data_root,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        val_split=cfg.val_split,
+        val_split_seed=cfg.val_split_seed,
+        max_samples=cfg.max_samples,
+    )
+    logger.info(
+        "Train batches: %d, val batches: %d, total samples: %d",
+        len(train_loader), len(val_loader), n_samples,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Device: %s", device)
+    model = Mover3DCNNTrans(
+        t_dim=cfg.n_frames,
+        dropout_rate=cfg.dropout_rate,
+        attn_dropout=cfg.attn_dropout,
+        max_attn_len=cfg.max_attn_len,
+        head_type=cfg.head_type,
+        return_logits=cfg.return_logits,
+        attn_type=cfg.attn_type,
+    ).to(device)
+
+    criterion = nn.BCEWithLogitsLoss() if cfg.return_logits else nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    best_val_acc = 0.0
+    history: list[dict] = []
+
+    for epoch in range(1, cfg.num_epochs + 1):
+        start = time.time()
+        model.train()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        for videos, labels in train_loader:
+            videos = videos.to(device)
+            labels = labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(videos)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * labels.size(0)
+            preds_prob = torch.sigmoid(outputs) if cfg.return_logits else outputs
+            predicted = (preds_prob > 0.5).long()
+            correct += (predicted == labels.long()).sum().item()
+            total += labels.size(0)
+        train_loss = total_loss / max(1, total)
+        train_acc = correct / max(1, total)
+
+        model.eval()
+        val_loss = 0.0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for videos, labels in val_loader:
+                videos = videos.to(device)
+                labels = labels.to(device)
+                outputs = model(videos)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item() * labels.size(0)
+                preds_prob = torch.sigmoid(outputs) if cfg.return_logits else outputs
+                predicted = (preds_prob > 0.5).long()
+                correct += (predicted == labels.long()).sum().item()
+                total += labels.size(0)
+        val_loss = val_loss / max(1, total)
+        val_acc = correct / max(1, total)
+        wall = time.time() - start
+
+        logger.info(
+            "[epoch %d/%d] train: loss=%.4f acc=%.4f | val: loss=%.4f acc=%.4f | wall=%.1fs",
+            epoch, cfg.num_epochs, train_loss, train_acc, val_loss, val_acc, wall,
+        )
+
+        history.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "wall_seconds": wall,
+        })
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            ckpt_path = output_root / "models" / "best_classifier.pt"
+            torch.save(model.state_dict(), ckpt_path)
+            logger.info("[epoch %d] saved best checkpoint (val_acc=%.4f)", epoch, val_acc)
+
+    return {"history": history, "best_val_acc": best_val_acc}
+
+
+# ---------------------------------------------------------------------------
+# Command-line interface (moved here from the scripts/ entry point)
+# ---------------------------------------------------------------------------
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments (see ``main``)."""
+    p = argparse.ArgumentParser(description="Train the binary scene classifier.")
+    p.add_argument("--config", required=True, help="YAML config path.")
+    p.add_argument("--data_root", default=None)
+    p.add_argument("--output_root", default=None)
+    p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--num_epochs", type=int, default=None)
+    p.add_argument("--num_workers", type=int, default=None)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--max_samples", type=int, default=None,
+                   help="Cap dataset size for smoke tests.")
+    add_root_args(p, ('data', 'runs'))
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Train the classifier from a YAML config with optional overrides.
+
+    Args:
+        argv: Argument list (default: ``sys.argv[1:]``).
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    args = _parse_args(argv)
+    with open(args.config) as f:
+        cfg_dict = yaml.safe_load(f)
+    if getattr(args, "data_root", None):
+        cfg_dict.pop("dataset", None)
+    if getattr(args, "output_root", None):
+        cfg_dict.pop("run_name", None)
+    resolve_config_paths(cfg_dict, args.data_root_dir, args.runs_root_dir)
+
+    for k in ("data_root", "output_root", "batch_size", "num_epochs",
+              "num_workers", "seed", "max_samples"):
+        v = getattr(args, k, None)
+        if v is not None:
+            cfg_dict[k] = v
+
+    cfg = ClassifierTrainConfig(**cfg_dict)
+    result = run_training(cfg)
+
+    out = Path(cfg.output_root)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "training_history.json").write_text(json.dumps(result, indent=2, default=str))
+    logging.info("Done. best_val_acc=%.4f", result["best_val_acc"])
+
+
+if __name__ == "__main__":
+    main()

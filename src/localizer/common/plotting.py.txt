@@ -1,0 +1,105 @@
+"""Output utilities for the volumetric segmenter (recovered from earlier Stage 2 work).
+
+Saves per-epoch sample input GIFs, predicted-mask NPYs, and truth-vs-pred
+comparison GIFs to ``{output_root}/generated_files/`` so the engineer can
+visually assess model behavior across training.
+
+Recovery note: module-level torch/numpy/random seeds removed (training
+entry point handles seeding). Google Drive paths replaced with a
+configurable ``output_root`` argument.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import imageio
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+
+
+logger = logging.getLogger(__name__)
+
+
+def save_comparison_gif(
+    pred_np: np.ndarray, masks: torch.Tensor, output_root: str | Path,
+    label: int, epoch: int,
+) -> None:
+    """Save a side-by-side truth-vs-pred GIF for one sample."""
+    sample_pred = np.squeeze(pred_np, axis=0)
+    truth = np.squeeze(masks[0].cpu().numpy(), axis=0)
+    comp_gif_path = (
+        Path(output_root) / "generated_files" / "truth_vs_pred_GIFs"
+        / f"comp_{label}_ep{epoch}.gif"
+    )
+    comp_gif_path.parent.mkdir(parents=True, exist_ok=True)
+    sample_pred = (sample_pred * 255).astype(np.uint8)
+    truth = (truth * 255).astype(np.uint8)
+    frames = []
+    for i in range(sample_pred.shape[0]):
+        frames.append(np.hstack((truth[i], sample_pred[i])))
+    imageio.mimsave(comp_gif_path, frames, fps=4)
+
+
+def save_video_gif(
+    videos: torch.Tensor, output_root: str | Path, label: int, epoch: int,
+) -> None:
+    """Save the input video as a GIF for one sample."""
+    video_np = videos[0].cpu().numpy()
+    video_np = np.squeeze(video_np, axis=0)
+    video_gif_path = (
+        Path(output_root) / "generated_files" / "input_GIFs"
+        / f"vid_{label}_ep{epoch}.gif"
+    )
+    video_gif_path.parent.mkdir(parents=True, exist_ok=True)
+    video_np = (video_np * 255).astype(np.uint8)
+    frames = [video_np[i] for i in range(video_np.shape[0])]
+    imageio.mimsave(video_gif_path, frames, fps=4)
+
+
+def data_saver(
+    videos: torch.Tensor, outputs: torch.Tensor, masks: torch.Tensor,
+    output_root: str | Path, label: int, epoch: int,
+) -> None:
+    """Save the input video GIF, prediction NPY, and comparison GIF for one sample."""
+    preds = (torch.sigmoid(outputs) > 0.5).float()
+    save_video_gif(videos, output_root, label, epoch)
+
+    pred_np = preds[0].cpu().numpy()
+    pred_npy_path = (
+        Path(output_root) / "generated_files" / "pred_NPYs"
+        / f"pred_{label}_ep{epoch}.npy"
+    )
+    pred_npy_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(pred_npy_path, pred_np)
+    save_comparison_gif(pred_np, masks, output_root, label, epoch)
+
+
+def plot_perf(
+    epochs: list, avg_trn_met: list, avg_val_met: list,
+    met_abrv: str, met_desc: str, output_root: str | Path,
+) -> None:
+    """Plot training vs validation metric over epochs; save CSV + PNG."""
+    columns = ["epoch", f"avg_trn_{met_abrv}", f"avg_val_{met_abrv}"]
+    stats = pd.DataFrame(columns=columns)
+    stats["epoch"] = epochs
+    stats[f"avg_trn_{met_abrv}"] = [d.cpu() if hasattr(d, "cpu") else d for d in avg_trn_met]
+    stats[f"avg_val_{met_abrv}"] = [d.cpu() if hasattr(d, "cpu") else d for d in avg_val_met]
+    out = Path(output_root)
+    stats.to_csv(out / f"stats_{met_abrv}.csv", index=False)
+    plt.figure(figsize=(10, 6))
+    plt.plot(stats["epoch"], stats[f"avg_trn_{met_abrv}"],
+             label=f"Training {met_abrv}", color="blue", marker="o", linestyle="--", markersize=4)
+    plt.plot(stats["epoch"], stats[f"avg_val_{met_abrv}"],
+             label=f"Validation {met_abrv}", color="red", marker="x", linestyle="--", markersize=4)
+    plt.xlabel("Epoch")
+    plt.ylabel(f"{met_desc} ({met_abrv})")
+    plt.legend()
+    plt.title(f"Train vs Validation {met_abrv} (Epochs 1-{max(epochs)})")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(out / f"learning-curve_{met_abrv}.png")
+    plt.close()

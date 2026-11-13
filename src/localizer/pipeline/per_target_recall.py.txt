@@ -1,0 +1,240 @@
+"""Per-target end-to-end recall + loss decomposition (A, B1) — inference-only.
+
+Re-aggregates the Tier-2 end-to-end pipeline (gate -> 4x4 128px chips -> Stage-2)
+to the TARGET level (the unit the >=0.95 bar is defined on), and decomposes any
+loss into gate-miss vs Stage-2-reject.
+
+Target instances: no per-target metadata exists in the dataset (binary masks
+only), so a target = a 3D connected component (6-conn) of the truth mask. This
+MERGES targets whose space-time tracks touch/cross (dense GRF clusters), so the
+component count is a lower bound on individual movers and a "target" here is a
+connected target GROUP. Reported with the per-scene count distribution.
+
+Per present scene:
+  - gate -> chip flags (4x4); each flagged chip's 128px crop -> Stage-2 -> pos.
+    chip_survived = flag AND Stage2-positive.
+  - target components -> each component's occupied chip set (time-collapsed) and
+    centroid chip.
+Per target (component):
+  - caught iff >=1 occupied chip is chip_survived (gate-flagged AND S2-positive).
+  - lenient (centroid): the component's centroid chip is chip_survived.
+  - loss class (if uncaught): gate-miss = gate flagged NONE of its chips;
+    Stage2-reject = gate flagged >=1 but all flagged target-chips were S2-negative.
+
+Needs a CUDA GPU for practical speed (the gate's Mamba kernels); with the
+pure-PyTorch Mamba reference it also runs on CPU, slowly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+from scipy import ndimage
+
+
+
+from localizer.gate.model import build_segmenter_v0_7
+from localizer.common.data import make_dataloaders as seg_loaders
+from localizer.classifier.model import Mover3DCNNTrans
+from localizer.common.checkpoint_io import load_weights
+from localizer.common.paths import add_root_args, resolve_under
+
+GATE_BUILD = dict(arm=2, nfeats=32, fusion="sum", stem_stride=2, dt_init_std=None)
+LOW_RES_POOL = (2, 4, 4)
+SUBSET, VSPLIT, VSEED = 3000, 0.1, 0
+THR = 0.5
+NCHIP, CHIP_IN, CHIP_LR = 4, 128, 32
+# Default checkpoints, resolved under the checkpoints root ($LSL_CKPT_ROOT).
+DEFAULT_CLASSIFIER_CKPT = "classifier_baseline_30k_ep64.safetensors"
+DEFAULT_GATE_CKPTS = ["A=gate_A_stem2_bs1_ep42.safetensors"]
+DEFAULT_DATASET = "multi_target_swarm_512x512x64"
+
+
+def _parse_gate_ckpts(items):
+    """Parse ``--gate-ckpt`` values (``LABEL=PATH`` or ``PATH``) into {label: path}."""
+    out = {}
+    for it in items:
+        label, _, path = it.rpartition("=")
+        out[label or Path(path).stem] = path
+    return out
+_STRUCT = ndimage.generate_binary_structure(3, 1)  # 6-connectivity
+
+
+def load_gate(path, device):
+    m = build_segmenter_v0_7(**GATE_BUILD).to(device)
+    load_weights(m, path, map_location=device, strict=True)
+    m.eval(); return m
+
+
+def load_stage2(path, device):
+    m = Mover3DCNNTrans(t_dim=64, dropout_rate=0.5, attn_dropout=0.1, max_attn_len=2200,
+                        head_type="flatten", return_logits=False, attn_type="full").to(device)
+    load_weights(m, path, map_location=device, strict=True)
+    m.eval(); return m
+
+
+@torch.no_grad()
+def chip_survived(gate, stage2, vol_t, device):
+    """(4,4) bools: gate flag, and survived (flag AND Stage2-positive)."""
+    logits = gate(vol_t.unsqueeze(0).to(device)).float()
+    pos = (torch.sigmoid(logits) > THR)[0, 0].cpu().numpy()        # (32,128,128)
+    flags = pos.reshape(pos.shape[0], NCHIP, CHIP_LR, NCHIP, CHIP_LR).any(axis=(0, 2, 4))
+    surv = np.zeros((NCHIP, NCHIP), bool)
+    for r in range(NCHIP):
+        for c in range(NCHIP):
+            if not flags[r, c]:
+                continue
+            crop = vol_t[0, :, r * CHIP_IN:(r + 1) * CHIP_IN, c * CHIP_IN:(c + 1) * CHIP_IN]
+            p = float(stage2(crop.unsqueeze(0).unsqueeze(0).to(device)).reshape(-1)[0].item())
+            surv[r, c] = p > 0.5
+    return flags, surv
+
+
+def target_components(mask_full):
+    """List of components; each = (set of (r,c) chips, centroid chip (r,c), n_chips)."""
+    m = (np.asarray(mask_full)[0] > 0.5)                          # (64,512,512)
+    labeled, n = ndimage.label(m, structure=_STRUCT)
+    comps = []
+    if n == 0:
+        return comps, 0
+    objs = ndimage.find_objects(labeled)
+    # spatial centroids over H,W (collapse T) per label
+    for lab in range(1, n + 1):
+        sl = objs[lab - 1]
+        if sl is None:
+            continue
+        sub = (labeled[sl] == lab)
+        # voxel coords within sub -> global H,W
+        tt, hh, ww = np.where(sub)
+        H = hh + sl[1].start
+        W = ww + sl[2].start
+        chips = set(zip((H // CHIP_IN).tolist(), (W // CHIP_IN).tolist()))
+        cr = int(np.clip(int(round(H.mean())) // CHIP_IN, 0, NCHIP - 1))
+        cc = int(np.clip(int(round(W.mean())) // CHIP_IN, 0, NCHIP - 1))
+        comps.append((chips, (cr, cc), len(chips)))
+    return comps, n
+
+
+def eval_arm(arm, gate, stage2, dataset, present_idx, comp_cache, device):
+    caught = lenient = total = 0
+    gate_miss = s2_reject = 0
+    foot_caught, foot_lost = [], []
+    per_scene_counts = []
+    for i in present_idx:
+        s = dataset[i]
+        vol = torch.as_tensor(s["volume"])
+        flags, surv = chip_survived(gate, stage2, vol, device)
+        comps = comp_cache[i]
+        per_scene_counts.append(len(comps))
+        for chips, (cr, cc), nchips in comps:
+            total += 1
+            is_caught = any(surv[r, c] for (r, c) in chips)
+            gate_any = any(flags[r, c] for (r, c) in chips)
+            if is_caught:
+                caught += 1; foot_caught.append(nchips)
+            else:
+                foot_lost.append(nchips)
+                if gate_any:
+                    s2_reject += 1
+                else:
+                    gate_miss += 1
+            if surv[cr, cc]:
+                lenient += 1
+    def foot_hist(v):
+        v = np.asarray(v) if v else np.array([], int)
+        return {"n": int(v.size), "mean": float(v.mean()) if v.size else 0.0,
+                "1chip": int((v == 1).sum()), "2chip": int((v == 2).sum()),
+                "3chip": int((v == 3).sum()), "4plus": int((v >= 4).sum())}
+    lost = total - caught
+    return {
+        "arm": arm, "n_present_scenes": len(present_idx),
+        "total_targets": total, "caught": caught,
+        "per_target_recall": caught / max(total, 1),
+        "lenient_centroid_caught": lenient,
+        "per_target_recall_lenient": lenient / max(total, 1),
+        "lost": lost,
+        "gate_miss": gate_miss, "stage2_reject": s2_reject,
+        "gate_miss_pct_of_loss": gate_miss / max(lost, 1),
+        "stage2_reject_pct_of_loss": s2_reject / max(lost, 1),
+        "footprint_caught": foot_hist(foot_caught),
+        "footprint_lost": foot_hist(foot_lost),
+        "per_scene_target_count": {
+            "mean": float(np.mean(per_scene_counts)), "p50": float(np.percentile(per_scene_counts, 50)),
+            "p95": float(np.percentile(per_scene_counts, 95)),
+            "min": int(np.min(per_scene_counts)), "max": int(np.max(per_scene_counts))},
+    }
+
+
+def main(argv=None):
+    """Run the evaluation; see the module docstring.
+
+    Args:
+        argv: Argument list (default: ``sys.argv[1:]``).
+
+    Returns:
+        Process exit code (0 on success).
+    """
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--dataset", default=DEFAULT_DATASET,
+                   help="dataset name under the data root, or an absolute path")
+    p.add_argument("--gate-ckpt", action="append", default=None,
+                   help="gate checkpoint as LABEL=PATH or PATH (repeatable); relative "
+                        "paths resolve under the checkpoints root. Default: "
+                        + ", ".join(DEFAULT_GATE_CKPTS))
+    p.add_argument("--classifier-ckpt", default=DEFAULT_CLASSIFIER_CKPT,
+                   help="classifier checkpoint; relative paths resolve under the checkpoints root")
+    p.add_argument("--out", required=True, help="output JSON path")
+    add_root_args(p, ("data", "ckpt"))
+    args = p.parse_args(argv)
+    data_dir = resolve_under("data", args.dataset, args.data_root_dir)
+    gate_ckpts = {k: resolve_under("ckpt", v, args.ckpt_root_dir)
+                  for k, v in _parse_gate_ckpts(args.gate_ckpt or DEFAULT_GATE_CKPTS).items()}
+    s2_ckpt = resolve_under("ckpt", args.classifier_ckpt, args.ckpt_root_dir)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device={device} host={socket.gethostname()}")
+    _, vl, datshape = seg_loaders(
+        data_root=str(data_dir), subset_size=SUBSET, batch_size=1, num_workers=0,
+        val_split=VSPLIT, val_split_seed=VSEED, output_resolution="low_res",
+        soft_target=False, low_res_pool=LOW_RES_POOL)
+    dataset = vl.dataset
+    present_idx = [i for i in range(len(dataset)) if int(dataset[i]["label"]) == 1]
+    print(f"val scenes={len(dataset)} present={len(present_idx)}")
+    # cache target components once (mask-only; arm-independent)
+    print("--- caching target components (3D CC) ---", flush=True)
+    comp_cache = {}
+    tot = 0
+    for i in present_idx:
+        comps, n = target_components(dataset[i]["mask_full"])
+        comp_cache[i] = comps
+        tot += len(comps)
+    print(f"  total target components (groups) = {tot}  (~{tot/len(present_idx):.1f}/scene)")
+    stage2 = load_stage2(s2_ckpt, device)
+    results = {}
+    for arm, gpath in gate_ckpts.items():
+        print(f"--- {arm} ---", flush=True)
+        gate = load_gate(gpath, device)
+        r = eval_arm(arm, gate, stage2, dataset, present_idx, comp_cache, device)
+        results[arm] = r
+        print(f"  {arm}: per-target recall={r['per_target_recall']:.4f} ({r['caught']}/{r['total_targets']}) "
+              f"lenient={r['per_target_recall_lenient']:.4f} | loss: gate-miss={r['gate_miss']} "
+              f"S2-reject={r['stage2_reject']} (S2 {r['stage2_reject_pct_of_loss']*100:.0f}% of loss)")
+    payload = {"meta": {"target_def": "3D CC (6-conn) of mask = connected target GROUP",
+                        "chip_grid": f"{NCHIP}x{NCHIP}", "chip_px": CHIP_IN,
+                        "stage2_ckpt": str(s2_ckpt), "gate_ckpts": {k: str(v) for k, v in gate_ckpts.items()},
+                        "data_root": str(data_dir),
+                        "caveat": "CC merges touching/crossing tracks in dense clusters; count is lower bound on movers"},
+               "results": results}
+    outp = Path(args.out); outp.parent.mkdir(parents=True, exist_ok=True)
+    outp.write_text(json.dumps(payload, indent=2, default=str))
+    print(f"wrote {outp}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,218 @@
+"""End-to-end Stage1(gate)->Stage2(classifier) system measurement (inference-only).
+
+Tier 2 of the Stage-2 specificity / system diagnostic. No training, no backward,
+no checkpoint/code mutation.
+
+Pipeline per 512x512x64 val scene:
+  1. Gate (v0.10 best_gate, A or B1) -> native low-res logits (32x128x128).
+  2. Partition the scene into a 4x4 grid of 128px chips (= cluster_chip_size 128,
+     the Stage-2 crop unit). A chip is a PROPOSAL if the gate flags any voxel in it
+     (sigmoid>0.5, any frame). A chip is TARGET-OCCUPIED if mask_full has any target
+     voxel in it (any frame).
+  3. Each proposal chip's 128x128x64 input crop -> Stage 2 classifier -> pos/neg.
+
+Tallies:
+  - System recall (end-to-end coverage): target-occupied chips that are
+    (proposal AND Stage2-positive) / target-occupied chips. A target chip lost
+    either at the gate (not proposed) or at Stage 2 (proposed but classified neg)
+    counts against recall. >=0.95 => <=5% target loss.
+  - System false-detections/scene: Stage2-positive proposal chips that are NOT
+    target-occupied. mean / p50 / p95, on absent and present scenes.
+  - Reference: gate proposals/scene; Stage2 specificity ON gate hard-negatives
+    (fraction of flagged non-target chips Stage2 calls negative).
+
+Needs a CUDA GPU for practical speed (the gate's Mamba kernels); with the
+pure-PyTorch Mamba reference it also runs on CPU, slowly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+
+
+from localizer.gate.model import build_segmenter_v0_7
+from localizer.common.data import make_dataloaders as seg_loaders
+from localizer.classifier.model import Mover3DCNNTrans
+from localizer.common.checkpoint_io import load_weights
+from localizer.common.paths import add_root_args, resolve_under
+
+GATE_BUILD = dict(arm=2, nfeats=32, fusion="sum", stem_stride=2, dt_init_std=None)
+LOW_RES_POOL = (2, 4, 4)
+SUBSET, VSPLIT, VSEED = 3000, 0.1, 0
+THR = 0.5
+NCHIP = 4              # 4x4 grid of 128px chips over 512
+CHIP_IN = 128         # input px per chip
+CHIP_LR = 32          # low-res px per chip (128/4)
+# Default checkpoints, resolved under the checkpoints root ($LSL_CKPT_ROOT).
+DEFAULT_CLASSIFIER_CKPT = "classifier_baseline_30k_ep64.safetensors"
+DEFAULT_GATE_CKPTS = ["A=gate_A_stem2_bs1_ep42.safetensors"]
+DEFAULT_DATASET = "multi_target_swarm_512x512x64"
+
+
+def _parse_gate_ckpts(items):
+    """Parse ``--gate-ckpt`` values (``LABEL=PATH`` or ``PATH``) into {label: path}."""
+    out = {}
+    for it in items:
+        label, _, path = it.rpartition("=")
+        out[label or Path(path).stem] = path
+    return out
+
+
+def load_gate(path, device):
+    m = build_segmenter_v0_7(**GATE_BUILD).to(device)
+    load_weights(m, path, map_location=device, strict=True)
+    m.eval(); return m
+
+
+def load_stage2(path, device):
+    m = Mover3DCNNTrans(t_dim=64, dropout_rate=0.5, attn_dropout=0.1, max_attn_len=2200,
+                        head_type="flatten", return_logits=False, attn_type="full").to(device)
+    load_weights(m, path, map_location=device, strict=True)
+    m.eval(); return m
+
+
+@torch.no_grad()
+def gate_chip_flags(gate, vol_t, device):
+    """(4,4) bool: gate flags any voxel in the chip (sigmoid>0.5, any frame)."""
+    logits = gate(vol_t.unsqueeze(0).to(device)).float()          # (1,1,32,128,128)
+    pos = (torch.sigmoid(logits) > THR)[0, 0].cpu().numpy()       # (32,128,128)
+    # chip c spans low-res [32c:32c+32]; flag if any positive in 2D block over time
+    blk = pos.reshape(pos.shape[0], NCHIP, CHIP_LR, NCHIP, CHIP_LR)
+    return blk.any(axis=(0, 2, 4))                                 # (4,4)
+
+
+def target_chip_occ(mask_full):
+    """(4,4) bool: mask has a target voxel in the chip (any frame)."""
+    m = (np.asarray(mask_full)[0] > 0.5)                           # (64,512,512)
+    blk = m.reshape(m.shape[0], NCHIP, CHIP_IN, NCHIP, CHIP_IN)
+    return blk.any(axis=(0, 2, 4))                                 # (4,4)
+
+
+@torch.no_grad()
+def classify_chip(stage2, vol, r, c, device):
+    """Stage2 prob>0.5 for the (r,c) 128x128x64 crop. vol: (1,64,512,512)."""
+    crop = vol[0, :, r * CHIP_IN:(r + 1) * CHIP_IN, c * CHIP_IN:(c + 1) * CHIP_IN]  # (64,128,128)
+    x = crop.unsqueeze(0).unsqueeze(0).to(device)                 # (1,1,64,128,128)
+    return float(stage2(x).reshape(-1)[0].item()) > 0.5
+
+
+def pstats(vals):
+    a = np.asarray(vals, float) if vals else np.array([0.0])
+    return dict(mean=float(a.mean()), p50=float(np.percentile(a, 50)),
+                p95=float(np.percentile(a, 95)), max=float(a.max()))
+
+
+def eval_gate(arm, gate, stage2, dataset, device):
+    n = len(dataset)
+    tgt_total = tgt_covered = 0
+    fp_present, fp_absent, prop_present, prop_absent = [], [], [], []
+    s2_hardneg_total = s2_hardneg_neg = 0     # Stage2 on flagged non-target chips
+    for i in range(n):
+        s = dataset[i]
+        label = int(s["label"])
+        vol = torch.as_tensor(s["volume"])                       # (1,64,512,512)
+        flags = gate_chip_flags(gate, vol, device)               # (4,4)
+        occ = target_chip_occ(s["mask_full"]) if label == 1 else np.zeros((NCHIP, NCHIP), bool)
+        n_prop = int(flags.sum())
+        (prop_present if label == 1 else prop_absent).append(n_prop)
+        fp = 0
+        # classify each proposal chip
+        s2pos = np.zeros((NCHIP, NCHIP), bool)
+        for r in range(NCHIP):
+            for c in range(NCHIP):
+                if not flags[r, c]:
+                    continue
+                pos = classify_chip(stage2, vol, r, c, device)
+                s2pos[r, c] = pos
+                if not occ[r, c]:                                 # gate hard-negative chip
+                    s2_hardneg_total += 1
+                    if not pos:
+                        s2_hardneg_neg += 1
+                    elif pos:
+                        fp += 1
+        if label == 1:
+            tt = int(occ.sum()); tgt_total += tt
+            tgt_covered += int((occ & flags & s2pos).sum())
+            fp_present.append(fp)
+        else:
+            fp_absent.append(fp)
+    return {
+        "arm": arm,
+        "system_recall": tgt_covered / max(tgt_total, 1),
+        "target_chips_total": tgt_total, "target_chips_covered": tgt_covered,
+        "fp_per_scene_absent": pstats(fp_absent),
+        "fp_per_scene_present": pstats(fp_present),
+        "gate_proposals_per_scene_absent": pstats(prop_absent),
+        "gate_proposals_per_scene_present": pstats(prop_present),
+        "stage2_specificity_on_gate_hardnegs": (
+            s2_hardneg_neg / max(s2_hardneg_total, 1)),
+        "gate_hardneg_chips_total": s2_hardneg_total,
+    }
+
+
+def main(argv=None):
+    """Run the evaluation; see the module docstring.
+
+    Args:
+        argv: Argument list (default: ``sys.argv[1:]``).
+
+    Returns:
+        Process exit code (0 on success).
+    """
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--dataset", default=DEFAULT_DATASET,
+                   help="dataset name under the data root, or an absolute path")
+    p.add_argument("--gate-ckpt", action="append", default=None,
+                   help="gate checkpoint as LABEL=PATH or PATH (repeatable); relative "
+                        "paths resolve under the checkpoints root. Default: "
+                        + ", ".join(DEFAULT_GATE_CKPTS))
+    p.add_argument("--classifier-ckpt", default=DEFAULT_CLASSIFIER_CKPT,
+                   help="classifier checkpoint; relative paths resolve under the checkpoints root")
+    p.add_argument("--out", required=True, help="output JSON path")
+    add_root_args(p, ("data", "ckpt"))
+    args = p.parse_args(argv)
+    data_dir = resolve_under("data", args.dataset, args.data_root_dir)
+    gate_ckpts = {k: resolve_under("ckpt", v, args.ckpt_root_dir)
+                  for k, v in _parse_gate_ckpts(args.gate_ckpt or DEFAULT_GATE_CKPTS).items()}
+    s2_ckpt = resolve_under("ckpt", args.classifier_ckpt, args.ckpt_root_dir)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device={device} host={socket.gethostname()}")
+    _, val_loader, datshape = seg_loaders(
+        data_root=str(data_dir), subset_size=SUBSET, batch_size=1, num_workers=0,
+        val_split=VSPLIT, val_split_seed=VSEED, output_resolution="low_res",
+        soft_target=False, low_res_pool=LOW_RES_POOL)
+    dataset = val_loader.dataset
+    print(f"val scenes={len(dataset)} datshape={datshape}")
+    stage2 = load_stage2(s2_ckpt, device)
+    results = {}
+    for arm, gpath in gate_ckpts.items():
+        print(f"--- {arm} ---", flush=True)
+        gate = load_gate(gpath, device)
+        r = eval_gate(arm, gate, stage2, dataset, device)
+        results[arm] = r
+        print(f"  {arm}: system_recall={r['system_recall']:.4f} "
+              f"FP/scene abs mean={r['fp_per_scene_absent']['mean']:.2f} p95={r['fp_per_scene_absent']['p95']:.1f} "
+              f"pres mean={r['fp_per_scene_present']['mean']:.2f} p95={r['fp_per_scene_present']['p95']:.1f} | "
+              f"gate prop/scene abs={r['gate_proposals_per_scene_absent']['mean']:.2f} "
+              f"S2spec@hardneg={r['stage2_specificity_on_gate_hardnegs']:.3f}")
+    payload = {"meta": {"threshold": THR, "chip_grid": f"{NCHIP}x{NCHIP}", "chip_px": CHIP_IN,
+                        "stage2_ckpt": str(s2_ckpt), "gate_ckpts": {k: str(v) for k, v in gate_ckpts.items()},
+                        "data_root": str(data_dir),
+                        "target_unit": "128px chip (cluster_chip_size=128)"},
+               "results": results}
+    outp = Path(args.out); outp.parent.mkdir(parents=True, exist_ok=True)
+    outp.write_text(json.dumps(payload, indent=2, default=str))
+    print(f"wrote {outp}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

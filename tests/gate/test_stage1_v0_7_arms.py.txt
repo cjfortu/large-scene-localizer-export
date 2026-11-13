@@ -1,0 +1,323 @@
+"""Shape + grad + head-fix bit-identity tests for the v0.7 Stage 1
+classes per ``documents/history/specs/stage1_v0_7_design.md`` §9 steps 5-6.
+
+Tested:
+
+* ``Stage1V07Arm2CnnMambaLowRes`` (head-fix + optional stride-2 stem):
+  - 128² input with ``stem_stride=1`` is BIT-IDENTICAL to the v0.6
+    ``Stage1V06Arm2CnnMambaLowRes`` when loaded with the same weights
+    (§3.3 validation rule). Output shape ``(B, 1, 32, 32, 32)``.
+  - 128² input with ``stem_stride=2`` produces ``(B, 1, 32, 32, 32)``,
+    finite output, finite gradients.
+  - 1024² input with ``stem_stride=1`` produces
+    ``(B, 1, 32, 256, 256)``, finite output, finite gradients. (Run
+    only when ``LOCALIZER_RUN_1024_TESTS=1`` because the activations
+    blow up dev-host VRAM.)
+  - 1024² input with ``stem_stride=2`` likewise. (Same gating.)
+
+* ``Stage1V07Arm4PureMambaLowRes`` (fusion variant + dt_init_std):
+  - ``fusion="sum"`` 128² produces ``(B, 1, 32, 32, 32)`` and trains
+    cleanly (finite forward + grads).
+  - ``fusion="concat_proj"`` 128² produces the same shape; the new
+    ``self.encoder.enc1.fusion`` ``nn.Linear`` is present and reached
+    by the backward pass.
+  - ``dt_init_std`` propagates to every Mamba sub-module's
+    ``dt_proj`` initialization (read-back from the ``A_log`` and
+    ``dt_proj.bias`` parameters' value distributions).
+
+* Factory dispatch via ``build_segmenter_v0_7``.
+
+All tests skip on CPU-only machines (Mamba requires CUDA).
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+import torch
+
+from localizer.gate.model import (
+    Stage1V06Arm2CnnMambaLowRes, Stage1V07Arm2CnnMambaLowRes,
+    Stage1V07Arm4PureMambaLowRes, _v07_low_res_target_shape,
+    build_segmenter_v0_7,
+)
+from localizer.gate.blocks import (
+    TokenMambaBlockConcatFusion, TokenMambaBlockV07,
+)
+
+
+CUDA_REQUIRED = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="v0.7 arms use Mamba which requires CUDA",
+)
+
+RUN_1024 = pytest.mark.skipif(
+    os.environ.get("LOCALIZER_RUN_1024_TESTS", "0") != "1",
+    reason="1024² tests gated behind LOCALIZER_RUN_1024_TESTS=1 (VRAM)",
+)
+
+
+def _finite_forward_backward(
+    model: torch.nn.Module,
+    input_shape: tuple,
+    expected_output_shape: tuple,
+) -> None:
+    model = model.cuda()
+    x = torch.randn(*input_shape, device="cuda")
+    y = model(x)
+    assert y.shape == expected_output_shape, (
+        f"expected {expected_output_shape}, got {tuple(y.shape)}"
+    )
+    assert torch.isfinite(y).all(), "non-finite forward output"
+    y.sum().backward()
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            assert p.grad is not None, f"missing grad for {name}"
+            assert torch.isfinite(p.grad).all(), (
+                f"non-finite grad for {name}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Target-shape helper.
+# ---------------------------------------------------------------------------
+
+
+def test_v07_low_res_target_shape_128():
+    assert _v07_low_res_target_shape((1, 1, 64, 128, 128)) == (32, 32, 32)
+
+
+def test_v07_low_res_target_shape_1024():
+    assert _v07_low_res_target_shape((1, 1, 64, 1024, 1024)) == (32, 256, 256)
+
+
+def test_v07_low_res_target_shape_rejects_wrong_ndim():
+    with pytest.raises(ValueError):
+        _v07_low_res_target_shape((1, 64, 128, 128))
+
+
+# ---------------------------------------------------------------------------
+# Arm 2 head-fix bit-identity (the §3.3 §11.3 validation rule).
+# ---------------------------------------------------------------------------
+
+
+@CUDA_REQUIRED
+def test_arm2_head_fix_128_bit_identity():
+    """v0.7 Arm 2 at 128² with stem_stride=1 must produce bit-identical
+    output to v0.6 Arm 2 when loaded with the same weights.
+
+    The two classes have identical encoders and identical head conv;
+    the only difference is that v0.7's head ``interpolate`` size is
+    computed from ``x.shape`` whereas v0.6's is hardcoded
+    ``(32, 32, 32)``. At a 128² input both must produce the same
+    ``(32, 32, 32)`` shape and (loaded with the same weights) the
+    same output values.
+    """
+    torch.manual_seed(0)
+    v06 = Stage1V06Arm2CnnMambaLowRes(nfeats=32).cuda()
+    v07 = Stage1V07Arm2CnnMambaLowRes(nfeats=32, stem_stride=1).cuda()
+    # Copy v0.6 -> v0.7. Same module names + parameter shapes for
+    # stem_stride=1, so a direct state_dict load is correct.
+    v07.load_state_dict(v06.state_dict(), strict=True)
+    v06.eval(); v07.eval()
+    x = torch.randn(1, 1, 64, 128, 128, device="cuda")
+    with torch.no_grad():
+        y06 = v06(x)
+        y07 = v07(x)
+    assert y06.shape == y07.shape == (1, 1, 32, 32, 32)
+    assert torch.equal(y06, y07), (
+        f"v0.7 head-fix should be bit-identical to v0.6 at 128²; "
+        f"max abs diff = {(y06 - y07).abs().max().item()}"
+    )
+
+
+@CUDA_REQUIRED
+def test_arm2_stem_stride2_128_shape():
+    """v0.7 Arm 2 with stem_stride=2 at 128² produces ``(B, 1, 32, 32, 32)``
+    output (same supervision shape as stem_stride=1)."""
+    _finite_forward_backward(
+        Stage1V07Arm2CnnMambaLowRes(nfeats=32, stem_stride=2),
+        input_shape=(1, 1, 64, 128, 128),
+        expected_output_shape=(1, 1, 32, 32, 32),
+    )
+
+
+@CUDA_REQUIRED
+@RUN_1024
+def test_arm2_stem_stride1_1024_shape():
+    """v0.7 Arm 2 with stem_stride=1 at 1024² produces ``(B, 1, 32, 256, 256)``."""
+    _finite_forward_backward(
+        Stage1V07Arm2CnnMambaLowRes(nfeats=32, stem_stride=1),
+        input_shape=(1, 1, 64, 1024, 1024),
+        expected_output_shape=(1, 1, 32, 256, 256),
+    )
+
+
+@CUDA_REQUIRED
+@RUN_1024
+def test_arm2_stem_stride2_1024_shape():
+    """v0.7 Arm 2 with stem_stride=2 at 1024² produces ``(B, 1, 32, 256, 256)``."""
+    _finite_forward_backward(
+        Stage1V07Arm2CnnMambaLowRes(nfeats=32, stem_stride=2),
+        input_shape=(1, 1, 64, 1024, 1024),
+        expected_output_shape=(1, 1, 32, 256, 256),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Arm 4 fusion-variant + dt_init_std plumbing.
+# ---------------------------------------------------------------------------
+
+
+@CUDA_REQUIRED
+def test_arm4_sum_fusion_128_shape():
+    """v0.7 Arm 4 with fusion="sum" produces ``(B, 1, 32, 32, 32)``."""
+    _finite_forward_backward(
+        Stage1V07Arm4PureMambaLowRes(fusion="sum"),
+        input_shape=(1, 1, 64, 128, 128),
+        expected_output_shape=(1, 1, 32, 32, 32),
+    )
+
+
+@CUDA_REQUIRED
+def test_arm4_concat_fusion_128_shape():
+    """v0.7 Arm 4 with fusion="concat_proj" produces the same shape AND
+    the fusion ``nn.Linear`` exists and receives gradient."""
+    model = Stage1V07Arm4PureMambaLowRes(fusion="concat_proj").cuda()
+    x = torch.randn(1, 1, 64, 128, 128, device="cuda")
+    y = model(x)
+    assert y.shape == (1, 1, 32, 32, 32)
+    y.sum().backward()
+    # Every TokenMambaBlockConcatFusion in the encoder must have a
+    # fusion.weight parameter that received gradient.
+    found = 0
+    for name, mod in model.named_modules():
+        if isinstance(mod, TokenMambaBlockConcatFusion):
+            found += 1
+            assert mod.fusion.weight.grad is not None, (
+                f"fusion linear at {name} did not receive grad"
+            )
+            assert torch.isfinite(mod.fusion.weight.grad).all()
+    assert found >= 4, (
+        f"expected >=4 TokenMambaBlockConcatFusion blocks; got {found}"
+    )
+
+
+@CUDA_REQUIRED
+def test_arm4_sum_uses_v07_token_block():
+    """Sum-fusion variant uses ``TokenMambaBlockV07``, not the
+    concat-fusion class."""
+    model = Stage1V07Arm4PureMambaLowRes(fusion="sum").cuda()
+    sum_blocks = sum(
+        1 for _, m in model.named_modules()
+        if isinstance(m, TokenMambaBlockV07)
+    )
+    concat_blocks = sum(
+        1 for _, m in model.named_modules()
+        if isinstance(m, TokenMambaBlockConcatFusion)
+    )
+    assert sum_blocks >= 4 and concat_blocks == 0
+
+
+@CUDA_REQUIRED
+def test_arm4_dt_init_std_propagation():
+    """The constructor ``dt_init_std`` argument is forwarded to every
+    Mamba sub-module. We verify by reading the ``dt_proj.weight``
+    distribution: Mamba initializes ``dt_proj.weight`` uniformly on
+    ``[-dt_init_std, dt_init_std]`` where ``dt_init_std = dt_rank**-0.5
+    * dt_scale``. With our ``dt_init_std=0.001`` target the weight
+    range collapses by ~100x relative to Mamba's default ``dt_scale=1.0``.
+
+    (Note: ``dt_proj.bias`` is set independently from ``dt_min``/
+    ``dt_max`` and does NOT scale with ``dt_init_std``; checking it
+    would not detect the propagation.)
+    """
+    torch.manual_seed(0)
+    default_model = Stage1V07Arm4PureMambaLowRes(
+        fusion="sum", dt_init_std=None,
+    )
+    torch.manual_seed(0)
+    tight_model = Stage1V07Arm4PureMambaLowRes(
+        fusion="sum", dt_init_std=0.001,
+    )
+
+    def _dt_weight_absmax(m):
+        weights = [p for n, p in m.named_parameters()
+                   if "dt_proj.weight" in n]
+        assert weights, "expected dt_proj.weight parameters in the model"
+        return max(w.detach().abs().max().item() for w in weights)
+
+    default_absmax = _dt_weight_absmax(default_model)
+    tight_absmax = _dt_weight_absmax(tight_model)
+    # The tight model's absolute max should be much smaller (target
+    # ratio ~100x; conservatively at least 10x for the test).
+    assert tight_absmax < default_absmax / 10, (
+        f"expected tight init dt_proj.weight |max| <= default/10; "
+        f"got tight={tight_absmax:.6g} default={default_absmax:.6g}"
+    )
+    # And the absolute value should be near the per-block target.
+    # For Arm 4's first block (embed_dim=64, dt_rank=4),
+    # dt_init_std=0.001 => weights bounded by 0.001. Check at least the
+    # smallest block satisfies this.
+    smallest_block_weight = None
+    for n, p in tight_model.named_parameters():
+        if "enc1" in n and "dt_proj.weight" in n:
+            smallest_block_weight = p.detach().abs().max().item()
+            break
+    assert smallest_block_weight is not None, "enc1 dt_proj.weight not found"
+    # Spec target is 0.001 at d_model=64. Allow generous slack for the
+    # math.sqrt(dt_rank=4)=2 conversion and floating-point round-trip.
+    assert smallest_block_weight < 0.002, (
+        f"enc1 dt_proj.weight |max| should be ~0.001 with dt_init_std=0.001; "
+        f"got {smallest_block_weight:.6g}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Factory dispatch.
+# ---------------------------------------------------------------------------
+
+
+@CUDA_REQUIRED
+def test_factory_arm2_default():
+    """``build_segmenter_v0_7(arm=2)`` returns Arm 2 with stem_stride=1."""
+    m = build_segmenter_v0_7(arm=2)
+    assert isinstance(m, Stage1V07Arm2CnnMambaLowRes)
+    assert m.stem_stride == 1
+
+
+@CUDA_REQUIRED
+def test_factory_arm2_stem_stride_2():
+    m = build_segmenter_v0_7(arm=2, stem_stride=2)
+    assert isinstance(m, Stage1V07Arm2CnnMambaLowRes)
+    assert m.stem_stride == 2
+
+
+@CUDA_REQUIRED
+def test_factory_arm4_sum_default():
+    m = build_segmenter_v0_7(arm=4)
+    assert isinstance(m, Stage1V07Arm4PureMambaLowRes)
+    assert m.fusion == "sum"
+
+
+@CUDA_REQUIRED
+def test_factory_arm4_concat():
+    m = build_segmenter_v0_7(arm=4, fusion="concat_proj")
+    assert isinstance(m, Stage1V07Arm4PureMambaLowRes)
+    assert m.fusion == "concat_proj"
+
+
+def test_factory_rejects_bad_arm():
+    with pytest.raises(ValueError, match="v0.7 arm must be 2 or 4"):
+        build_segmenter_v0_7(arm=1)
+
+
+def test_factory_rejects_bad_fusion():
+    with pytest.raises(ValueError, match="fusion must be one of"):
+        build_segmenter_v0_7(arm=4, fusion="add")
+
+
+def test_factory_rejects_bad_stem_stride():
+    with pytest.raises(ValueError, match="stem_stride must be one of"):
+        build_segmenter_v0_7(arm=2, stem_stride=4)

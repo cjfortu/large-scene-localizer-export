@@ -1,0 +1,10 @@
+"""Generate a synthetic swarm dataset from a YAML config, e.g. configs/data/multi_target_swarm_512_v2.yaml.
+
+Thin wrapper around ``localizer.synth.swarm.main``; same as the console command ``lsl-generate``.
+Run with ``--help`` for the arguments.
+"""
+
+from localizer.synth.swarm import main
+
+if __name__ == "__main__":
+    main()

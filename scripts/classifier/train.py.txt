@@ -1,0 +1,10 @@
+"""Train the classifier (Stage 2) from a YAML config, e.g. configs/classifier/baseline_30k.yaml.
+
+Thin wrapper around ``localizer.classifier.train.main``; same as the console command ``lsl-train-classifier``.
+Run with ``--help`` for the arguments.
+"""
+
+from localizer.classifier.train import main
+
+if __name__ == "__main__":
+    main()

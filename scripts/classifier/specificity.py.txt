@@ -1,0 +1,111 @@
+"""Tier-1 Stage-2 standalone specificity/sensitivity (inference-only).
+
+Recomputes the Stage-2 binary classifier's per-class confusion on its OWN
+validation set (the figures cited in the gate-viability results, section
+2(d) of the originating results record). No
+confusion matrix was ever persisted by the classifier trainer (only `val_acc`
+was logged), so specificity = TN/(TN+FP) and sensitivity = TP/(TP+FN) are
+recovered here by a forward pass over the exact val split. No training, no
+backward, no checkpoint/code mutation.
+
+Self-verifying: the recomputed accuracy must reproduce the trainer's logged best
+`val_acc` (0.9973), confirming the val set is reconstructed correctly.
+
+Sources:
+  - checkpoint: classifier_baseline_30k_ep64.safetensors under the checkpoints root
+    (attn_type='full', head_type='flatten', sigmoid output; val_acc 0.9973 @ep64)
+  - data: swarm_128x128x64 under the data root (the 30k swarm 128x128x64 set the
+    baseline config trained on), stratified 90/10 split, val_split_seed=91 (the
+    classifier dataset's fixed convention) -> reproduces the exact val membership.
+
+Expected (handoff §2(d)): N=3000 (1500 present / 1500 absent),
+TP=1494 TN=1498 FP=2 FN=6, specificity=0.9987, sensitivity=0.9960, acc=0.9973.
+
+Any CUDA host (the classifier is a plain 3D-CNN + attention, no Mamba kernel;
+CPU works but is slow).
+
+  python scripts/classifier/specificity.py            # uses $LSL_DATA_ROOT, $LSL_CKPT_ROOT
+  python scripts/classifier/specificity.py --dataset swarm_128x128x64 \
+      --checkpoint classifier_baseline_30k_ep64.safetensors
+"""
+
+from __future__ import annotations
+
+import argparse
+import socket
+import sys
+from pathlib import Path
+
+import torch
+
+
+
+from localizer.classifier.model import Mover3DCNNTrans
+from localizer.classifier.data import make_dataloaders
+from localizer.common.checkpoint_io import load_weights
+from localizer.common.paths import add_root_args, resolve_under
+
+DEFAULT_CK = "classifier_baseline_30k_ep64.safetensors"   # under the checkpoints root
+DEFAULT_DATA = "swarm_128x128x64"                 # under the data root
+VAL_SPLIT, VAL_SPLIT_SEED = 0.1, 91      # the classifier dataset's fixed convention
+THR = 0.5
+EXPECTED = dict(N=3000, TP=1494, TN=1498, FP=2, FN=6)   # handoff §2(d)
+
+
+def main() -> int:
+    """Recompute the classifier's val-set confusion; return 0 if it matches EXPECTED."""
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--dataset", default=DEFAULT_DATA,
+                   help="dataset name under the data root, or an absolute path")
+    p.add_argument("--checkpoint", default=DEFAULT_CK,
+                   help="checkpoint name under the checkpoints root, or an absolute path")
+    p.add_argument("--batch_size", type=int, default=32)
+    add_root_args(p, ("data", "ckpt"))
+    args = p.parse_args()
+    args.data_root = str(resolve_under("data", args.dataset, args.data_root_dir))
+    args.checkpoint = str(resolve_under("ckpt", args.checkpoint, args.ckpt_root_dir))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device={device} host={socket.gethostname()}")
+
+    model = Mover3DCNNTrans(
+        t_dim=64, dropout_rate=0.5, attn_dropout=0.1, max_attn_len=2200,
+        head_type="flatten", return_logits=False, attn_type="full",
+    ).to(device)
+    load_weights(model, args.checkpoint, map_location=device, strict=True)
+    model.eval()
+
+    _, val_loader, n = make_dataloaders(
+        data_root=args.data_root, batch_size=args.batch_size, num_workers=8,
+        val_split=VAL_SPLIT, val_split_seed=VAL_SPLIT_SEED,
+    )
+    print(f"total samples={n}  val batches={len(val_loader)}")
+
+    TP = TN = FP = FN = 0
+    with torch.no_grad():
+        for vid, lab in val_loader:
+            vid = vid.to(device); lab = lab.to(device)
+            pred = (model(vid).squeeze(-1) > THR).float()
+            TP += int(((pred == 1) & (lab == 1)).sum())
+            TN += int(((pred == 0) & (lab == 0)).sum())
+            FP += int(((pred == 1) & (lab == 0)).sum())
+            FN += int(((pred == 0) & (lab == 1)).sum())
+
+    N = TP + TN + FP + FN
+    spec = TN / (TN + FP) if (TN + FP) else float("nan")
+    sens = TP / (TP + FN) if (TP + FN) else float("nan")
+    acc = (TP + TN) / N if N else float("nan")
+    print(f"val N={N}  present(1)={TP + FN}  absent(0)={TN + FP}")
+    print(f"TP={TP} TN={TN} FP={FP} FN={FN}")
+    print(f"specificity TN/(TN+FP) = {spec:.4f}")
+    print(f"sensitivity TP/(TP+FN) = {sens:.4f}")
+    print(f"accuracy = {acc:.4f}  (self-verify: trainer logged best val_acc=0.9973)")
+
+    match = all([N == EXPECTED["N"], TP == EXPECTED["TP"], TN == EXPECTED["TN"],
+                 FP == EXPECTED["FP"], FN == EXPECTED["FN"]])
+    print(f"MATCHES handoff §2(d) counts: {match}")
+    return 0 if match else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

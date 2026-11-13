@@ -1,0 +1,128 @@
+"""Import-layering check for the ``localizer`` package.
+
+Parses every module under ``src/localizer`` (including function-level and
+``try``/``if``-nested imports) and asserts that the cross-package edges among
+the six subpackages are exactly::
+
+    pipeline -> {gate, classifier, common}
+    gate -> common
+    classifier -> common
+    segmenter -> common
+    synth: no edges in or out
+    common: no outgoing edges
+
+and that no package ``__init__.py`` imports anything (no eager imports).
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+import pytest
+
+SRC = Path(__file__).resolve().parents[1] / "src" / "localizer"
+PACKAGES = ("common", "gate", "classifier", "segmenter", "synth", "pipeline")
+EXPECTED_EDGES = {
+    ("pipeline", "gate"), ("pipeline", "classifier"), ("pipeline", "common"),
+    ("gate", "common"), ("classifier", "common"), ("segmenter", "common"),
+}
+
+
+def _module_name(path: Path) -> str:
+    """Dotted module name of a file under ``src/``."""
+    rel = path.relative_to(SRC.parent).with_suffix("")
+    parts = list(rel.parts)
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _imported_modules(path: Path) -> set[str]:
+    """All absolute module names imported anywhere in ``path`` (relative imports resolved)."""
+    tree = ast.parse(path.read_text(), filename=str(path))
+    mod = _module_name(path)
+    pkg = mod if path.name == "__init__.py" else mod.rpartition(".")[0]
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            out.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = pkg.split(".")[: len(pkg.split(".")) - (node.level - 1)]
+                name = ".".join(base + ([node.module] if node.module else []))
+            else:
+                name = node.module or ""
+            out.add(name)
+            out.update(f"{name}.{a.name}" for a in node.names)
+    return out
+
+
+def _package_of(module: str) -> str | None:
+    """Return the localizer subpackage a module belongs to, or None."""
+    parts = module.split(".")
+    if len(parts) >= 2 and parts[0] == "localizer" and parts[1] in PACKAGES:
+        return parts[1]
+    return None
+
+
+def _edges() -> set[tuple[str, str]]:
+    """Cross-subpackage import edges found in the source tree."""
+    edges = set()
+    for path in SRC.rglob("*.py"):
+        src_pkg = _package_of(_module_name(path))
+        if src_pkg is None:
+            continue
+        for imported in _imported_modules(path):
+            dst = _package_of(imported)
+            if dst is not None and dst != src_pkg:
+                edges.add((src_pkg, dst))
+    return edges
+
+
+def test_all_packages_present() -> None:
+    """Every expected subpackage exists with an ``__init__.py``."""
+    for pkg in PACKAGES:
+        assert (SRC / pkg / "__init__.py").is_file(), pkg
+
+
+def test_cross_package_edges_are_exactly_the_allowed_set() -> None:
+    """The cross-package import graph equals the documented layering."""
+    edges = _edges()
+    assert edges == EXPECTED_EDGES, (
+        f"unexpected: {sorted(edges - EXPECTED_EDGES)}; missing: {sorted(EXPECTED_EDGES - edges)}"
+    )
+
+
+def test_synth_and_common_have_no_outgoing_edges() -> None:
+    """``synth`` and ``common`` import no other localizer subpackage."""
+    out = {dst for src, dst in _edges() if src in ("synth", "common")}
+    assert not out
+
+
+def test_graph_is_acyclic() -> None:
+    """No import cycle among the subpackages."""
+    graph: dict[str, set[str]] = {p: set() for p in PACKAGES}
+    for a, b in _edges():
+        graph[a].add(b)
+    state: dict[str, int] = {}
+
+    def visit(n: str) -> None:
+        state[n] = 1
+        for m in graph[n]:
+            assert state.get(m) != 1, f"cycle through {n} -> {m}"
+            if m not in state:
+                visit(m)
+        state[n] = 2
+
+    for p in PACKAGES:
+        if p not in state:
+            visit(p)
+
+
+@pytest.mark.parametrize("init", sorted(str(p.relative_to(SRC)) for p in SRC.rglob("__init__.py")))
+def test_init_files_have_no_imports(init: str) -> None:
+    """Package ``__init__.py`` files carry no imports (nothing is loaded eagerly)."""
+    tree = ast.parse((SRC / init).read_text())
+    imports = [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]
+    assert not imports, f"{init} imports {[ast.unparse(n) for n in imports]}"

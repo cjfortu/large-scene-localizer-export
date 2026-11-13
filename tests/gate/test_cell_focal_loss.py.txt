@@ -1,0 +1,127 @@
+"""Unit tests for ``localizer.gate.losses.CellFocalLoss``.
+
+Covers the cell aggregation (shape, the any-voxel truth rule, the maxpool
+eval alignment), the focal term against a hand computation, the auxiliary
+per-voxel BCE, the optional Tversky term, argument validation and gradient
+flow. All tests are CPU-only and use small tensors.
+"""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from localizer.gate.losses import CellFocalLoss
+
+
+def _field(b: int = 2, t: int = 4, h: int = 8, w: int = 8, seed: int = 0) -> torch.Tensor:
+    """Return a random ``(b, 1, t, h, w)`` logit field."""
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(b, 1, t, h, w, generator=g)
+
+
+def test_cell_aggregate_shape_and_values() -> None:
+    """amax aggregation gives (B, 1, H/cs, W/cs) holding each block's max over T and space."""
+    loss = CellFocalLoss(cell_size=4)
+    x = _field(t=3, h=8, w=12)
+    agg = loss._cell_aggregate(x, "amax")
+    assert agg.shape == (2, 1, 2, 3)
+    want = x[:, :, :, 4:8, 8:12].amax(dim=(2, 3, 4))
+    assert torch.equal(agg[:, :, 1, 2], want)
+    lse = loss._cell_aggregate(x, "logsumexp")
+    assert lse.shape == (2, 1, 2, 3)
+    assert torch.allclose(lse[:, :, 0, 0], torch.logsumexp(x[:, :, :, 0:4, 0:4].reshape(2, 1, -1), dim=-1))
+
+
+def test_cell_label_is_any_voxel_rule() -> None:
+    """A single positive voxel anywhere in a block (any frame) makes that cell positive."""
+    loss = CellFocalLoss(cell_size=4)
+    mask = torch.zeros(1, 1, 5, 8, 8)
+    mask[0, 0, 3, 6, 1] = 1.0  # frame 3, row 6 -> cell row 1; col 1 -> cell col 0
+    labels = loss._cell_aggregate(mask, "amax") > 0.5
+    assert labels.sum().item() == 1
+    assert bool(labels[0, 0, 1, 0])
+
+
+def test_maxpool_is_eval_aligned() -> None:
+    """With maxpool, cell logit > 0 iff some voxel has sigmoid > 0.5 (the eval rule)."""
+    loss = CellFocalLoss(cell_size=4)
+    x = _field(seed=3) - 1.5
+    cell = loss._cell_aggregate(x, "amax")
+    voxel_rule = (torch.sigmoid(x) > 0.5).reshape(2, 1, 4, 2, 4, 2, 4).permute(0, 1, 3, 5, 2, 4, 6)
+    voxel_rule = voxel_rule.reshape(2, 1, 2, 2, -1).any(dim=-1)
+    assert torch.equal(cell > 0, voxel_rule)
+
+
+def test_focal_term_matches_hand_computation() -> None:
+    """With aux_weight 0 the loss equals the alpha-weighted focal BCE on cell max-logits."""
+    gamma, alpha = 2.0, 0.6
+    loss = CellFocalLoss(cell_size=4, gamma=gamma, alpha=alpha, aux_weight=0.0)
+    logits = _field(seed=1)
+    mask = torch.zeros_like(logits)
+    mask[0, 0, 0, 0, 0] = 1.0
+    mask[1, 0, 2, 5, 7] = 1.0
+    cell_logit = loss._cell_aggregate(logits, "amax").squeeze(1)
+    cell_label = (loss._cell_aggregate(mask, "amax") > 0.5).float().squeeze(1)
+    bce = F.binary_cross_entropy_with_logits(cell_logit, cell_label, reduction="none")
+    p_t = torch.exp(-bce)
+    a_t = alpha * cell_label + (1 - alpha) * (1 - cell_label)
+    want = (a_t * (1 - p_t) ** gamma * bce).mean()
+    assert torch.allclose(loss(logits, mask), want, atol=1e-6)
+
+
+def test_alpha_default_and_aux_term() -> None:
+    """alpha=None defaults to 0.75; aux term adds aux_weight * per-voxel BCE (with pos_weight)."""
+    assert CellFocalLoss().alpha == 0.75
+    logits = _field(seed=2)
+    mask = (torch.rand(logits.shape, generator=torch.Generator().manual_seed(4)) > 0.97).float()
+    pw = torch.tensor([7.0])
+    base = CellFocalLoss(cell_size=4, aux_weight=0.0)(logits, mask)
+    full = CellFocalLoss(cell_size=4, aux_weight=0.5, pos_weight=pw)(logits, mask)
+    aux = F.binary_cross_entropy_with_logits(logits, mask, pos_weight=pw)
+    assert torch.allclose(full, base + 0.5 * aux, atol=1e-6)
+
+
+def test_tversky_term_off_by_default_and_positive_when_on() -> None:
+    """Tversky weight 0 adds nothing; a positive weight adds a non-negative amount."""
+    logits = _field(seed=5)
+    mask = torch.zeros_like(logits)
+    mask[:, :, :, 0:2, 0:2] = 1.0
+    off = CellFocalLoss(cell_size=4)(logits, mask)
+    on = CellFocalLoss(cell_size=4, tversky_weight=1.0)(logits, mask)
+    assert on.item() >= off.item() - 1e-7
+
+
+def test_perfect_prediction_has_small_focal_loss() -> None:
+    """Confident correct cell logits give a near-zero focal term."""
+    loss = CellFocalLoss(cell_size=4, aux_weight=0.0)
+    mask = torch.zeros(1, 1, 2, 8, 8)
+    mask[0, 0, 1, 1, 1] = 1.0
+    logits = torch.full_like(mask, -20.0)
+    logits[0, 0, 1, 1, 1] = 20.0
+    assert loss(logits, mask).item() < 1e-6
+
+
+def test_validation_errors() -> None:
+    """Unknown aggregation and non-divisible spatial dims raise ValueError."""
+    with pytest.raises(ValueError):
+        CellFocalLoss(aggregation="mean")
+    with pytest.raises(ValueError):
+        CellFocalLoss(cell_size=3)(_field(h=8, w=8), torch.zeros(2, 1, 4, 8, 8))
+
+
+@pytest.mark.parametrize("aggregation", ["maxpool", "logsumexp"])
+def test_gradients_flow(aggregation: str) -> None:
+    """Backward produces finite, non-zero gradients on the logits."""
+    logits = _field(seed=6).requires_grad_(True)
+    mask = torch.zeros_like(logits)
+    mask[0, 0, 1, 2, 3] = 1.0
+    out = CellFocalLoss(cell_size=4, aggregation=aggregation, tversky_weight=0.5)(logits, mask)
+    assert math.isfinite(out.item())
+    out.backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad.abs().sum().item() > 0

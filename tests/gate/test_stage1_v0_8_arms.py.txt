@@ -1,0 +1,535 @@
+"""Shape + bit-identity + functional tests for v0.8 Stage 1 classes
+and the new v0.8 dataset / trainer plumbing per design §9 steps 3-10.
+
+Covered:
+
+* ``Stage1V08Arm2CnnMambaLowRes`` at gradient_checkpoint=False is
+  bit-identical to ``Stage1V07Arm2CnnMambaLowRes(stem_stride=1)`` at
+  128² input when loaded with the same weights (§3.3 validation).
+* ``Stage1V08Arm4PureMambaLowRes`` at gradient_checkpoint=False
+  produces ``(B, 1, 32, 32, 32)`` at 128² input (resolution-invariant
+  head, bit-shape equivalent to v0.7 Arm 4 at 128²).
+* ``build_segmenter_v0_8`` factory dispatch + invalid-arm rejection.
+* Gaussian kernel: peak-1 (NOT mass-preserving) per §3.2; sum ≈ 15.7
+  for σ=1.0; overlap-clip behavior preserves [0, 1] range.
+* ``MoverDataset`` with ``soft_target=False`` is bit-identical to
+  v0.6/v0.7 except for the new ``mask_hard`` key being present.
+* ``MoverDataset`` with ``soft_target=True`` produces a soft mask
+  in [0, 1] and a hard mask_hard in {0, 1}.
+* ``_criterion_value`` and ``_is_new_best`` for ``best_dice_product``.
+* The new v0.8 early-stop helpers (catastrophic, relative-plateau,
+  overfit) on synthetic per-epoch series.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+from localizer.gate.model import (
+    Stage1V07Arm2CnnMambaLowRes, Stage1V07Arm4PureMambaLowRes,
+    Stage1V08Arm2CnnMambaLowRes, Stage1V08Arm4PureMambaLowRes,
+    build_segmenter_v0_8,
+)
+from localizer.gate.train import (
+    Stage1SegTrainConfig,
+    _criterion_initial_value, _criterion_value, _is_new_best,
+    _check_v08_catastrophic_dice_product,
+    _check_v08_relative_plateau,
+    _check_v08_overfit,
+    _median5,
+)
+from localizer.common.data import (
+    MoverDataset,
+    _GAUSSIAN_KERNEL, _GAUSSIAN_KERNEL_SIZE, _GAUSSIAN_SIGMA,
+    _make_gaussian_kernel_3d,
+)
+
+
+CUDA_REQUIRED = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="v0.8 arms use Mamba which requires CUDA",
+)
+
+
+# ---------------------------------------------------------------------------
+# Gaussian kernel correctness (§3.2).
+# ---------------------------------------------------------------------------
+
+
+def test_gaussian_kernel_peak_is_one():
+    """The CenterNet-style kernel must have center value 1.0, NOT sum 1.0."""
+    k = _make_gaussian_kernel_3d(size=7, sigma=1.0)
+    assert k.shape == (1, 1, 7, 7, 7)
+    center = k[0, 0, 3, 3, 3].item()
+    assert abs(center - 1.0) < 1e-6, (
+        f"kernel center should be 1.0; got {center}"
+    )
+
+
+def test_gaussian_kernel_sum_is_not_one():
+    """Spec §3.2 — sum ≈ 15.7 for σ=1.0; mass-preserving would be wrong."""
+    k = _make_gaussian_kernel_3d(size=7, sigma=1.0)
+    s = float(k.sum())
+    # (2π σ²)^(3/2) for σ=1: ≈ 15.75. Truncation at 3σ knocks ~0.27%
+    # off; 15.5-15.75 is the expected range.
+    assert 15.0 < s < 16.0, f"expected ~15.7; got {s}"
+
+
+def test_gaussian_kernel_symmetric():
+    """Spatially symmetric: flipping any axis is the identity."""
+    k = _make_gaussian_kernel_3d(size=7, sigma=1.0)
+    assert torch.allclose(k, k.flip(2))
+    assert torch.allclose(k, k.flip(3))
+    assert torch.allclose(k, k.flip(4))
+
+
+def test_gaussian_kernel_module_constants():
+    """Module-level constants match spec defaults."""
+    assert _GAUSSIAN_SIGMA == 1.0
+    assert _GAUSSIAN_KERNEL_SIZE == 7
+    assert _GAUSSIAN_KERNEL.shape == (1, 1, 7, 7, 7)
+
+
+def test_gaussian_conv_isolated_target_peaks_at_one():
+    """Conv of a single hard-target voxel with peak-1 kernel produces a
+    soft target whose peak is 1.0 at the target's location."""
+    import torch.nn.functional as F
+    mask = torch.zeros(1, 1, 16, 16, 16)
+    mask[0, 0, 8, 8, 8] = 1.0
+    soft = F.conv3d(mask, _GAUSSIAN_KERNEL, padding=3)
+    assert abs(soft[0, 0, 8, 8, 8].item() - 1.0) < 1e-5
+    # After overlap-clip — no clipping applies on this isolated case.
+    soft_clipped = soft.clamp(0.0, 1.0)
+    assert torch.equal(soft, soft_clipped)
+
+
+def test_gaussian_conv_overlap_clips_to_one():
+    """Two adjacent hard-target voxels produce overlap >1 in soft target;
+    clip-to-[0,1] flattens the peak."""
+    import torch.nn.functional as F
+    mask = torch.zeros(1, 1, 16, 16, 16)
+    mask[0, 0, 8, 8, 8] = 1.0
+    mask[0, 0, 8, 8, 9] = 1.0
+    soft = F.conv3d(mask, _GAUSSIAN_KERNEL, padding=3)
+    # Pre-clip peak between the two targets is > 1.0.
+    peak_pre = soft.max().item()
+    assert peak_pre > 1.0, f"expected overlap > 1.0; got {peak_pre}"
+    # Post-clip peak is exactly 1.0.
+    soft_clipped = soft.clamp(0.0, 1.0)
+    assert abs(soft_clipped.max().item() - 1.0) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# MoverDataset soft_target plumbing (§3.2).
+# ---------------------------------------------------------------------------
+
+
+def _make_tiny_dataset(tmp_path: Path, n: int = 2):
+    """Create a tiny on-disk dataset for MoverDataset tests."""
+    data_dir = tmp_path / "data_all"
+    label_dir = tmp_path / "label_msk"
+    data_dir.mkdir()
+    label_dir.mkdir()
+    file_names = []
+    for i in range(n):
+        # Half present (label=1), half absent (label=0).
+        label = 1 if i % 2 == 0 else 0
+        fname = f"vid{i}_{label}.npy"
+        # Volume: random uint8.
+        vol = np.random.randint(0, 256, size=(64, 128, 128), dtype=np.uint8)
+        np.save(data_dir / fname, vol)
+        # Mask: a few positive voxels for present, all zero for absent.
+        msk = np.zeros((64, 128, 128), dtype=np.uint8)
+        if label == 1:
+            msk[10:14, 60:64, 60:64] = 255
+        np.save(label_dir / fname.replace(".npy", "_mask.npy"), msk)
+        file_names.append(fname)
+    return data_dir, label_dir, file_names
+
+
+def test_mover_dataset_low_res_hard_target_default():
+    """soft_target=False (default) — mask is hard low-res; mask_hard
+    is byte-identical to mask."""
+    with tempfile.TemporaryDirectory() as td:
+        data_dir, label_dir, files = _make_tiny_dataset(Path(td))
+        ds = MoverDataset(
+            data_dir, label_dir, files,
+            output_resolution="low_res", soft_target=False,
+        )
+        sample = ds[0]
+        assert "mask_hard" in sample
+        assert sample["mask"].shape == (1, 32, 32, 32)
+        assert sample["mask_hard"].shape == (1, 32, 32, 32)
+        # All values in {0, 1} for hard target (after /255).
+        unique_vals = np.unique(sample["mask"])
+        assert set(unique_vals.tolist()).issubset({0.0, 1.0})
+        # mask == mask_hard.
+        np.testing.assert_array_equal(sample["mask"], sample["mask_hard"])
+
+
+def test_mover_dataset_low_res_soft_target():
+    """soft_target=True — mask is Gaussian-convolved; mask_hard is hard."""
+    with tempfile.TemporaryDirectory() as td:
+        data_dir, label_dir, files = _make_tiny_dataset(Path(td))
+        ds = MoverDataset(
+            data_dir, label_dir, files,
+            output_resolution="low_res", soft_target=True,
+        )
+        sample = ds[0]   # present sample
+        assert sample["mask"].shape == (1, 32, 32, 32)
+        assert sample["mask_hard"].shape == (1, 32, 32, 32)
+        # mask_hard still in {0, 1}.
+        unique_hard = np.unique(sample["mask_hard"])
+        assert set(unique_hard.tolist()).issubset({0.0, 1.0})
+        # mask in [0, 1] with at least one peak at 1.0 (the target cell).
+        assert sample["mask"].min() >= 0.0
+        assert sample["mask"].max() <= 1.0
+        # For the present sample at least one cell should be > 0.
+        assert sample["mask"].max() > 0.0
+
+
+def test_mover_dataset_full_resolution_unchanged():
+    """In full mode, the v0.8 changes don't affect output (no mask_hard,
+    mask is the full-resolution mask)."""
+    with tempfile.TemporaryDirectory() as td:
+        data_dir, label_dir, files = _make_tiny_dataset(Path(td))
+        ds = MoverDataset(
+            data_dir, label_dir, files,
+            output_resolution="full", soft_target=False,
+        )
+        sample = ds[0]
+        assert "mask_hard" not in sample
+        assert sample["mask"].shape == (1, 64, 128, 128)
+
+
+def test_mover_dataset_soft_target_with_full_resolution_rejected():
+    """soft_target=True requires output_resolution='low_res'."""
+    with pytest.raises(ValueError, match="soft_target=True requires"):
+        MoverDataset(
+            "x", "y", [],
+            output_resolution="full", soft_target=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Model-class shape / bit-identity tests.
+# ---------------------------------------------------------------------------
+
+
+@CUDA_REQUIRED
+def test_v08_arm2_grad_ckpt_off_matches_v07_at_128():
+    """v0.8 Arm 2 at gradient_checkpoint=False, 128² input, must be
+    bit-identical to v0.7 Arm 2 at stem_stride=1 when loaded with
+    the same weights."""
+    torch.manual_seed(0)
+    v07 = Stage1V07Arm2CnnMambaLowRes(nfeats=32, stem_stride=1).cuda()
+    v08 = Stage1V08Arm2CnnMambaLowRes(
+        nfeats=32, gradient_checkpoint=False,
+    ).cuda()
+    v08.load_state_dict(v07.state_dict(), strict=True)
+    v07.eval(); v08.eval()
+    x = torch.randn(1, 1, 64, 128, 128, device="cuda")
+    with torch.no_grad():
+        y07 = v07(x)
+        y08 = v08(x)
+    assert y07.shape == y08.shape == (1, 1, 32, 32, 32)
+    assert torch.equal(y07, y08), (
+        f"v0.8 Arm 2 should match v0.7 at grad_ckpt=False, 128²; "
+        f"max abs diff = {(y07 - y08).abs().max().item()}"
+    )
+
+
+@CUDA_REQUIRED
+def test_v08_arm2_grad_ckpt_on_shape_128():
+    """v0.8 Arm 2 with grad_ckpt=True at 128² still produces
+    ``(B, 1, 32, 32, 32)`` and trains cleanly."""
+    model = Stage1V08Arm2CnnMambaLowRes(
+        nfeats=32, gradient_checkpoint=True,
+    ).cuda()
+    model.train()  # grad_ckpt path is gated on .training
+    x = torch.randn(1, 1, 64, 128, 128, device="cuda")
+    y = model(x)
+    assert y.shape == (1, 1, 32, 32, 32)
+    assert torch.isfinite(y).all()
+    y.sum().backward()
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            assert p.grad is not None, f"missing grad for {name}"
+            assert torch.isfinite(p.grad).all(), (
+                f"non-finite grad for {name}"
+            )
+
+
+@CUDA_REQUIRED
+def test_v08_arm4_head_resolution_invariant_128_bit_identity():
+    """v0.8 Arm 4 at 128² input, gradient_checkpoint=False, produces
+    bit-identical output to v0.7 Arm 4 when loaded with the same weights
+    (the head's hardcoded (32, 32, 32) target shape coincides with the
+    resolution-invariant value at 128²)."""
+    torch.manual_seed(0)
+    v07 = Stage1V07Arm4PureMambaLowRes(fusion="sum", dt_init_std=None).cuda()
+    v08 = Stage1V08Arm4PureMambaLowRes(
+        fusion="sum", dt_init_std=None, gradient_checkpoint=False,
+    ).cuda()
+    v08.load_state_dict(v07.state_dict(), strict=True)
+    v07.eval(); v08.eval()
+    x = torch.randn(1, 1, 64, 128, 128, device="cuda")
+    with torch.no_grad():
+        y07 = v07(x)
+        y08 = v08(x)
+    assert y07.shape == y08.shape == (1, 1, 32, 32, 32)
+    assert torch.equal(y07, y08), (
+        f"v0.8 Arm 4 should match v0.7 at grad_ckpt=False, 128²; "
+        f"max abs diff = {(y07 - y08).abs().max().item()}"
+    )
+
+
+@CUDA_REQUIRED
+def test_v08_arm4_grad_ckpt_on_shape_128():
+    """v0.8 Arm 4 with grad_ckpt=True at 128² still produces
+    ``(B, 1, 32, 32, 32)`` and trains cleanly."""
+    model = Stage1V08Arm4PureMambaLowRes(
+        fusion="concat_proj", dt_init_std=0.001,
+        gradient_checkpoint=True,
+    ).cuda()
+    model.train()
+    x = torch.randn(1, 1, 64, 128, 128, device="cuda")
+    y = model(x)
+    assert y.shape == (1, 1, 32, 32, 32)
+    assert torch.isfinite(y).all()
+    y.sum().backward()
+    # At minimum a parameter inside an encoder block must have grad.
+    enc_grad_any = any(
+        p.grad is not None and torch.isfinite(p.grad).all()
+        for n, p in model.named_parameters()
+        if "encoder" in n
+    )
+    assert enc_grad_any
+
+
+# ---------------------------------------------------------------------------
+# Factory.
+# ---------------------------------------------------------------------------
+
+
+@CUDA_REQUIRED
+def test_v08_factory_arm2():
+    m = build_segmenter_v0_8(arm=2, gradient_checkpoint=True)
+    assert isinstance(m, Stage1V08Arm2CnnMambaLowRes)
+    assert m.gradient_checkpoint is True
+
+
+@CUDA_REQUIRED
+def test_v08_factory_arm4_sum():
+    m = build_segmenter_v0_8(arm=4, fusion="sum", dt_init_std=0.001)
+    assert isinstance(m, Stage1V08Arm4PureMambaLowRes)
+    assert m.fusion == "sum"
+
+
+@CUDA_REQUIRED
+def test_v08_factory_arm4_concat_grad_ckpt():
+    m = build_segmenter_v0_8(
+        arm=4, fusion="concat_proj", dt_init_std=0.001,
+        gradient_checkpoint=True,
+    )
+    assert isinstance(m, Stage1V08Arm4PureMambaLowRes)
+    assert m.fusion == "concat_proj"
+    assert m.gradient_checkpoint is True
+
+
+def test_v08_factory_rejects_bad_arm():
+    with pytest.raises(ValueError, match="v0.8 arm must be 2 or 4"):
+        build_segmenter_v0_8(arm=1)
+
+
+# ---------------------------------------------------------------------------
+# best_dice_product checkpoint criterion (§5.2).
+# ---------------------------------------------------------------------------
+
+
+def test_dice_product_initial_is_minus_inf():
+    """maximization sentinel."""
+    assert _criterion_initial_value("best_dice_product") == float("-inf")
+
+
+def test_dice_product_value():
+    val_m = {"dice_present": 0.3, "dice_absent": 0.8}
+    assert abs(_criterion_value("best_dice_product", 0.5, val_m) - 0.24) < 1e-9
+
+
+def test_dice_product_nan_guard():
+    """NaN in dp or da -> 0.0 (early-epoch artifact)."""
+    val_m = {"dice_present": float("nan"), "dice_absent": 0.8}
+    assert _criterion_value("best_dice_product", 0.5, val_m) == 0.0
+
+
+def test_dice_product_predict_nothing_is_zero():
+    """Predict-nothing: dp=0, da=1.0 -> product=0 (loses to any productive)."""
+    val_m = {"dice_present": 0.0, "dice_absent": 1.0}
+    assert _criterion_value("best_dice_product", 0.5, val_m) == 0.0
+
+
+def test_dice_product_is_new_best():
+    assert _is_new_best("best_dice_product", 0.1, 0.2)
+    assert not _is_new_best("best_dice_product", 0.2, 0.1)
+    # Strict > so tie does NOT trigger save.
+    assert not _is_new_best("best_dice_product", 0.2, 0.2)
+
+
+# ---------------------------------------------------------------------------
+# v0.8 early-stop helpers (§5.3).
+# ---------------------------------------------------------------------------
+
+
+def _cfg_with_es(min_epoch=15, cat_floor=0.001, plateau_rel=0.005, overfit=50.0):
+    return Stage1SegTrainConfig(
+        early_stop_min_epoch=min_epoch,
+        early_stop_catastrophic_dice_product_floor=cat_floor,
+        early_stop_plateau_relative_threshold=plateau_rel,
+        early_stop_overfit_train_val_ratio=overfit,
+    )
+
+
+def test_v08_catastrophic_does_not_fire_with_productive_epoch():
+    """One productive epoch (dp*da above floor) clears catastrophic."""
+    cfg = _cfg_with_es(min_epoch=15, cat_floor=0.001)
+    dprod = [0.0] * 14 + [0.01]   # ep15 produces 0.01 > floor
+    assert not _check_v08_catastrophic_dice_product(cfg, dprod, epoch=15)
+
+
+def test_v08_catastrophic_fires_on_all_zero():
+    """All-zero dp*da over the min-epoch window -> CATASTROPHIC."""
+    cfg = _cfg_with_es(min_epoch=15, cat_floor=0.001)
+    dprod = [0.0] * 15
+    assert _check_v08_catastrophic_dice_product(cfg, dprod, epoch=15)
+
+
+def test_v08_catastrophic_not_checked_before_min_epoch():
+    cfg = _cfg_with_es(min_epoch=15, cat_floor=0.001)
+    dprod = [0.0] * 10
+    assert not _check_v08_catastrophic_dice_product(cfg, dprod, epoch=10)
+
+
+def test_median5_correctness():
+    assert _median5([1, 2, 3, 4, 5], 4) == 3.0
+    assert _median5([5, 4, 3, 2, 1], 4) == 3.0
+    assert _median5([10, 10, 10, 10, 5], 4) == 10.0
+
+
+def test_v08_relative_plateau_does_not_fire_when_climbing():
+    """Strictly-climbing series clears the plateau check."""
+    cfg = _cfg_with_es(min_epoch=15, plateau_rel=0.005)
+    # 20 increasing epochs.
+    dprod = [0.01 * (i + 1) for i in range(20)]
+    assert not _check_v08_relative_plateau(cfg, dprod, epoch=20)
+
+
+def test_v08_relative_plateau_does_not_crash_at_ep15():
+    """Regression test for the M1 attempt-2 crash (2026-05-27): the
+    plateau check at ep 15 with len(dice_product)=15 raised
+    ``median5 needs at least 5 entries ending at index 0; series has 15``
+    because the loop's first ``_median5(dice_product, i-5)`` at i=5
+    fell below index 4. The fix raises the pre-loop guard from
+    len >= 15 to len >= 19. At len=15, the check should return False
+    (insufficient history) rather than crash.
+    """
+    cfg = _cfg_with_es(min_epoch=15, plateau_rel=0.005)
+    dprod = [1e-4] * 15
+    # Must NOT raise — just returns False because len < 19.
+    assert _check_v08_relative_plateau(cfg, dprod, epoch=15) is False
+
+
+def test_v08_relative_plateau_does_not_crash_at_ep18():
+    """One off from the boundary — len=18 also must not crash."""
+    cfg = _cfg_with_es(min_epoch=15, plateau_rel=0.005)
+    dprod = [1e-4] * 18
+    assert _check_v08_relative_plateau(cfg, dprod, epoch=18) is False
+
+
+def test_v08_relative_plateau_safe_at_ep30_sparks_first_fire():
+    """The 128 GB-node arms use ``early_stop_min_epoch=30`` (H1, H2, M2 configs).
+    At ep 30 the plateau check fires for the first time with
+    len(dice_product)=30 — well past the len>=19 guard. The loop
+    iterates i in [20, 29]; smallest ``i-5=15`` passes _median5's
+    idx>=4 requirement. This is the user's verification ask after the
+    M1 attempt-2 crash: confirm the guard isn't a patch against
+    early_stop_min_epoch=15 specifically but a structural guard on
+    the algorithm's parameters (10 sustained + 5 lookback + 4 median
+    minimum-idx).
+
+    With a flat dice_product trajectory the plateau should fire at
+    ep 30 (10 consecutive median-stable epochs over the last window).
+    """
+    cfg = _cfg_with_es(min_epoch=30, plateau_rel=0.005)
+    # Climb then 20 flat — same shape as the ep-25 climb-then-flat test
+    # but scaled to len=35 so the last-10 window at ep 30 is fully flat.
+    # Actually for first-fire at ep 30: len=30. Need flat through last 10
+    # iterations: i in [20, 29] all see med_now and med_prev both flat.
+    # Easiest: dprod = climb 1..10, then flat 0.1 for the rest. Climb
+    # is far enough back that med_prev at i=20 (idx 15) is in the flat.
+    dprod = [0.01 * (i + 1) for i in range(5)] + [0.10] * 25
+    # No crash + plateau fires at ep 30 with 25 flat tail.
+    assert _check_v08_relative_plateau(cfg, dprod, epoch=30) is True
+
+
+def test_v08_relative_plateau_does_not_fire_climbing_at_ep30():
+    """Counterpart to ep30 stability: strictly-climbing series at
+    early_stop_min_epoch=30 clears the plateau check."""
+    cfg = _cfg_with_es(min_epoch=30, plateau_rel=0.005)
+    dprod = [0.01 * (i + 1) for i in range(35)]   # 35 climbing epochs
+    assert _check_v08_relative_plateau(cfg, dprod, epoch=35) is False
+
+
+def test_v08_relative_plateau_fires_when_flat_after_climb():
+    """Climb then enough flat epochs that all 10 rolling-window checks
+    in the last-10-epoch tail compare two flat medians -> plateau fires.
+
+    The check is "for each of i = epoch-10 .. epoch-1, med5(i) - med5(i-5) <
+    threshold". For all 10 to be flat-to-flat the climb has to be far
+    enough back that even med5(i-5) at i=epoch-10 falls inside the flat
+    region — so we need at least 15 flat epochs after the climb stops.
+    """
+    cfg = _cfg_with_es(min_epoch=15, plateau_rel=0.005)
+    # 5 climb epochs then 20 flat at the peak -> 25 epochs total. At
+    # epoch=25 (the most recent epoch), i ranges 15..24; med5(i) and
+    # med5(i-5) for i in [15..24] both fall inside the flat region.
+    dprod = [0.01 * (i + 1) for i in range(5)] + [0.10] * 20
+    assert _check_v08_relative_plateau(cfg, dprod, epoch=25)
+
+
+def test_v08_overfit_fires_when_ratio_high_and_checkpoint_stale():
+    """val/train ratio above threshold AND checkpoint hasn't updated in
+    10 epochs -> EARLY_STOP_OVERFIT."""
+    cfg = _cfg_with_es(min_epoch=15, overfit=50.0)
+    train = [0.001] * 25
+    val = [10.0] * 25   # ratio = 10000 well above 50
+    assert _check_v08_overfit(
+        cfg, train, val, best_criterion_epoch=5, epoch=25,
+    )
+
+
+def test_v08_overfit_does_not_fire_when_checkpoint_recent():
+    """Even with high ratio, fresh checkpoint suppresses the fire."""
+    cfg = _cfg_with_es(min_epoch=15, overfit=50.0)
+    train = [0.001] * 25
+    val = [10.0] * 25
+    assert not _check_v08_overfit(
+        cfg, train, val, best_criterion_epoch=24, epoch=25,
+    )
+
+
+def test_v08_overfit_does_not_fire_under_threshold():
+    """Ratio below threshold (50) doesn't fire even if checkpoint stale."""
+    cfg = _cfg_with_es(min_epoch=15, overfit=50.0)
+    train = [1.0] * 25
+    val = [10.0] * 25   # ratio = 10 < 50
+    assert not _check_v08_overfit(
+        cfg, train, val, best_criterion_epoch=5, epoch=25,
+    )

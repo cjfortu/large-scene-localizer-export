@@ -1,0 +1,2142 @@
+"""Stage 1 v0 pure-conv 3D segmenter training loop.
+
+Mirrors ``localizer.segmenter.train`` directly for the
+optimizer / scheduler / loss / checkpointing / sample-saving
+plumbing. Diverges in two places per design §5.2, §7.4, §8.1, §8.2:
+
+1. Train log line is ``loss + lr`` only; train-side Dice/IoU are
+   dropped (the recovered segmenter computed them but they were
+   never the diagnostic signal).
+2. Val pass produces sparsity-aware split Dice/IoU + per-voxel P/R
+   on target-present scenes + mean-positive-vox count on
+   target-absent scenes, plus the full detection-metrics pipeline
+   (recall@K, precision@K, mean-proposals/scene, FP/scene). All
+   defined in ``localizer.gate.metrics``.
+
+The per-epoch log format is the five-line pattern of design §7.4.
+"""
+
+from __future__ import annotations
+
+import argparse
+import yaml
+
+import json
+import logging
+import math
+import os
+import random
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+from localizer.common.data import make_dataloaders, setup_output_dirs
+from localizer.common.paths import add_root_args, resolve_config_paths, require_path
+from localizer.common.plotting import data_saver, plot_perf
+
+from localizer.gate.model import (
+    PureConvSegmenter3D, build_segmenter_v0_5, build_segmenter_v0_6,
+    build_segmenter_v0_7, build_segmenter_v0_8,
+)
+from localizer.gate.metrics import (
+    DetectionEpochAccumulator, SplitSegmentationAccumulator,
+    predicted_positive_count,
+)
+from localizer.gate.losses import CellFocalLoss
+
+
+_SSM_PARAM_LEAF_NAMES = {"A_log", "D"}
+
+
+def _find_output_head_conv(model: nn.Module) -> nn.Conv3d | None:
+    """Return the model's final single-channel ``Conv3d`` output head.
+
+    For the v0.7 Arm 2 hybrid this is ``model.head`` (a
+    ``Conv3d(c4, 1, 1)``). Falls back to scanning every ``Conv3d`` with
+    ``out_channels == 1`` and returning the last one in module-traversal
+    order. Returns ``None`` if no 1-channel conv head is found (the
+    bias-init is then skipped with a warning).
+    """
+    head = getattr(model, "head", None)
+    if isinstance(head, nn.Conv3d) and head.out_channels == 1:
+        return head
+    last: nn.Conv3d | None = None
+    for m in model.modules():
+        if isinstance(m, nn.Conv3d) and m.out_channels == 1:
+            last = m
+    return last
+
+
+def _init_head_bias(model: nn.Module, bias_value: float) -> None:
+    """Initialize the output head's ``Conv3d`` bias to ``bias_value``.
+
+    Per the converged-architecture doc (512 ladder §4.3), setting the
+    head bias to ``logit(p)`` (p = empirical positive-cell frequency)
+    removes the implicit 50/50 prior that otherwise wastes early epochs
+    on bulk-negative gradient. No-op (logged) if no head conv is found
+    or the head has no bias term.
+    """
+    head = _find_output_head_conv(model)
+    if head is None or head.bias is None:
+        logger.warning(
+            "cell_focal head bias-init skipped: no 1-channel Conv3d head "
+            "with a bias term found",
+        )
+        return
+    with torch.no_grad():
+        head.bias.fill_(float(bias_value))
+
+
+@torch.no_grad()
+def _estimate_positive_cell_frequency(
+    train_loader, cell_size: int, max_batches: int = 300,
+) -> float:
+    """Empirical positive-CELL frequency on the train split (512 §4.3).
+
+    A cell (``cell_size`` x ``cell_size`` spatial block, collapsed over
+    all frames) is positive iff any target voxel falls in it -- the exact
+    8x8 rescore truth rule. Iterates up to ``max_batches`` train batches
+    (a stable Bernoulli estimate; the full pass is unnecessary and would
+    re-load every 512² volume) and returns positive_cells / total_cells.
+
+    Args:
+        train_loader: The training ``DataLoader`` (yields ``sample["mask"]``
+            of shape ``(B, 1, T_m, H_m, W_m)``).
+        cell_size: Spatial block edge in low-res voxels (16 -> 8x8 grid).
+        max_batches: Cap on batches sampled for the estimate.
+
+    Returns:
+        Positive-cell fraction in ``[0, 1]``.
+    """
+    cs = int(cell_size)
+    pos_cells = 0
+    tot_cells = 0
+    for bi, sample in enumerate(train_loader):
+        if bi >= max_batches:
+            break
+        mask = sample["mask"]                       # (B, 1, T, H, W)
+        B, C, T, H, W = mask.shape
+        gh, gw = H // cs, W // cs
+        r = mask.reshape(B, C, T, gh, cs, gw, cs)
+        r = r.permute(0, 1, 3, 5, 2, 4, 6).reshape(B, C, gh, gw, T * cs * cs)
+        cell_pos = (r.amax(dim=-1) > 0.5)           # (B, 1, gh, gw)
+        pos_cells += int(cell_pos.sum().item())
+        tot_cells += int(cell_pos.numel())
+    if tot_cells == 0:
+        return 0.0
+    return pos_cells / tot_cells
+
+
+def _split_optimizer_param_groups(
+    model: nn.Module,
+    weight_decay: float,
+    weight_decay_ssm: float,
+) -> list[dict]:
+    """Build AdamW parameter groups separating SSM-specific parameters
+    from the rest of the model per design §5.4.
+
+    SSM-specific = ``A_log``, ``D`` (Mamba SSM core parameters), plus
+    the ``dt_proj.bias`` Mamba initializes specially. These get
+    ``weight_decay_ssm`` (typically 0); everything else gets
+    ``weight_decay``.
+
+    For v0.5 configs with no Mamba blocks, the SSM groups end up empty
+    and AdamW handles them correctly.
+    """
+    ssm_params: list[nn.Parameter] = []
+    ssm_bias_params: list[nn.Parameter] = []
+    other_params: list[nn.Parameter] = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        short_name = name.split(".")[-1]
+        if short_name in _SSM_PARAM_LEAF_NAMES:
+            ssm_params.append(p)
+        elif "dt_proj" in name and short_name == "bias":
+            ssm_bias_params.append(p)
+        else:
+            other_params.append(p)
+    groups: list[dict] = [
+        {"params": other_params, "weight_decay": weight_decay},
+    ]
+    if ssm_params:
+        groups.append({"params": ssm_params, "weight_decay": weight_decay_ssm})
+    if ssm_bias_params:
+        groups.append({"params": ssm_bias_params, "weight_decay": weight_decay_ssm})
+    return groups
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Write ``payload`` as JSON to ``path`` atomically via ``os.replace``.
+
+    Used by the v0.6 incremental ``training_history.json`` writer per
+    §5.5: a SIGINT mid-write would corrupt a naive open-truncate-write,
+    but ``os.replace`` is POSIX-atomic so the file is always either the
+    pre- or post-write content. Wrapped in try/except so a transient
+    shared-filesystem error does not crash the training loop.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2, default=str))
+        os.replace(tmp, path)
+    except OSError as exc:  # pragma: no cover - transient network-filesystem issues
+        logger.warning("training_history.json incremental write failed: %s", exc)
+
+
+logger = logging.getLogger(__name__)
+
+
+_VALID_CHECKPOINT_CRITERIA = (
+    "best_val_loss", "best_unsplit_dice", "best_dice_product",
+)
+
+
+def _criterion_initial_value(criterion: str) -> float:
+    """Return the sentinel initial value for the given checkpoint criterion.
+
+    Loss is minimized (``+inf``), Dice criteria are maximized (``-inf``).
+    Raises ``ValueError`` for unknown criteria.
+    """
+    if criterion == "best_val_loss":
+        return float("inf")
+    if criterion in ("best_unsplit_dice", "best_dice_product"):
+        return float("-inf")
+    raise ValueError(
+        f"checkpoint_criterion must be one of {_VALID_CHECKPOINT_CRITERIA}; "
+        f"got {criterion!r}"
+    )
+
+
+def _is_new_best(criterion: str, best_so_far: float, candidate: float) -> bool:
+    """Decide whether ``candidate`` is a new best under ``criterion``.
+
+    ``best_val_loss`` minimizes (strict ``<``). Dice criteria maximize
+    (strict ``>``). Strict inequality prevents re-saving the same
+    checkpoint on a tie. Raises ``ValueError`` for unknown criteria.
+    """
+    if criterion == "best_val_loss":
+        return candidate < best_so_far
+    if criterion in ("best_unsplit_dice", "best_dice_product"):
+        return candidate > best_so_far
+    raise ValueError(
+        f"checkpoint_criterion must be one of {_VALID_CHECKPOINT_CRITERIA}; "
+        f"got {criterion!r}"
+    )
+
+
+def _criterion_value(criterion: str, val_loss: float, val_metrics: dict) -> float:
+    """Pull the per-epoch value of ``criterion`` from val outputs.
+
+    * ``best_val_loss`` reads the scalar ``val_loss``.
+    * ``best_unsplit_dice`` derives ``0.5 * dice_present + 0.5 *
+      dice_absent`` (v0/v0.5/v0.6/v0.7 default; degenerate against
+      predict-nothing per v0.8 design §5.2).
+    * ``best_dice_product`` derives ``dice_present * dice_absent`` —
+      the v0.8 §5.2 fix. Predict-nothing scores 0 (0*1.0); predict-
+      everywhere scores ~0 (small dp * near-0 da); productive epochs
+      win. Always computed against the hard-binary mask via
+      ``mask_hard`` in the metric path; for soft-target arms the loss
+      target differs but the dice metric is the same as for hard arms.
+
+    NaN-guards: returns 0.0 for the product if either dp or da is NaN
+    (an early-epoch artifact where the present-bin or absent-bin
+    accumulator hasn't seen any samples yet).
+    """
+    if criterion == "best_val_loss":
+        return float(val_loss)
+    if criterion == "best_unsplit_dice":
+        return 0.5 * float(val_metrics["dice_present"]) \
+            + 0.5 * float(val_metrics["dice_absent"])
+    if criterion == "best_dice_product":
+        dp = float(val_metrics.get("dice_present", 0.0))
+        da = float(val_metrics.get("dice_absent", 0.0))
+        if math.isnan(dp) or math.isnan(da):
+            return 0.0
+        return dp * da
+    raise ValueError(
+        f"checkpoint_criterion must be one of {_VALID_CHECKPOINT_CRITERIA}; "
+        f"got {criterion!r}"
+    )
+
+
+def _plot_val_only(epochs, vals, met_abrv, met_desc, output_root):
+    """Write a CSV + PNG for a single per-epoch val-only series.
+
+    Mirrors ``plot_perf``'s output naming (``stats_<abrv>.csv``,
+    ``learning-curve_<abrv>.png``) but for series that have no
+    train counterpart by design (§7.4).
+    """
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    out = Path(output_root)
+    df = pd.DataFrame({"epoch": epochs, f"avg_val_{met_abrv}": vals})
+    df.to_csv(out / f"stats_{met_abrv}.csv", index=False)
+    plt.figure(figsize=(10, 6))
+    plt.plot(
+        epochs, vals, label=f"Validation {met_abrv}",
+        color="red", marker="x", linestyle="--", markersize=4,
+    )
+    plt.xlabel("Epoch")
+    plt.ylabel(f"{met_desc} ({met_abrv})")
+    plt.legend()
+    plt.title(f"Validation {met_abrv} (Epochs 1-{max(epochs)})")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(out / f"learning-curve_{met_abrv}.png")
+    plt.close()
+
+
+@dataclass
+class Stage1SegTrainConfig:
+    """Training hyperparameters for the Stage 1 v0 / v0.5 segmenter.
+
+    Mirrors ``VolsegTrainConfig`` (``localizer.segmenter.train``)
+    with three v0/v0.5 extensions:
+
+    * ``bottleneck_variant`` — selects the v0 bottleneck variant
+      (A/B/C/D); honored only when ``temporal_variant="baseline"``.
+    * ``temporal_variant`` — selects the v0.5 temporal-axis arm
+      (``"baseline"``, ``"wide_t_kernel"``, ``"delayed_t_pool"``,
+      ``"dilated_t"``). Default ``"baseline"`` preserves v0 behavior:
+      the factory returns ``PureConvSegmenter3D`` directly.
+    * ``checkpoint_criterion`` — selects the metric used to decide
+      "best checkpoint". ``"best_val_loss"`` is the v0 default kept
+      for v0 reproducibility; v0.5 configs set
+      ``"best_unsplit_dice"`` per design §5.1 to avoid the
+      checkpoint-misalignment seen on v0.
+
+    Default ``num_epochs`` (100) and ``subset_size`` (30000) are v0
+    values; v0.5 configs override these per design §5 (150 epochs,
+    5000 scenes).
+    """
+
+    bottleneck_variant: str = "A"
+    temporal_variant: str = "baseline"
+    checkpoint_criterion: str = "best_val_loss"
+    seed: int = 0
+    nfeats: int = 32
+    target_positive_pixels_per_frame: int = 13
+    lr: float = 1e-3
+    weight_decay: float = 1e-2
+    scheduler_factor: float = 0.5
+    scheduler_patience: int = 10
+    batch_size: int = 8
+    num_epochs: int = 100
+    subset_size: int = 30000
+    # Required at run time; set from the config `dataset:` key via
+    # localizer.common.paths.resolve_config_paths (or directly, absolute).
+    data_root: str | None = None
+    val_split: float = 0.1
+    val_split_seed: int = 0
+    # Required at run time; set from the config `run_name:` key.
+    output_root: str | None = None
+    num_workers: int = 4
+
+    # v0.6 additive fields per stage1_v0_6_design.md §5, §6.4. ``arm`` is
+    # the dispatch key — when not None, the v0.6 model factory is used
+    # instead of the v0.5 factory and the trainer enters the v0.6 code
+    # path (low-res metrics, param-group AdamW, incremental JSON write
+    # — though incremental JSON applies on every run, not just v0.6).
+    # ``output_resolution`` selects the dataloader contract per §3.3
+    # (default "full" preserves v0/v0.5 behavior).
+    # ``weight_decay_ssm`` is the AdamW weight-decay applied to the SSM
+    # parameter group per §5.4 / §11.9. For v0/v0.5 configs (no Mamba
+    # blocks) the SSM group is empty and this field is harmless.
+    arm: int | None = None
+    output_resolution: str = "full"
+    weight_decay_ssm: float = 0.0
+
+    # v0.7 additive fields per stage1_v0_7_design.md §5, §6.5, §11.11.
+    # ``model_factory`` selects which factory builds the model:
+    # ``"v0_6"`` (default; preserves v0.6 dispatch) or ``"v0_7"``.
+    # ``fusion`` and ``stem_stride`` are honored only when
+    # ``model_factory == "v0_7"``; ``dt_init_std`` is forwarded to the
+    # v0.7 factory for both arms but Arm 2 ignores it.
+    # ``gradient_clip_norm`` enables grad clipping at the given norm
+    # (None == disabled, preserves v0.6 bit-exact for Arm 2 path).
+    # ``warmup_epochs`` enables a LinearLR(start_factor=0.01,
+    # end_factor=1.0, total_iters=warmup_epochs) warmup that runs for
+    # the first ``warmup_epochs`` epochs before the
+    # ReduceLROnPlateau scheduler takes over. 0 (default) disables the
+    # warmup chain entirely.
+    # ``early_stop_min_epoch`` >= cfg.num_epochs disables plateau-based
+    # early-stop. Default 999 preserves v0.6 trainer behavior.
+    model_factory: str = "v0_6"
+    fusion: str = "sum"
+    stem_stride: int = 1
+    dt_init_std: float | None = None
+    gradient_clip_norm: float | None = None
+    warmup_epochs: int = 0
+    early_stop_min_epoch: int = 999
+    early_stop_plateau_window: int = 5
+    early_stop_plateau_threshold: float = 0.005
+    early_stop_catastrophic_dice_present_floor: float = 0.01
+
+    # v0.8 additive fields per stage1_v0_8_design.md §5.1-5.3, §6.5.
+    # * ``loss_target``: "hard_binary" (default, v0.6/v0.7 behavior) or
+    #   "soft_gaussian" (v0.8 §3.2 — peak-1 σ=1.0 Gaussian-convolved
+    #   low-res mask). Forwarded to MoverDataset via the soft_target
+    #   kwarg on make_dataloaders.
+    # * ``use_bf16``: when True, the model forward + loss is wrapped in
+    #   torch.autocast(device_type="cuda", dtype=torch.bfloat16) per
+    #   v0.8 §5.1 / §11.12. Default False preserves fp32 behavior.
+    # * ``gradient_checkpoint``: when True, forwarded to the v0.8 model
+    #   factory to wrap heavy dense blocks in torch.utils.checkpoint
+    #   per §5.1 / §11.13.
+    # * ``early_stop_catastrophic_dice_product_floor``: v0.8 §5.3.1 —
+    #   if max(dp*da) over the first ``early_stop_min_epoch`` epochs is
+    #   below this floor, fire EARLY_STOP_CATASTROPHIC. v0.8 default
+    #   0.001 per §11.8. Distinct from v0.7's catastrophic_dice_present_
+    #   floor (preserved for v0.7 config backward compat).
+    # * ``early_stop_plateau_relative_threshold``: v0.8 §5.3.2 — fraction
+    #   (e.g. 0.005 = 0.5%) of the running best dp*da; the relative
+    #   plateau check fires when the rolling-5 median's gain is below
+    #   this threshold for 10 consecutive epochs. v0.8 default 0.005.
+    # * ``early_stop_overfit_train_val_ratio``: v0.8 §5.3.3 — when
+    #   val_loss / train_loss exceeds this AND the saved checkpoint
+    #   hasn't updated in 10 epochs, fire EARLY_STOP_OVERFIT. v0.8
+    #   default 50.
+    loss_target: str = "hard_binary"
+    use_bf16: bool = False
+    gradient_checkpoint: bool = False
+    early_stop_catastrophic_dice_product_floor: float = 0.001
+    early_stop_plateau_relative_threshold: float = 0.005
+    early_stop_overfit_train_val_ratio: float = 50.0
+
+    # v0.9 additive fields per stage1_v0_9_design.md §5.2, §4.6.
+    # * ``low_res_pool``: ``(T, H, W)`` max-pool factors for the
+    #   low-res supervision branch. Default ``(2, 4, 4)`` preserves
+    #   v0.6/v0.7/v0.8 bit-identically. v0.9 M-supgrid uses ``(1, 2, 2)``.
+    #   Forwarded to ``make_dataloaders`` and ``build_segmenter_v0_8``.
+    # * ``detection_recall_ks``: K values for ``DetectionEpochAccumulator``
+    #   per §7.1 (extends v0.8's hardcoded (1, 3, 5) to include 15 by
+    #   default for v0.9 verdict metrics). Default ``(1, 3, 5)``
+    #   preserves v0.8 behavior; v0.9 configs pass ``[1, 3, 5, 15]``.
+    # * ``secondary_recall_k``: K used for the secondary checkpoint
+    #   (``best_recall_at_K``). Default ``3`` preserves v0.8 behavior
+    #   bit-identically; v0.9 configs set ``15`` per §4.6.
+    low_res_pool: tuple[int, int, int] | list[int] = (2, 4, 4)
+    detection_recall_ks: tuple[int, ...] | list[int] = (1, 3, 5)
+    secondary_recall_k: int = 3
+    # Phase 2 (§5 item 7): proposal-patch size in input voxels for the
+    # detection metrics. The patch IS the Stage-2 crop; at full scale
+    # (1024²) it is genuinely 128×128. To make precision_present at the
+    # cheaper rungs a faithful estimate of the eventual 1024²
+    # localization precision, the patch is scaled to the SAME fraction
+    # of field (1/8 per axis) at every rung:
+    #   128²->16, 256²->32, 512²->64, 1024²->128.
+    # Default 128 preserves the prior full-field behavior bit-identically
+    # for any config that does not set it.
+    proposal_patch_h: int = 128
+    proposal_patch_w: int = 128
+    # Phase 2 Section A: full-res chip size (input voxels) for GRF-cluster
+    # coverage recall (val_cluster_recall): 32 @128², 128 @512²/1024².
+    # None disables the metric (default: prior behavior unchanged).
+    cluster_chip_size: int | None = None
+    # Gate-aware checkpoint selection (fixes the best_recall@K criterion
+    # rewarding transient early spikes — e.g. the 512² settling runs saved
+    # an ep2 cold-start+1 spike). When gate_settle_min_epoch > 0, a
+    # ``best_gate_model.pth`` is saved as the epoch (>= gate_settle_min_epoch)
+    # with the highest cluster_recall *among epochs that hold the absent
+    # side*, i.e. abs_pos_frac <= gate_abs_frac_bar — the actual gate
+    # objective (cover targets without flooding empty scenes), read on the
+    # settled regime not a pre-convergence spike. A ``last_epoch_model.pth``
+    # is also always saved as a deploy-the-converged-state fallback. 0
+    # disables (default: prior behavior bit-identical except the additive
+    # last_epoch file). Required for the eventual 1024² run.
+    gate_settle_min_epoch: int = 0
+    gate_abs_frac_bar: float = 0.25
+
+    # v0.10 stabilizers (stage1_v0_10_stabilization_ablation_spec.md §4.2).
+    # OPT-IN, defaults OFF: with these defaults config A is behaviorally
+    # identical to Phase 2 plus the §5 additive logging. None of the
+    # branches guarded by these flags execute when the flag is off.
+    # * ``use_ema``: maintain an exponential moving average of model
+    #   weights; when True, validation and checkpointing use the EMA
+    #   weights. Accumulation starts at ``ema_start_epoch`` so the average
+    #   is never polluted by the pre-settle peak (§4.2). Default False
+    #   leaves the EMA code path inert (``_WeightEMA`` is never built).
+    # * ``ema_decay``: EMA decay delta (§4.2: 0.9999 ~= 3.7-epoch average
+    #   at ~2700 updates/epoch). Updated once per optimizer step.
+    # * ``ema_start_epoch``: first epoch at which EMA accumulation begins
+    #   (reuse of the gate settle floor ~30 per §4.2). >= num_epochs means
+    #   EMA never starts.
+    # * ``min_lr``: ReduceLROnPlateau LR floor hook (§4.2 late-training LR
+    #   reduction). Default 0.0 == the torch ReduceLROnPlateau default ==
+    #   current behavior bit-identically. The concrete B LR-decay shape is
+    #   set later from A's flood-vs-LR readout; this is only the inert hook.
+    use_ema: bool = False
+    ema_decay: float = 0.9999
+    ema_start_epoch: int = 30
+    min_lr: float = 0.0
+
+    # 512 gate-precision ladder (stage1_gate_precision_ladder_512_spec.md).
+    # * ``padding_mode``: Conv3d padding mode threaded through the v0.7
+    #   Arm 2 encoder convs (§4.2 border fix — L1/L2/L3). Default
+    #   "zeros" preserves all prior runs bit-identically; the ladder
+    #   passes "replicate". Honored only by the v0_7 factory.
+    # * ``loss_target == "cell_focal"`` (§4.3 — L3): the low-res logits
+    #   are aggregated to the 8x8 cell grid via logsumexp over each
+    #   ``cell_focal_cell_size`` x cell_size x T block and a FocalLoss
+    #   (``cell_focal_gamma`` / ``cell_focal_alpha``) is applied against
+    #   cell labels (a cell is positive iff any target voxel falls in its
+    #   block — the exact 8x8 rescore truth rule). The existing
+    #   pos-weighted BCE on the low-res mask is retained as an auxiliary
+    #   localization term with weight ``cell_focal_aux_weight``. The
+    #   head's final Conv3d bias is initialized to ``logit(p)`` where p is
+    #   the empirical positive-CELL frequency on the train split (computed
+    #   at startup, never hardcoded). ``cell_focal_tversky_*`` optionally
+    #   add a Tversky FN>FP term (held at 0 weight unless the §7 retune
+    #   fires). All inert unless ``loss_target == "cell_focal"``.
+    padding_mode: str = "zeros"
+    cell_focal_cell_size: int = 16
+    cell_focal_gamma: float = 2.0
+    cell_focal_alpha: float | None = None
+    cell_focal_aux_weight: float = 0.5
+    cell_focal_tversky_weight: float = 0.0
+    cell_focal_tversky_alpha: float = 0.7
+    cell_focal_tversky_beta: float = 0.3
+    # Cell aggregation: "maxpool" (eval-aligned, operator-selected default)
+    # or "logsumexp" (the spec's original choice; mis-calibrated against the
+    # per-voxel-threshold 8x8 eval -- see CellFocalLoss docstring).
+    cell_focal_aggregation: str = "maxpool"
+
+
+def _check_catastrophic_early_stop(
+    cfg, dice_present: list[float], epoch: int,
+) -> bool:
+    """v0.7 §11.11 catastrophic early-stop: ``dice_present`` has been
+    below the chance-level floor for the first ``early_stop_min_epoch``
+    epochs.
+
+    Triggers at ``epoch == cfg.early_stop_min_epoch`` (no need to
+    re-evaluate every epoch after that — if it triggered, the run is
+    already stopped). The check looks at *all* completed epochs so far;
+    fires only if every value is below the floor.
+    """
+    if epoch < cfg.early_stop_min_epoch:
+        return False
+    floor = cfg.early_stop_catastrophic_dice_present_floor
+    if not dice_present:
+        return False
+    return all(v < floor for v in dice_present[:cfg.early_stop_min_epoch])
+
+
+def _check_plateau_early_stop(
+    cfg,
+    unsplit_dice: list[float],
+    dice_present: list[float],
+    dice_absent: list[float],
+    epoch: int,
+) -> bool:
+    """v0.7 §11.11 plateau early-stop: three conditions must all hold.
+
+    1. ``epoch >= early_stop_min_epoch``.
+    2. Latest values meet the Credible-tier per §8.1 / §8.2
+       (``dice_present >= 0.30`` AND ``dice_absent >= 0.8``).
+    3. ``max(unsplit_dice[-window:]) - min(unsplit_dice[-window:]) <
+       plateau_threshold``.
+
+    The window check looks at the last
+    ``early_stop_plateau_window`` epochs of ``unsplit_dice``. If fewer
+    epochs have completed than the window, returns False (not enough
+    data).
+    """
+    if epoch < cfg.early_stop_min_epoch:
+        return False
+    if len(unsplit_dice) < cfg.early_stop_plateau_window:
+        return False
+    if dice_present[-1] < 0.30 or dice_absent[-1] < 0.8:
+        return False
+    window = unsplit_dice[-cfg.early_stop_plateau_window:]
+    return (max(window) - min(window)) < cfg.early_stop_plateau_threshold
+
+
+def _check_v08_catastrophic_dice_product(
+    cfg, dice_product: list[float], epoch: int,
+) -> bool:
+    """v0.8 §5.3.1 catastrophic early-stop on ``dp * da``.
+
+    Fires at ``epoch == early_stop_min_epoch`` when
+    ``max(dice_product[:min_epoch])`` is below the configured floor.
+    The check uses the *maximum* over the window (not the per-epoch
+    value) because a single productive epoch is enough to disprove
+    catastrophic — predict-nothing equilibria emit 0 at every epoch.
+    """
+    if epoch < cfg.early_stop_min_epoch:
+        return False
+    floor = cfg.early_stop_catastrophic_dice_product_floor
+    if not dice_product:
+        return False
+    window = dice_product[:cfg.early_stop_min_epoch]
+    return max(window) < floor
+
+
+def _check_v08_relative_plateau(
+    cfg, dice_product: list[float], epoch: int,
+) -> bool:
+    """v0.8 §5.3.2 plateau early-stop on the rolling 5-epoch median of
+    ``dp * da``, with a *relative* threshold against the running best.
+
+    Four conditions:
+
+    1. ``epoch >= early_stop_min_epoch``.
+    2. At least 19 epochs of history. The last 10 epochs each require
+       ``median5(i)`` (idx >= 4) AND ``median5(i - 5)`` (idx >= 4 →
+       i >= 9). With the loop iterating i = len-10..len-1, the
+       earliest i is len-10 and the earliest median5 call is on
+       len-15. So we need len-15 >= 4, i.e., len >= 19. This was
+       len >= 15 in the initial implementation — surfaced as a
+       trainer crash on M1 attempt-2 at ep 15 (2026-05-27) where the
+       guard failed and ``_median5(dice_product, 0)`` raised.
+    3. ``running_best > 0`` — no productive epoch yet means the
+       catastrophic check is the right signal, not the plateau check.
+    4. For each of the last 10 epochs, the rolling-5 median gain over
+       the median 5 epochs earlier is below
+       ``early_stop_plateau_relative_threshold * running_best``.
+
+    Uses ``early_stop_plateau_relative_threshold`` rather than the
+    absolute ``early_stop_plateau_threshold`` because dice_product
+    dynamic range differs by arm (hybrid ~0.7 expected; pure-Mamba
+    ~0.001-0.05 expected) — an absolute threshold would over-fire on
+    pure-Mamba and under-fire on the hybrid.
+    """
+    if epoch < cfg.early_stop_min_epoch:
+        return False
+    if len(dice_product) < 19:
+        return False
+    running_best = max(dice_product)
+    if running_best <= 0:
+        # No productive epoch yet; the catastrophic check is the right
+        # signal here, not the plateau check.
+        return False
+    threshold = cfg.early_stop_plateau_relative_threshold * running_best
+    # Last 10 epochs: each rolling-5 median at epoch i vs at epoch i-5
+    # should differ by < threshold to count as a plateaued epoch. The
+    # ``len >= 19`` guard above already ensures i-5 >= 4 on the first
+    # iteration; no per-iter guard needed.
+    sustained = 0
+    for i in range(len(dice_product) - 10, len(dice_product)):
+        med_now = _median5(dice_product, i)
+        med_prev = _median5(dice_product, i - 5)
+        if med_now - med_prev < threshold:
+            sustained += 1
+        else:
+            sustained = 0
+    return sustained >= 10
+
+
+def _median5(series: list[float], idx_inclusive: int) -> float:
+    """Median of ``series[idx_inclusive - 4 : idx_inclusive + 1]``.
+
+    Helper for the v0.8 §5.3.2 rolling-5 median plateau check.
+    Returns float; series must contain at least 5 entries ending at
+    ``idx_inclusive``.
+    """
+    if idx_inclusive < 4:
+        raise ValueError(
+            f"median5 needs at least 5 entries ending at index "
+            f"{idx_inclusive}; series has {len(series)}"
+        )
+    window = sorted(series[idx_inclusive - 4: idx_inclusive + 1])
+    return float(window[2])
+
+
+def _check_v08_overfit(
+    cfg,
+    train_losses: list[float],
+    val_losses: list[float],
+    best_criterion_epoch: int | None,
+    epoch: int,
+) -> bool:
+    """v0.8 §5.3.3 overfitting-onset check.
+
+    Fires when (a) the latest val_loss / train_loss ratio exceeds the
+    configured threshold, AND (b) the saved best checkpoint has not
+    updated in the last 10 epochs (catches the v0.7 arm B pathology:
+    productive moment at ep 6 → 90+ epochs of overfitting into junk).
+
+    Skipped before ``early_stop_min_epoch`` because the train loss can
+    be very small in the first few warmup epochs and the ratio is
+    misleading.
+    """
+    if epoch < cfg.early_stop_min_epoch:
+        return False
+    if not train_losses or not val_losses:
+        return False
+    train_last = train_losses[-1]
+    val_last = val_losses[-1]
+    if train_last <= 0:
+        return False
+    ratio = val_last / train_last
+    if ratio < cfg.early_stop_overfit_train_val_ratio:
+        return False
+    if best_criterion_epoch is None:
+        return False
+    return (epoch - best_criterion_epoch) >= 10
+
+
+class _WarmupThenPlateau:
+    """Compose ``LinearLR`` warmup with ``ReduceLROnPlateau`` per v0.7 §5.3.
+
+    For epochs ``< warmup_epochs`` calls ``warmup.step()`` (no args).
+    For later epochs calls ``plateau.step(val_loss)``. Exposes
+    ``get_last_lr()`` so the trainer's train-log line keeps working.
+    """
+
+    def __init__(
+        self,
+        warmup: torch.optim.lr_scheduler.LinearLR,
+        plateau: torch.optim.lr_scheduler.ReduceLROnPlateau,
+        warmup_epochs: int,
+    ) -> None:
+        self.warmup = warmup
+        self.plateau = plateau
+        self.warmup_epochs = warmup_epochs
+        self._epoch_count = 0
+        self._optimizer = warmup.optimizer
+
+    def step(self, val_loss: float) -> None:
+        """Step the active sub-scheduler.
+
+        ``ReduceLROnPlateau`` requires ``val_loss``; ``LinearLR`` does
+        not accept one. The composite picks based on internal epoch
+        counter (incremented inside this method).
+        """
+        self._epoch_count += 1
+        if self._epoch_count <= self.warmup_epochs:
+            self.warmup.step()
+        else:
+            self.plateau.step(val_loss)
+
+    def get_last_lr(self) -> list[float]:
+        return [g["lr"] for g in self._optimizer.param_groups]
+
+
+class _WeightEMA:
+    """Exponential moving average of model weights per v0.10 §4.2.
+
+    OPT-IN stabilizer. Only constructed when ``cfg.use_ema`` is True, so
+    with the flag off this code path never executes. Tracks a shadow copy
+    of every trainable parameter; ``update`` is called once per optimizer
+    step (the ~2700-updates/epoch cadence the §4.2 decay timescale assumes).
+
+    Accumulation does not begin until ``initialize`` is called (at
+    ``ema_start_epoch``), so the average is seeded from the settled-regime
+    weights rather than the pre-settle peak. ``apply_shadow`` swaps the EMA
+    weights into the model for validation/checkpointing and stashes the raw
+    weights; ``restore`` puts the raw weights back so training continues
+    from the un-averaged trajectory.
+    """
+
+    def __init__(self, decay: float) -> None:
+        self.decay = float(decay)
+        self.shadow: dict[str, torch.Tensor] = {}
+        self.backup: dict[str, torch.Tensor] = {}
+        self.started: bool = False
+
+    def initialize(self, model: nn.Module) -> None:
+        """Seed the shadow weights from the current model parameters.
+
+        Called once, at ``ema_start_epoch``, before that epoch's steps so
+        the average begins from the settled-regime weights.
+        """
+        self.shadow = {
+            name: p.detach().clone()
+            for name, p in model.named_parameters()
+            if p.requires_grad
+        }
+        self.started = True
+
+    def update(self, model: nn.Module) -> None:
+        """Advance the EMA by one optimizer step (no-op until initialized)."""
+        if not self.started:
+            return
+        d = self.decay
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            self.shadow[name].mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    def apply_shadow(self, model: nn.Module) -> None:
+        """Load EMA weights into ``model``, stashing the raw weights."""
+        self.backup = {}
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            self.backup[name] = p.detach().clone()
+            p.data.copy_(self.shadow[name])
+
+    def restore(self, model: nn.Module) -> None:
+        """Restore the raw (pre-``apply_shadow``) weights into ``model``."""
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            p.data.copy_(self.backup[name])
+        self.backup = {}
+
+
+def _abs_frac_stats(per_scene: list[float]) -> dict[str, float]:
+    """Derived statistics of the per-scene absent ``abs_pos_frac`` vector.
+
+    Per v0.10 §5, logs the headline tail statistic p95 alongside
+    mean/std/p50/p90/max so any threshold can be recomputed later from the
+    raw vector (also logged). Returns NaN for every statistic on an empty
+    vector (an epoch with no absent val scenes).
+    """
+    keys = ("mean", "std", "p50", "p90", "p95", "max")
+    if not per_scene:
+        return {k: float("nan") for k in keys}
+    arr = np.asarray(per_scene, dtype=np.float64)
+    return {
+        "mean": float(arr.mean()),
+        "std": float(arr.std()),
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+        "p95": float(np.percentile(arr, 95)),
+        "max": float(arr.max()),
+    }
+
+
+def _write_grad_norm_first10_header(path: Path) -> None:
+    """Write the header line for the v0.7 §5.6 grad-norm-first-10 sidecar.
+
+    Called once at training start. Subsequent rows are appended by
+    ``_record_grad_norm_first10`` after each of the first 10 train
+    batches.
+    """
+    path.write_text(
+        "batch,parameter_name,parameter_shape,grad_norm,parameter_norm\n",
+    )
+
+
+def _record_grad_norm_first10(
+    model: nn.Module, batch_index: int, path: Path,
+) -> None:
+    """Append one line per trainable parameter to the §5.6 sidecar CSV.
+
+    Captures per-parameter pre-clip gradient norm and parameter norm
+    for the first 10 train batches of a v0.7 pure-Mamba run. Cost is
+    ~50 ms per batch (read-only parameter iteration).
+    """
+    rows: list[str] = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad or p.grad is None:
+            continue
+        gn = p.grad.detach().norm().item()
+        pn = p.detach().norm().item()
+        shape = "x".join(str(s) for s in p.shape)
+        rows.append(f"{batch_index},{name},{shape},{gn:.6e},{pn:.6e}\n")
+    with path.open("a") as f:
+        f.writelines(rows)
+
+
+def _train_one_epoch(
+    model, device, train_loader, criterion, optimizer, scheduler, epoch,
+    gradient_clip_norm: float | None = None,
+    grad_norm_sidecar: Path | None = None,
+    record_grad_norm_first10: bool = False,
+    use_bf16: bool = False,
+    ema: "_WeightEMA | None" = None,
+    ema_active: bool = False,
+):
+    """Train one epoch. Returns ``(epoch_loss, grad_norm_max)``.
+
+    No train-side Dice/IoU computation per design §7.4.
+
+    Two v0.7 additions:
+
+    * ``gradient_clip_norm``: when not None, applies
+      ``torch.nn.utils.clip_grad_norm_`` between ``loss.backward()`` and
+      ``optimizer.step()``. Returns the pre-clip total grad norm and
+      records the per-epoch maximum for the cross-arm CSV per §6.3.
+    * ``record_grad_norm_first10``: when True, calls
+      ``_record_grad_norm_first10`` for batches 0-9 of epoch 1 (the
+      first 10 train batches of the run). The sidecar file is
+      ``grad_norm_sidecar`` (typically
+      ``<output_root>/grad_norms_first10.csv``).
+
+    One v0.8 addition:
+
+    * ``use_bf16``: when True, wraps the model forward + loss in
+      ``torch.autocast(device_type="cuda", dtype=torch.bfloat16)``.
+      Parameters stay fp32; activations cast to bf16 inside the
+      autocast region. No GradScaler (bf16 range is sufficient).
+    """
+    model.train()
+    running_loss = 0.0
+    grad_norm_max = 0.0
+    for batch_idx, sample in enumerate(train_loader):
+        input = sample["volume"].to(device)
+        masks = sample["mask"].to(device)
+        optimizer.zero_grad()
+        if use_bf16:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                outputs = model(input)
+                loss = criterion(outputs, masks)
+        else:
+            outputs = model(input)
+            loss = criterion(outputs, masks)
+        loss.backward()
+        if gradient_clip_norm is not None:
+            # clip_grad_norm_ returns the pre-clip total norm.
+            total_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=gradient_clip_norm,
+            )
+            total_norm_val = float(total_norm)
+            if total_norm_val > grad_norm_max:
+                grad_norm_max = total_norm_val
+        if (
+            record_grad_norm_first10
+            and epoch == 1
+            and batch_idx < 10
+            and grad_norm_sidecar is not None
+        ):
+            _record_grad_norm_first10(
+                model, batch_idx, grad_norm_sidecar,
+            )
+        optimizer.step()
+        # v0.10 §4.2 EMA: advance the weight average once per optimizer
+        # step. Guarded so the branch is inert unless EMA is on AND active
+        # (epoch >= ema_start_epoch); ema is None entirely when use_ema off.
+        if ema is not None and ema_active:
+            ema.update(model)
+        running_loss += loss.item() * input.size(0)
+    epoch_loss = running_loss / len(train_loader.dataset)
+    if gradient_clip_norm is not None:
+        logger.info(
+            "[epoch %d] train: loss=%.4f lr=%.6f grad_norm_max=%.4f",
+            epoch, epoch_loss, scheduler.get_last_lr()[0], grad_norm_max,
+        )
+    else:
+        logger.info(
+            "[epoch %d] train: loss=%.4f lr=%.6f",
+            epoch, epoch_loss, scheduler.get_last_lr()[0],
+        )
+    return epoch_loss, grad_norm_max
+
+
+def _validate(
+    model, device, val_loader, criterion, scheduler, epoch, output_root,
+    full_res_metrics: bool = False,
+    use_bf16: bool = False,
+    detection_ks: tuple[int, ...] = (1, 3, 5),
+    proposal_patch_h: int = 128,
+    proposal_patch_w: int = 128,
+    cluster_chip_size: int | None = None,
+    gate_grid_voxels: int | None = None,
+):
+    """Validate one epoch. Returns ``(val_loss, native_metrics, full_metrics, instr)``.
+
+    ``instr`` is the v0.10 §5 additive instrumentation: the per-scene
+    absent ``abs_pos_frac`` vector (native low-res grid) and the mean
+    present/absent loss components (logging only — validation runs no
+    backward, so this cannot perturb the optimized loss).
+
+    ``native_metrics`` is the merged dict of native-resolution
+    ``SplitSegmentationAccumulator`` + ``DetectionEpochAccumulator``
+    summaries. For full-resolution arms (Arms 1/3 v0.6 or v0/v0.5) this
+    is the entire metric set used for both checkpoint selection AND
+    cross-arm comparison.
+
+    For low-resolution arms (``full_res_metrics=True``; v0.6 Arms 2/4
+    per §6.2), ``full_metrics`` carries a second set computed by
+    NN-upsampling the predicted logits to full resolution and dicing
+    against the original full-res mask provided as ``sample["mask_full"]``.
+    The training-loop checkpoint criterion uses ``native_metrics``; the
+    cross-arm comparison and §8 success criteria use ``full_metrics``.
+
+    For full-resolution arms ``full_metrics`` is bit-identical to
+    ``native_metrics`` (so the cross-arm CSV has a uniform schema). The
+    caller's downstream code can pretend the two were always present.
+
+    Calls ``scheduler.step(val_loss)`` and logs both native and
+    full-resolution metric lines per §6.4.
+
+    v0.8 §6.4 dual-mask routing: the loss is computed against
+    ``sample["mask"]`` (soft if ``loss_target=="soft_gaussian"``, hard
+    otherwise) but the dice/detection metrics are computed against
+    ``sample["mask_hard"]`` (always hard-binary). For hard-target arms
+    these are byte-identical so the metric paths are bit-identical to
+    v0.6/v0.7. When ``sample["mask_hard"]`` is absent (full-res mode),
+    fall back to ``sample["mask"]`` to preserve v0/v0.5 behavior.
+
+    v0.8 ``use_bf16``: wraps the model forward + loss in
+    ``torch.autocast(device_type="cuda", dtype=torch.bfloat16)``.
+    """
+    model.eval()
+    val_loss = 0.0
+    seg_acc = SplitSegmentationAccumulator()
+    # cluster_chip_size goes on whichever accumulator feeds full_m (the
+    # cross-arm/full-res metric set): full_det_acc when full_res_metrics,
+    # else the native det_acc. The full-res chip grid is degenerate on the
+    # low-res native mask, so native gets None for low-res arms.
+    det_acc = DetectionEpochAccumulator(
+        ks=tuple(detection_ks),
+        patch_h=proposal_patch_h, patch_w=proposal_patch_w,
+        cluster_chip_size=(None if full_res_metrics else cluster_chip_size),
+    )
+    if full_res_metrics:
+        full_seg_acc = SplitSegmentationAccumulator()
+        full_det_acc = DetectionEpochAccumulator(
+            ks=tuple(detection_ks),
+            patch_h=proposal_patch_h, patch_w=proposal_patch_w,
+            cluster_chip_size=cluster_chip_size,
+        )
+    saved_1 = False
+    saved_0 = False
+    # v0.10 §5 instrumentation (ALWAYS-ON, additive). Validation runs no
+    # backward(), so none of this can perturb the optimized loss. Per-scene
+    # absent abs_pos_frac on the native low-res grid + the present/absent
+    # loss split (logging only; calibrates the §4.3 C lambda bracket).
+    abs_pos_frac_per_scene: list[float] = []
+    present_loss_sum = 0.0
+    present_loss_n = 0
+    absent_loss_sum = 0.0
+    absent_loss_n = 0
+    with torch.no_grad():
+        for sample in val_loader:
+            videos = sample["volume"].to(device)
+            masks = sample["mask"].to(device)              # loss target
+            # v0.8 §6.4: hard-binary mask for metrics. Falls back to
+            # ``masks`` when "mask_hard" not in sample (full-res / pre-
+            # v0.8 datasets) so v0/v0.5/v0.6/v0.7 are bit-identical.
+            if "mask_hard" in sample:
+                masks_hard = sample["mask_hard"].to(device)
+            else:
+                masks_hard = masks
+            if use_bf16:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    outputs = model(videos)
+                    loss = criterion(outputs, masks)
+            else:
+                outputs = model(videos)
+                loss = criterion(outputs, masks)
+            # Cast outputs back to fp32 for downstream metric computation
+            # (the dice math is fp32; bf16 here causes accumulator drift).
+            if outputs.dtype != torch.float32:
+                outputs = outputs.float()
+            val_loss += loss.item() * videos.size(0)
+            batch_size = videos.size(0)
+            if full_res_metrics:
+                masks_full = sample["mask_full"].to(device)
+                outputs_full = F.interpolate(
+                    outputs, size=tuple(masks_full.shape[-3:]),
+                    mode="nearest",
+                )
+            for b in range(batch_size):
+                label_b = int(sample["label"][b])
+                logits_b = outputs[b]
+                mask_b = masks_hard[b]                     # hard for metrics
+                seg_acc.update(logits_b, mask_b, label_b)
+                det_acc.update(logits_b, mask_b)
+                # v0.10 §5 (logging only): per-scene loss split using the
+                # UNCHANGED criterion, and per-scene absent abs_pos_frac.
+                scene_loss = float(
+                    criterion(outputs[b:b + 1], masks[b:b + 1]).item()
+                )
+                if label_b == 1:
+                    present_loss_sum += scene_loss
+                    present_loss_n += 1
+                else:
+                    absent_loss_sum += scene_loss
+                    absent_loss_n += 1
+                    # Per-scene abs_pos_frac is put on the SAME basis as the
+                    # existing validated dataset abs_pos_frac (the gate code's
+                    # mean_pos_vox_absent / gate_grid_voxels): the low-res
+                    # supervision-grid voxel count (datshape // low_res_pool),
+                    # passed in as gate_grid_voxels — NOT a slice of the output
+                    # dims. The assert pins the invariant that the native
+                    # output layout equals that grid, so any future layout
+                    # change (1024² scale-up, supervision-grid edit) trips here
+                    # instead of silently rescaling the per-scene fraction.
+                    native_vox = (
+                        int(logits_b.shape[-3]) * int(logits_b.shape[-2])
+                        * int(logits_b.shape[-1])
+                    )
+                    if gate_grid_voxels is None:
+                        grid_vox = native_vox
+                    else:
+                        assert native_vox == gate_grid_voxels, (
+                            "abs_pos_frac basis mismatch: native logits grid "
+                            f"{tuple(logits_b.shape[-3:])} -> {native_vox} "
+                            f"voxels != gate_grid_voxels {gate_grid_voxels}"
+                        )
+                        grid_vox = gate_grid_voxels
+                    pos_vox = predicted_positive_count(
+                        logits_b, threshold=seg_acc.threshold,
+                    )
+                    abs_pos_frac_per_scene.append(
+                        pos_vox / grid_vox if grid_vox > 0 else float("nan")
+                    )
+                if full_res_metrics:
+                    full_seg_acc.update(
+                        outputs_full[b], masks_full[b], label_b,
+                    )
+                    full_det_acc.update(outputs_full[b], masks_full[b])
+                if label_b == 1 and not saved_1:
+                    data_saver(
+                        videos[b:b + 1], outputs[b:b + 1], masks[b:b + 1],
+                        output_root, label_b, epoch,
+                    )
+                    saved_1 = True
+                elif label_b == 0 and not saved_0:
+                    data_saver(
+                        videos[b:b + 1], outputs[b:b + 1], masks[b:b + 1],
+                        output_root, label_b, epoch,
+                    )
+                    saved_0 = True
+    epoch_loss = val_loss / len(val_loader.dataset)
+    scheduler.step(epoch_loss)
+
+    seg_m = seg_acc.summarize()
+    det_m = det_acc.summarize()
+    native_merged = {**seg_m, **det_m}
+
+    if full_res_metrics:
+        full_seg_m = full_seg_acc.summarize()
+        full_det_m = full_det_acc.summarize()
+        full_merged = {**full_seg_m, **full_det_m}
+    else:
+        # Full-res arms: full == native (for uniform cross-arm CSV).
+        full_merged = native_merged
+
+    logger.info("[epoch %d] val:   loss=%.4f", epoch, epoch_loss)
+    logger.info(
+        "[epoch %d] val seg present: dice=%.4f iou=%.4f vox_p=%.4f vox_r=%.4f",
+        epoch, seg_m["dice_present"], seg_m["iou_present"],
+        seg_m["vox_p_present"], seg_m["vox_r_present"],
+    )
+    logger.info(
+        "[epoch %d] val seg absent:  dice=%.4f iou=%.4f mean_pos_vox=%.1f",
+        epoch, seg_m["dice_absent"], seg_m["iou_absent"],
+        seg_m["mean_pos_vox_absent"],
+    )
+    logger.info(
+        "[epoch %d] val det: recall@1=%.3f recall@3=%.3f recall@5=%.3f "
+        "precision@3=%.3f mean_prop_present=%.2f mean_prop_absent=%.2f",
+        epoch, det_m["recall@1"], det_m["recall@3"], det_m["recall@5"],
+        det_m["precision@3"],
+        det_m["mean_proposals_per_scene_present"],
+        det_m["mean_proposals_per_scene_absent"],
+    )
+    if full_res_metrics:
+        logger.info(
+            "[epoch %d] val seg present (full-res): dice=%.4f iou=%.4f",
+            epoch, full_merged["dice_present"], full_merged["iou_present"],
+        )
+        logger.info(
+            "[epoch %d] val seg absent (full-res):  dice=%.4f iou=%.4f mean_pos_vox=%.1f",
+            epoch, full_merged["dice_absent"], full_merged["iou_absent"],
+            full_merged["mean_pos_vox_absent"],
+        )
+        logger.info(
+            "[epoch %d] val det (full-res): recall@3=%.3f precision@3=%.3f "
+            "mean_prop_absent=%.2f",
+            epoch, full_merged["recall@3"], full_merged["precision@3"],
+            full_merged["mean_proposals_per_scene_absent"],
+        )
+
+    # v0.10 §5: bundle the additive per-scene instrumentation for the
+    # history payload. Mean present/absent loss components are NaN when the
+    # val pass saw no scene of that class.
+    instr = {
+        "abs_pos_frac_per_scene": abs_pos_frac_per_scene,
+        "present_loss_component": (
+            present_loss_sum / present_loss_n
+            if present_loss_n > 0 else float("nan")
+        ),
+        "absent_loss_component": (
+            absent_loss_sum / absent_loss_n
+            if absent_loss_n > 0 else float("nan")
+        ),
+    }
+    return epoch_loss, native_merged, full_merged, instr
+
+
+def run_training(cfg: Stage1SegTrainConfig) -> dict:
+    """Train the Stage 1 v0 segmenter end-to-end.
+
+    Sets seeds, builds dataloaders, instantiates ``PureConvSegmenter3D``
+    with the configured bottleneck variant, runs ``cfg.num_epochs`` epochs,
+    saves best checkpoint by val loss, writes train-loss and val
+    Dice-present / IoU-present learning curves.
+
+    Returns a dict with per-epoch lists for everything in the §7.4
+    log lines so the launch session's ``training_history.json``
+    fully captures the v0 metric trajectory.
+    """
+    require_path(cfg.data_root, "data_root")
+    require_path(cfg.output_root, "output_root")
+    torch.manual_seed(cfg.seed)
+    random.seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+
+    output_root = setup_output_dirs(cfg.output_root)
+
+    low_res_pool_t = tuple(int(p) for p in cfg.low_res_pool)
+    detection_ks_t = tuple(int(k) for k in cfg.detection_recall_ks)
+    if int(cfg.secondary_recall_k) not in detection_ks_t:
+        detection_ks_t = detection_ks_t + (int(cfg.secondary_recall_k),)
+    secondary_recall_k = int(cfg.secondary_recall_k)
+    secondary_recall_key = f"recall@{secondary_recall_k}"
+    train_loader, val_loader, datshape = make_dataloaders(
+        data_root=cfg.data_root,
+        subset_size=cfg.subset_size,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        val_split=cfg.val_split,
+        val_split_seed=cfg.val_split_seed,
+        output_resolution=cfg.output_resolution,
+        soft_target=(cfg.loss_target == "soft_gaussian"),
+        low_res_pool=low_res_pool_t,
+    )
+    logger.info(
+        "Train batches: %d, val batches: %d, datshape: %s",
+        len(train_loader), len(val_loader), datshape,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if cfg.model_factory == "v0_8":
+        logger.info(
+            "Device: %s | v0.8 arm=%d | output_resolution=%s | nfeats=%d | "
+            "fusion=%s | stem_stride=%d | dt_init_std=%s | "
+            "gradient_checkpoint=%s | loss_target=%s | use_bf16=%s | "
+            "checkpoint_criterion=%s",
+            device, cfg.arm, cfg.output_resolution, cfg.nfeats,
+            cfg.fusion, cfg.stem_stride, cfg.dt_init_std,
+            cfg.gradient_checkpoint, cfg.loss_target, cfg.use_bf16,
+            cfg.checkpoint_criterion,
+        )
+        model = build_segmenter_v0_8(
+            arm=cfg.arm, nfeats=cfg.nfeats,
+            fusion=cfg.fusion, stem_stride=cfg.stem_stride,
+            dt_init_std=cfg.dt_init_std,
+            gradient_checkpoint=cfg.gradient_checkpoint,
+            pool_factor=low_res_pool_t,
+        ).to(device)
+    elif cfg.model_factory == "v0_7":
+        logger.info(
+            "Device: %s | v0.7 arm=%d | output_resolution=%s | nfeats=%d | "
+            "fusion=%s | stem_stride=%d | dt_init_std=%s | padding_mode=%s | "
+            "loss_target=%s | checkpoint_criterion=%s",
+            device, cfg.arm, cfg.output_resolution, cfg.nfeats,
+            cfg.fusion, cfg.stem_stride, cfg.dt_init_std, cfg.padding_mode,
+            cfg.loss_target, cfg.checkpoint_criterion,
+        )
+        model = build_segmenter_v0_7(
+            arm=cfg.arm, nfeats=cfg.nfeats,
+            fusion=cfg.fusion, stem_stride=cfg.stem_stride,
+            dt_init_std=cfg.dt_init_std, padding_mode=cfg.padding_mode,
+        ).to(device)
+    elif cfg.arm is not None:
+        logger.info(
+            "Device: %s | v0.6 arm=%d | output_resolution=%s | nfeats=%d | "
+            "checkpoint_criterion=%s",
+            device, cfg.arm, cfg.output_resolution, cfg.nfeats,
+            cfg.checkpoint_criterion,
+        )
+        model = build_segmenter_v0_6(arm=cfg.arm, nfeats=cfg.nfeats).to(device)
+    else:
+        logger.info(
+            "Device: %s | bottleneck=%s | temporal=%s | nfeats=%d | "
+            "checkpoint_criterion=%s",
+            device, cfg.bottleneck_variant, cfg.temporal_variant, cfg.nfeats,
+            cfg.checkpoint_criterion,
+        )
+        model = build_segmenter_v0_5(
+            temporal_variant=cfg.temporal_variant,
+            bottleneck_variant=cfg.bottleneck_variant,
+            nfeats=cfg.nfeats,
+        ).to(device)
+
+    # pos_weight is derived from the MASK shape, not the volume shape:
+    # for low-res arms the loss is computed on the (32, 32, 32) mask,
+    # so the per-frame positive count is in the mask's spatial grid.
+    # For full-res arms this is bit-identical to v0/v0.5 (mask spatial
+    # = volume spatial). See stage1_v0_6_design.md §5.3 "Trainer code
+    # change".
+    sample_for_shape = next(iter(train_loader))
+    mask_shape = sample_for_shape["mask"].shape   # (B, 1, T_m, H_m, W_m)
+    H_m, W_m = mask_shape[-2], mask_shape[-1]
+    pos_weight = torch.tensor(
+        [(H_m * W_m) / cfg.target_positive_pixels_per_frame], device=device,
+    )
+    logger.info(
+        "pos_weight = %.2f (mask H_m=%d W_m=%d, target_pos_per_frame=%d)",
+        pos_weight.item(), H_m, W_m, cfg.target_positive_pixels_per_frame,
+    )
+    full_res_metrics = (cfg.output_resolution == "low_res")
+    if cfg.loss_target == "cell_focal":
+        # 512 gate-precision ladder L3 (§4.3): cell-level focal loss on the
+        # 8x8 grid + retained per-voxel pos-weighted BCE aux + head
+        # bias-init to the empirical positive-cell prior.
+        cell_p = _estimate_positive_cell_frequency(
+            train_loader, int(cfg.cell_focal_cell_size),
+        )
+        cell_p = float(min(max(cell_p, 1e-4), 1.0 - 1e-4))
+        head_bias = math.log(cell_p / (1.0 - cell_p))
+        _init_head_bias(model, head_bias)
+        focal_alpha = (
+            cfg.cell_focal_alpha
+            if cfg.cell_focal_alpha is not None
+            else (1.0 - cell_p)
+        )
+        logger.info(
+            "loss_target=cell_focal | aggregation=%s | cell_size=%d | "
+            "pos_cell_freq=%.5f | head_bias_init=%.4f | "
+            "focal_gamma=%.2f focal_alpha=%.4f | aux_weight=%.2f | "
+            "tversky_weight=%.2f (alpha=%.2f beta=%.2f)",
+            cfg.cell_focal_aggregation, cfg.cell_focal_cell_size, cell_p,
+            head_bias, cfg.cell_focal_gamma, focal_alpha,
+            cfg.cell_focal_aux_weight, cfg.cell_focal_tversky_weight,
+            cfg.cell_focal_tversky_alpha, cfg.cell_focal_tversky_beta,
+        )
+        criterion = CellFocalLoss(
+            cell_size=int(cfg.cell_focal_cell_size),
+            gamma=float(cfg.cell_focal_gamma),
+            alpha=float(focal_alpha),
+            aux_weight=float(cfg.cell_focal_aux_weight),
+            pos_weight=pos_weight,
+            tversky_weight=float(cfg.cell_focal_tversky_weight),
+            tversky_alpha=float(cfg.cell_focal_tversky_alpha),
+            tversky_beta=float(cfg.cell_focal_tversky_beta),
+            aggregation=str(cfg.cell_focal_aggregation),
+        ).to(device)
+    else:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = optim.AdamW(
+        _split_optimizer_param_groups(
+            model, cfg.weight_decay, cfg.weight_decay_ssm,
+        ),
+        lr=cfg.lr,
+    )
+    n_ssm_groups = sum(
+        1 for g in optimizer.param_groups
+        if g["weight_decay"] == cfg.weight_decay_ssm
+        and len(g["params"]) > 0
+    )
+    logger.info(
+        "Optimizer: AdamW param groups = %d (with %d non-empty SSM groups "
+        "at weight_decay_ssm=%.4g; non-SSM weight_decay=%.4g)",
+        sum(1 for g in optimizer.param_groups if len(g["params"]) > 0),
+        n_ssm_groups, cfg.weight_decay_ssm, cfg.weight_decay,
+    )
+    plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=cfg.scheduler_factor,
+        patience=cfg.scheduler_patience, min_lr=cfg.min_lr,
+    )
+    if cfg.warmup_epochs > 0:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0,
+            total_iters=cfg.warmup_epochs,
+        )
+        scheduler = _WarmupThenPlateau(
+            warmup=warmup, plateau=plateau, warmup_epochs=cfg.warmup_epochs,
+        )
+        logger.info(
+            "Scheduler: LinearLR warmup (start_factor=0.01, total_iters=%d) "
+            "-> ReduceLROnPlateau(factor=%.2f, patience=%d)",
+            cfg.warmup_epochs, cfg.scheduler_factor, cfg.scheduler_patience,
+        )
+    else:
+        scheduler = plateau
+        logger.info(
+            "Scheduler: ReduceLROnPlateau(factor=%.2f, patience=%d) "
+            "(no warmup)",
+            cfg.scheduler_factor, cfg.scheduler_patience,
+        )
+
+    # v0.10 §4.2 weight EMA (opt-in). Built only when use_ema is True, so
+    # the entire EMA code path is inert by default. The shadow is seeded
+    # lazily at ema_start_epoch (see the epoch loop) so the pre-settle peak
+    # never enters the average.
+    ema = _WeightEMA(cfg.ema_decay) if cfg.use_ema else None
+    if cfg.use_ema:
+        logger.info(
+            "Weight EMA: ENABLED (decay=%.6f, start_epoch=%d; validation + "
+            "checkpointing use EMA weights once accumulation starts)",
+            cfg.ema_decay, cfg.ema_start_epoch,
+        )
+
+    # v0.7 §5.6 per-parameter grad-norm sidecar for the first 10 train
+    # batches. Enabled when gradient_clip_norm is set (the heuristic
+    # for "this is a pure-Mamba run we want to instrument").
+    record_grad_norm_first10 = cfg.gradient_clip_norm is not None
+    grad_norm_sidecar = Path(output_root) / "grad_norms_first10.csv"
+    if record_grad_norm_first10:
+        _write_grad_norm_first10_header(grad_norm_sidecar)
+
+    best_criterion_value = _criterion_initial_value(cfg.checkpoint_criterion)
+    best_criterion_epoch: int | None = None
+    epochs: list[int] = []
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    avg_val_DSC: list[float] = []
+    avg_val_IoU: list[float] = []
+    dice_present: list[float] = []
+    iou_present: list[float] = []
+    vox_p_present: list[float] = []
+    vox_r_present: list[float] = []
+    dice_absent: list[float] = []
+    iou_absent: list[float] = []
+    mean_pos_vox_absent: list[float] = []
+    unsplit_dice: list[float] = []
+    val_recall_at_3: list[float] = []
+    val_precision_at_3: list[float] = []
+    val_mean_proposals_present: list[float] = []
+    val_mean_proposals_absent: list[float] = []
+    val_mean_fp_per_scene: list[float] = []
+    # Phase 2 (§5 item 6) — proposal-centric gate-precision on present
+    # scenes (multi-target-safe; see DetectionEpochAccumulator). Logged
+    # from ep 1, additive — does not perturb any existing series.
+    val_precision_present: list[float] = []
+    val_redundancy_present: list[float] = []
+    # v0.9 §4.6 — additive per-K series for the configured
+    # secondary_recall_k (v0.8 default K=3 → these duplicate recall@3
+    # series byte-identically; v0.9 K=15 → these carry the recall@15
+    # trajectory). Always present in the history payload, named after
+    # the actual K, so analysis scripts can key on the correct K.
+    val_recall_at_secondary: list[float] = []
+    full_val_recall_at_secondary: list[float] = []
+    # v0.6 full-resolution columns (identical to native for full-res arms;
+    # NN-upsampled-derived for low-res arms per §6.2).
+    full_dice_present: list[float] = []
+    full_dice_absent: list[float] = []
+    full_unsplit_dice: list[float] = []
+    full_val_recall_at_3: list[float] = []
+    full_val_precision_at_3: list[float] = []
+    full_val_mean_proposals_absent: list[float] = []
+    full_val_mean_fp_per_scene: list[float] = []
+    # Phase 2 (§5 items 6-7): full-resolution gate-precision. At full
+    # res the configured patch (table value) is exactly 1/8 of field, so
+    # these are the faithful 1024²-localization-precision estimates the
+    # gate verdict reads (native val_precision_present uses the same patch
+    # value on the low-res grid, a coarser fraction).
+    full_val_precision_present: list[float] = []
+    full_val_redundancy_present: list[float] = []
+    # Phase 2 Section A: full-res GRF-cluster coverage recall (the
+    # coverage verdict metric; sourced from full_m).
+    val_cluster_recall: list[float] = []
+    grad_norm_max_per_epoch: list[float] = []
+    walltimes_per_epoch: list[float] = []
+    # v0.10 §5 instrumentation series (additive; do not perturb training).
+    # Per-scene absent abs_pos_frac vector + derived stats (p95 = headline
+    # tail), peak VRAM, effective LR, present/absent loss split.
+    abs_pos_frac_per_scene_per_epoch: list[list[float]] = []
+    abs_pos_frac_mean: list[float] = []
+    abs_pos_frac_std: list[float] = []
+    abs_pos_frac_p50: list[float] = []
+    abs_pos_frac_p90: list[float] = []
+    abs_pos_frac_p95: list[float] = []
+    abs_pos_frac_max: list[float] = []
+    peak_vram_bytes: list[float] = []
+    effective_lr: list[float] = []
+    present_loss_component: list[float] = []
+    absent_loss_component: list[float] = []
+    # v0.8 §5.2 — dp * da per epoch (the new checkpoint criterion's
+    # primary signal, also the v0.8 early-stop check signal).
+    dice_product: list[float] = []
+    # v0.8 secondary checkpoint per the M1 attempt-2 diagnostic
+    # (2026-05-27): track full_recall@3 max and save an independent
+    # checkpoint at that epoch. Tie-break = most recent (>=), so
+    # sustained-plateau trajectories capture the latest weights at
+    # the plateau. Primary best_dice_product checkpoint is NOT
+    # affected; this is purely additive.
+    best_recall_at_3_value: float = -1.0
+    best_recall_at_3_epoch: int | None = None
+    # Gate-aware checkpoint state (see Stage1SegTrainConfig.gate_settle_min_epoch).
+    best_gate_value: float = -1.0
+    best_gate_epoch: int | None = None
+    # Low-res supervision-grid voxel count for abs_pos_frac =
+    # mean_pos_vox_absent / grid_voxels (the §6 scale-invariant absent
+    # fraction). datshape is (C, T, H, W) of the input volume.
+    _lr = tuple(low_res_pool_t)
+    gate_grid_voxels = (
+        (datshape[-3] // _lr[0]) * (datshape[-2] // _lr[1]) * (datshape[-1] // _lr[2])
+    )
+    early_stop_reason: str | None = None
+    incremental_json_path = Path(output_root) / "training_history.json"
+
+    if cfg.use_bf16:
+        logger.info(
+            "bf16 autocast: ENABLED (model forward + loss wrapped; "
+            "parameters fp32; no GradScaler)",
+        )
+
+    for epoch in range(1, cfg.num_epochs + 1):
+        start = time.time()
+        # v0.10 §5 peak-VRAM logging: reset at epoch start, read after val.
+        # Guarded so it no-ops on CPU (CPU smoke runs) and never
+        # crashes a CPU run.
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        # v0.10 §4.2 EMA: seed the shadow once, at ema_start_epoch, before
+        # that epoch's steps; accumulate per-step from then on. Inert when
+        # use_ema is off (ema is None).
+        ema_active = cfg.use_ema and epoch >= cfg.ema_start_epoch
+        if cfg.use_ema and epoch == cfg.ema_start_epoch:
+            ema.initialize(model)
+            logger.info(
+                "[epoch %d] EMA accumulation started (shadow seeded from "
+                "settled-regime weights)", epoch,
+            )
+        train_loss, grad_norm_max = _train_one_epoch(
+            model, device, train_loader, criterion, optimizer, scheduler, epoch,
+            gradient_clip_norm=cfg.gradient_clip_norm,
+            grad_norm_sidecar=grad_norm_sidecar,
+            record_grad_norm_first10=record_grad_norm_first10,
+            use_bf16=cfg.use_bf16,
+            ema=ema, ema_active=ema_active,
+        )
+        grad_norm_max_per_epoch.append(grad_norm_max)
+        # v0.10 §5: effective LR used during the epoch just trained (before
+        # the scheduler steps inside _validate). Sets B's LR-decay shape.
+        eff_lr = float(optimizer.param_groups[0]["lr"])
+        # v0.10 §4.2: validation + checkpointing use the EMA weights once
+        # accumulation has started. apply_shadow stashes the raw weights;
+        # restore (after the checkpoint saves below) puts them back so
+        # training continues from the un-averaged trajectory.
+        if ema_active:
+            ema.apply_shadow(model)
+        val_loss, val_m, full_m, instr = _validate(
+            model, device, val_loader, criterion, scheduler, epoch, output_root,
+            full_res_metrics=full_res_metrics,
+            use_bf16=cfg.use_bf16,
+            detection_ks=detection_ks_t,
+            proposal_patch_h=cfg.proposal_patch_h,
+            proposal_patch_w=cfg.proposal_patch_w,
+            cluster_chip_size=cfg.cluster_chip_size,
+            gate_grid_voxels=gate_grid_voxels,
+        )
+        # Peak VRAM over the train+val of this epoch (NaN on CPU).
+        if torch.cuda.is_available():
+            peak_vram = float(torch.cuda.max_memory_allocated())
+        else:
+            peak_vram = float("nan")
+        epochs.append(epoch)
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        dice_present.append(val_m["dice_present"])
+        iou_present.append(val_m["iou_present"])
+        vox_p_present.append(val_m["vox_p_present"])
+        vox_r_present.append(val_m["vox_r_present"])
+        dice_absent.append(val_m["dice_absent"])
+        iou_absent.append(val_m["iou_absent"])
+        mean_pos_vox_absent.append(val_m["mean_pos_vox_absent"])
+        unsplit_dice_value = 0.5 * val_m["dice_present"] + 0.5 * val_m["dice_absent"]
+        unsplit_dice.append(unsplit_dice_value)
+        # v0.8 §5.2 — dp * da (computed against the hard-binary mask via
+        # the §6.4 mask_hard metric routing). NaN-guards mirror
+        # _criterion_value to keep the series numerically clean for
+        # downstream plateau/catastrophic checks.
+        _dp_e = val_m.get("dice_present", 0.0)
+        _da_e = val_m.get("dice_absent", 0.0)
+        if math.isnan(float(_dp_e)) or math.isnan(float(_da_e)):
+            dice_product.append(0.0)
+        else:
+            dice_product.append(float(_dp_e) * float(_da_e))
+        val_recall_at_3.append(val_m["recall@3"])
+        val_precision_at_3.append(val_m["precision@3"])
+        val_mean_proposals_present.append(val_m["mean_proposals_per_scene_present"])
+        val_mean_proposals_absent.append(val_m["mean_proposals_per_scene_absent"])
+        val_mean_fp_per_scene.append(val_m["mean_fp_per_scene"])
+        val_precision_present.append(val_m["precision_present"])
+        val_redundancy_present.append(val_m["redundancy_present"])
+        val_recall_at_secondary.append(float(val_m.get(secondary_recall_key, float("nan"))))
+        full_dice_present.append(full_m["dice_present"])
+        full_dice_absent.append(full_m["dice_absent"])
+        full_unsplit_dice.append(
+            0.5 * full_m["dice_present"] + 0.5 * full_m["dice_absent"]
+        )
+        full_val_recall_at_3.append(full_m["recall@3"])
+        full_val_precision_at_3.append(full_m["precision@3"])
+        full_val_mean_proposals_absent.append(
+            full_m["mean_proposals_per_scene_absent"]
+        )
+        full_val_mean_fp_per_scene.append(full_m["mean_fp_per_scene"])
+        full_val_precision_present.append(full_m["precision_present"])
+        full_val_redundancy_present.append(full_m["redundancy_present"])
+        val_cluster_recall.append(full_m.get("cluster_recall", float("nan")))
+        full_val_recall_at_secondary.append(float(full_m.get(secondary_recall_key, float("nan"))))
+        # avg_val_DSC / IoU now mean "val target-present Dice/IoU"
+        avg_val_DSC.append(val_m["dice_present"])
+        avg_val_IoU.append(val_m["iou_present"])
+        # v0.10 §5 instrumentation appends (additive; logging only).
+        _aps_vec = list(instr["abs_pos_frac_per_scene"])
+        _aps_stats = _abs_frac_stats(_aps_vec)
+        abs_pos_frac_per_scene_per_epoch.append(_aps_vec)
+        abs_pos_frac_mean.append(_aps_stats["mean"])
+        abs_pos_frac_std.append(_aps_stats["std"])
+        abs_pos_frac_p50.append(_aps_stats["p50"])
+        abs_pos_frac_p90.append(_aps_stats["p90"])
+        abs_pos_frac_p95.append(_aps_stats["p95"])
+        abs_pos_frac_max.append(_aps_stats["max"])
+        peak_vram_bytes.append(peak_vram)
+        effective_lr.append(eff_lr)
+        present_loss_component.append(float(instr["present_loss_component"]))
+        absent_loss_component.append(float(instr["absent_loss_component"]))
+        logger.info(
+            "[epoch %d] instr: abs_pos_frac p95=%.4f max=%.4f mean=%.4f | "
+            "eff_lr=%.6g | peak_vram=%.2f GiB | loss[present=%.4f absent=%.4f]",
+            epoch, _aps_stats["p95"], _aps_stats["max"], _aps_stats["mean"],
+            eff_lr,
+            peak_vram / (1024 ** 3) if peak_vram == peak_vram else float("nan"),
+            float(instr["present_loss_component"]),
+            float(instr["absent_loss_component"]),
+        )
+        candidate_value = _criterion_value(cfg.checkpoint_criterion, val_loss, val_m)
+        if _is_new_best(cfg.checkpoint_criterion, best_criterion_value, candidate_value):
+            best_criterion_value = candidate_value
+            best_criterion_epoch = epoch
+            torch.save(
+                model.state_dict(),
+                Path(output_root) / "models" / "best_stage1_seg_model.pth",
+            )
+            logger.info(
+                "[epoch %d] saved best checkpoint (%s=%.4f)",
+                epoch, cfg.checkpoint_criterion, candidate_value,
+            )
+        # v0.8 secondary checkpoint per the M1 attempt-2 diagnostic.
+        # Uses full_recall@3 (the §8 spec-aligned operational metric)
+        # with >= tie-break so sustained-plateau trajectories save the
+        # latest weights at the plateau. Independent of the primary;
+        # the §8 success criteria don't depend on either checkpoint
+        # choice (they're operational metrics). On v2 1024² arms (H1,
+        # H2, M2) recall@3 is the cluster-centroid hit per §6.3 — the
+        # caveat applies to the saved secondary checkpoint too but
+        # the trajectory is still cleaner than dp*da when absent-side
+        # noise is high.
+        candidate_r3 = float(full_m.get(secondary_recall_key, 0.0))
+        if candidate_r3 >= best_recall_at_3_value:
+            best_recall_at_3_value = candidate_r3
+            best_recall_at_3_epoch = epoch
+            torch.save(
+                model.state_dict(),
+                Path(output_root) / "models" / f"best_stage1_seg_model_by_recall_at_{secondary_recall_k}.pth",
+            )
+            logger.info(
+                "[epoch %d] saved secondary checkpoint (full_%s=%.4f)",
+                epoch, secondary_recall_key, candidate_r3,
+            )
+        # Gate-aware checkpoint + last-epoch fallback (fixes the
+        # transient-spike selection; see config docstring). Additive:
+        # gate_settle_min_epoch=0 disables the gate checkpoint entirely.
+        torch.save(
+            model.state_dict(),
+            Path(output_root) / "models" / "last_epoch_model.pth",
+        )
+        if cfg.gate_settle_min_epoch > 0 and epoch >= cfg.gate_settle_min_epoch:
+            _abs_frac = float(val_m.get("mean_pos_vox_absent", float("inf"))) / gate_grid_voxels
+            _cr = float(full_m.get("cluster_recall", float("nan")))
+            if (_cr == _cr) and (_abs_frac <= cfg.gate_abs_frac_bar) and (_cr > best_gate_value):
+                best_gate_value = _cr
+                best_gate_epoch = epoch
+                torch.save(
+                    model.state_dict(),
+                    Path(output_root) / "models" / "best_gate_model.pth",
+                )
+                logger.info(
+                    "[epoch %d] saved gate checkpoint (cluster_recall=%.4f, "
+                    "abs_pos_frac=%.4f <= %.2f)",
+                    epoch, _cr, _abs_frac, cfg.gate_abs_frac_bar,
+                )
+        # v0.10 §4.2: restore raw (un-averaged) weights now that validation
+        # and all checkpoint saves for this epoch are done, so the next
+        # epoch's training continues from the live trajectory.
+        if ema_active:
+            ema.restore(model)
+        wall = time.time() - start
+        walltimes_per_epoch.append(wall)
+        logger.info("[epoch %d] wall=%.1fs", epoch, wall)
+        # Incremental training_history.json write per §5.5 — atomic via
+        # os.replace so SIGINT loses at most the partial epoch in progress.
+        _atomic_write_json(incremental_json_path, _build_history_payload(
+            cfg, epochs, train_losses, val_losses, avg_val_DSC, avg_val_IoU,
+            dice_present, iou_present, vox_p_present, vox_r_present,
+            dice_absent, iou_absent, mean_pos_vox_absent, unsplit_dice,
+            val_recall_at_3, val_precision_at_3,
+            val_mean_proposals_present, val_mean_proposals_absent,
+            val_mean_fp_per_scene,
+            full_dice_present, full_dice_absent, full_unsplit_dice,
+            full_val_recall_at_3, full_val_precision_at_3,
+            full_val_mean_proposals_absent, full_val_mean_fp_per_scene,
+            grad_norm_max_per_epoch, walltimes_per_epoch,
+            dice_product,
+            best_criterion_epoch, best_criterion_value,
+            best_recall_at_3_epoch, best_recall_at_3_value,
+            early_stop_reason,
+            secondary_recall_k=secondary_recall_k,
+            val_recall_at_secondary=val_recall_at_secondary,
+            full_val_recall_at_secondary=full_val_recall_at_secondary,
+            val_precision_present=val_precision_present,
+            val_redundancy_present=val_redundancy_present,
+            full_val_precision_present=full_val_precision_present,
+            full_val_redundancy_present=full_val_redundancy_present,
+            val_cluster_recall=val_cluster_recall,
+            best_gate_epoch=best_gate_epoch, best_gate_value=best_gate_value,
+            abs_pos_frac_per_scene=abs_pos_frac_per_scene_per_epoch,
+            abs_pos_frac_mean=abs_pos_frac_mean,
+            abs_pos_frac_std=abs_pos_frac_std,
+            abs_pos_frac_p50=abs_pos_frac_p50,
+            abs_pos_frac_p90=abs_pos_frac_p90,
+            abs_pos_frac_p95=abs_pos_frac_p95,
+            abs_pos_frac_max=abs_pos_frac_max,
+            peak_vram_bytes=peak_vram_bytes,
+            effective_lr=effective_lr,
+            present_loss_component=present_loss_component,
+            absent_loss_component=absent_loss_component,
+        ))
+
+        # v0.7 §11.11 trainer-side early-stop. v0.8 configs select
+        # checkpoint_criterion="best_dice_product" and route through the
+        # v0.8 helpers below; v0.7 configs continue to use the v0.7
+        # helpers (their criterion is best_unsplit_dice).
+        if cfg.checkpoint_criterion == "best_dice_product":
+            if _check_v08_catastrophic_dice_product(cfg, dice_product, epoch):
+                early_stop_reason = "EARLY_STOP_CATASTROPHIC"
+                logger.info(
+                    "[epoch %d] EARLY_STOP_CATASTROPHIC: max(dp*da) over "
+                    "first %d epochs = %.6f < floor %.6f",
+                    epoch, cfg.early_stop_min_epoch,
+                    max(dice_product[:cfg.early_stop_min_epoch])
+                    if dice_product else 0.0,
+                    cfg.early_stop_catastrophic_dice_product_floor,
+                )
+                break
+            if _check_v08_relative_plateau(cfg, dice_product, epoch):
+                early_stop_reason = "EARLY_STOP_PLATEAU"
+                logger.info(
+                    "[epoch %d] EARLY_STOP_PLATEAU (v0.8 rel): "
+                    "rolling-5 median gain on dp*da below %.4f x running "
+                    "best %.6f for 10 consecutive epochs",
+                    epoch,
+                    cfg.early_stop_plateau_relative_threshold,
+                    max(dice_product),
+                )
+                break
+            if _check_v08_overfit(
+                cfg, train_losses, val_losses, best_criterion_epoch, epoch,
+            ):
+                early_stop_reason = "EARLY_STOP_OVERFIT"
+                logger.info(
+                    "[epoch %d] EARLY_STOP_OVERFIT: val/train ratio "
+                    "%.1f exceeds threshold %.1f AND best checkpoint "
+                    "epoch %s is %d epochs back",
+                    epoch, val_losses[-1] / max(train_losses[-1], 1e-12),
+                    cfg.early_stop_overfit_train_val_ratio,
+                    best_criterion_epoch,
+                    epoch - (best_criterion_epoch or 0),
+                )
+                break
+        else:
+            if _check_catastrophic_early_stop(cfg, dice_present, epoch):
+                early_stop_reason = "EARLY_STOP_CATASTROPHIC"
+                logger.info(
+                    "[epoch %d] EARLY_STOP_CATASTROPHIC: dice_present below "
+                    "%.4f for %d epochs", epoch,
+                    cfg.early_stop_catastrophic_dice_present_floor,
+                    cfg.early_stop_min_epoch,
+                )
+                break
+            if _check_plateau_early_stop(cfg, unsplit_dice, dice_present, dice_absent, epoch):
+                early_stop_reason = "EARLY_STOP_PLATEAU"
+                window = unsplit_dice[-cfg.early_stop_plateau_window:]
+                rng = max(window) - min(window)
+                logger.info(
+                    "[epoch %d] EARLY_STOP_PLATEAU: best_unsplit_dice=%.4f "
+                    "stable over last %d epochs (range=%.4g)",
+                    epoch, best_criterion_value, cfg.early_stop_plateau_window, rng,
+                )
+                break
+
+    # Train + val BCE loss share an epoch axis and a y-scale, so
+    # plot_perf's two-series call is the natural fit.
+    plot_perf(
+        epochs, train_losses, val_losses, "loss",
+        "BCE loss (train vs val)", output_root,
+    )
+    # Present-only Dice/IoU are val-only by design (§7.4); a
+    # one-off val-only plotter is cleaner than misusing plot_perf.
+    _plot_val_only(epochs, avg_val_DSC, "DSC_present",
+                   "Val target-present Dice-Sorensen Coefficient", output_root)
+    _plot_val_only(epochs, avg_val_IoU, "IoU_present",
+                   "Val target-present Intersection over Union", output_root)
+
+    return _build_history_payload(
+        cfg, epochs, train_losses, val_losses, avg_val_DSC, avg_val_IoU,
+        dice_present, iou_present, vox_p_present, vox_r_present,
+        dice_absent, iou_absent, mean_pos_vox_absent, unsplit_dice,
+        val_recall_at_3, val_precision_at_3,
+        val_mean_proposals_present, val_mean_proposals_absent,
+        val_mean_fp_per_scene,
+        full_dice_present, full_dice_absent, full_unsplit_dice,
+        full_val_recall_at_3, full_val_precision_at_3,
+        full_val_mean_proposals_absent, full_val_mean_fp_per_scene,
+        grad_norm_max_per_epoch, walltimes_per_epoch,
+        dice_product,
+        best_criterion_epoch, best_criterion_value,
+        best_recall_at_3_epoch, best_recall_at_3_value,
+        early_stop_reason,
+        secondary_recall_k=secondary_recall_k,
+        val_recall_at_secondary=val_recall_at_secondary,
+        full_val_recall_at_secondary=full_val_recall_at_secondary,
+        val_precision_present=val_precision_present,
+        val_redundancy_present=val_redundancy_present,
+        full_val_precision_present=full_val_precision_present,
+        full_val_redundancy_present=full_val_redundancy_present,
+        val_cluster_recall=val_cluster_recall,
+        best_gate_epoch=best_gate_epoch, best_gate_value=best_gate_value,
+        abs_pos_frac_per_scene=abs_pos_frac_per_scene_per_epoch,
+        abs_pos_frac_mean=abs_pos_frac_mean,
+        abs_pos_frac_std=abs_pos_frac_std,
+        abs_pos_frac_p50=abs_pos_frac_p50,
+        abs_pos_frac_p90=abs_pos_frac_p90,
+        abs_pos_frac_p95=abs_pos_frac_p95,
+        abs_pos_frac_max=abs_pos_frac_max,
+        peak_vram_bytes=peak_vram_bytes,
+        effective_lr=effective_lr,
+        present_loss_component=present_loss_component,
+        absent_loss_component=absent_loss_component,
+    )
+
+
+def _build_history_payload(
+    cfg, epochs, train_losses, val_losses, avg_val_DSC, avg_val_IoU,
+    dice_present, iou_present, vox_p_present, vox_r_present,
+    dice_absent, iou_absent, mean_pos_vox_absent, unsplit_dice,
+    val_recall_at_3, val_precision_at_3,
+    val_mean_proposals_present, val_mean_proposals_absent,
+    val_mean_fp_per_scene,
+    full_dice_present, full_dice_absent, full_unsplit_dice,
+    full_val_recall_at_3, full_val_precision_at_3,
+    full_val_mean_proposals_absent, full_val_mean_fp_per_scene,
+    grad_norm_max_per_epoch, walltimes_per_epoch,
+    dice_product,
+    best_criterion_epoch, best_criterion_value,
+    best_recall_at_3_epoch, best_recall_at_3_value,
+    early_stop_reason: str | None,
+    *,
+    secondary_recall_k: int = 3,
+    val_recall_at_secondary: list[float] | None = None,
+    full_val_recall_at_secondary: list[float] | None = None,
+    val_precision_present: list[float] | None = None,
+    val_redundancy_present: list[float] | None = None,
+    full_val_precision_present: list[float] | None = None,
+    full_val_redundancy_present: list[float] | None = None,
+    val_cluster_recall: list[float] | None = None,
+    best_gate_epoch: int | None = None,
+    best_gate_value: float | None = None,
+    abs_pos_frac_per_scene: list[list[float]] | None = None,
+    abs_pos_frac_mean: list[float] | None = None,
+    abs_pos_frac_std: list[float] | None = None,
+    abs_pos_frac_p50: list[float] | None = None,
+    abs_pos_frac_p90: list[float] | None = None,
+    abs_pos_frac_p95: list[float] | None = None,
+    abs_pos_frac_max: list[float] | None = None,
+    peak_vram_bytes: list[float] | None = None,
+    effective_lr: list[float] | None = None,
+    present_loss_component: list[float] | None = None,
+    absent_loss_component: list[float] | None = None,
+) -> dict:
+    """Assemble the per-run history dict written to ``training_history.json``.
+
+    Factored out so the incremental writer (§5.5) and the end-of-run
+    writer produce bit-identical payloads.
+    """
+    return {
+        "bottleneck_variant": cfg.bottleneck_variant,
+        "temporal_variant": cfg.temporal_variant,
+        "arm": cfg.arm,
+        "model_factory": cfg.model_factory,
+        "fusion": cfg.fusion,
+        "stem_stride": cfg.stem_stride,
+        "dt_init_std": cfg.dt_init_std,
+        "gradient_clip_norm": cfg.gradient_clip_norm,
+        "warmup_epochs": cfg.warmup_epochs,
+        "output_resolution": cfg.output_resolution,
+        "checkpoint_criterion": cfg.checkpoint_criterion,
+        "loss_target": cfg.loss_target,
+        "use_bf16": cfg.use_bf16,
+        "gradient_checkpoint": cfg.gradient_checkpoint,
+        "use_ema": cfg.use_ema,
+        "ema_decay": cfg.ema_decay,
+        "ema_start_epoch": cfg.ema_start_epoch,
+        "min_lr": cfg.min_lr,
+        "target_positive_pixels_per_frame": cfg.target_positive_pixels_per_frame,
+        "early_stop_reason": early_stop_reason,
+        "epochs": epochs,
+        "train_loss": train_losses,
+        "val_loss": val_losses,
+        "avg_val_DSC": avg_val_DSC,
+        "avg_val_IoU": avg_val_IoU,
+        "dice_present": dice_present,
+        "iou_present": iou_present,
+        "vox_p_present": vox_p_present,
+        "vox_r_present": vox_r_present,
+        "dice_absent": dice_absent,
+        "iou_absent": iou_absent,
+        "mean_pos_vox_absent": mean_pos_vox_absent,
+        "unsplit_dice": unsplit_dice,
+        "val_recall_at_3": val_recall_at_3,
+        "val_precision_at_3": val_precision_at_3,
+        "val_mean_proposals_present": val_mean_proposals_present,
+        "val_mean_proposals_absent": val_mean_proposals_absent,
+        "val_mean_fp_per_scene": val_mean_fp_per_scene,
+        "val_precision_present": (
+            list(val_precision_present) if val_precision_present is not None else []
+        ),
+        "val_redundancy_present": (
+            list(val_redundancy_present) if val_redundancy_present is not None else []
+        ),
+        "full_val_precision_present": (
+            list(full_val_precision_present) if full_val_precision_present is not None else []
+        ),
+        "full_val_redundancy_present": (
+            list(full_val_redundancy_present) if full_val_redundancy_present is not None else []
+        ),
+        "val_cluster_recall": (
+            list(val_cluster_recall) if val_cluster_recall is not None else []
+        ),
+        "best_gate_epoch": best_gate_epoch,
+        "best_gate_cluster_recall": best_gate_value,
+        # v0.10 §5 instrumentation (additive). Per-scene absent abs_pos_frac
+        # vector + derived stats (p95 = headline tail per §7), peak VRAM,
+        # effective LR, present/absent loss split. Empty lists when not
+        # supplied so the schema is uniform across callers.
+        "abs_pos_frac_per_scene": (
+            [list(v) for v in abs_pos_frac_per_scene]
+            if abs_pos_frac_per_scene is not None else []
+        ),
+        "abs_pos_frac_mean": (
+            list(abs_pos_frac_mean) if abs_pos_frac_mean is not None else []
+        ),
+        "abs_pos_frac_std": (
+            list(abs_pos_frac_std) if abs_pos_frac_std is not None else []
+        ),
+        "abs_pos_frac_p50": (
+            list(abs_pos_frac_p50) if abs_pos_frac_p50 is not None else []
+        ),
+        "abs_pos_frac_p90": (
+            list(abs_pos_frac_p90) if abs_pos_frac_p90 is not None else []
+        ),
+        "abs_pos_frac_p95": (
+            list(abs_pos_frac_p95) if abs_pos_frac_p95 is not None else []
+        ),
+        "abs_pos_frac_max": (
+            list(abs_pos_frac_max) if abs_pos_frac_max is not None else []
+        ),
+        "peak_vram_bytes": (
+            list(peak_vram_bytes) if peak_vram_bytes is not None else []
+        ),
+        "effective_lr": (
+            list(effective_lr) if effective_lr is not None else []
+        ),
+        "present_loss_component": (
+            list(present_loss_component) if present_loss_component is not None else []
+        ),
+        "absent_loss_component": (
+            list(absent_loss_component) if absent_loss_component is not None else []
+        ),
+        "full_dice_present": full_dice_present,
+        "full_dice_absent": full_dice_absent,
+        "full_unsplit_dice": full_unsplit_dice,
+        "full_val_recall_at_3": full_val_recall_at_3,
+        "full_val_precision_at_3": full_val_precision_at_3,
+        "full_val_mean_proposals_absent": full_val_mean_proposals_absent,
+        "full_val_mean_fp_per_scene": full_val_mean_fp_per_scene,
+        "grad_norm_max_per_epoch": grad_norm_max_per_epoch,
+        "walltimes_per_epoch": walltimes_per_epoch,
+        "dice_product": dice_product,
+        f"best_epoch_by_{cfg.checkpoint_criterion}": best_criterion_epoch,
+        f"best_{cfg.checkpoint_criterion}_value": best_criterion_value,
+        # v0.8 secondary checkpoint by full_recall@K (additive; result
+        # handoff compares this to the primary best_dice_product
+        # checkpoint per the M1 attempt-2 diagnostic's implication).
+        # K is fixed at 3 in v0.8; v0.9 §4.6 parameterizes via
+        # cfg.secondary_recall_k. The legacy keys (best_epoch_by_recall_at_3,
+        # best_recall_at_3_value) carry the v0.8 K=3 trajectory for analysis
+        # back-compat when K=3; for K!=3 they carry the value at the same K
+        # the secondary checkpoint was selected on (same data; just stored
+        # under the legacy name to preserve schema). New v0.9 keys
+        # use the actual K in the name.
+        "best_epoch_by_recall_at_3": best_recall_at_3_epoch,
+        "best_recall_at_3_value": best_recall_at_3_value,
+        "secondary_recall_k": int(secondary_recall_k),
+        f"best_epoch_by_recall_at_{int(secondary_recall_k)}": best_recall_at_3_epoch,
+        f"best_recall_at_{int(secondary_recall_k)}_value": best_recall_at_3_value,
+        f"val_recall_at_{int(secondary_recall_k)}": (
+            list(val_recall_at_secondary) if val_recall_at_secondary is not None else []
+        ),
+        f"full_val_recall_at_{int(secondary_recall_k)}": (
+            list(full_val_recall_at_secondary) if full_val_recall_at_secondary is not None else []
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Command-line interface (moved here from the scripts/ entry point)
+# ---------------------------------------------------------------------------
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments (see ``main``)."""
+    p = argparse.ArgumentParser(
+        description="Train the Stage 1 v0 / v0.5 pure-conv segmenter.",
+    )
+    p.add_argument("--config", required=True, help="YAML config path.")
+    p.add_argument("--bottleneck_variant", default=None,
+                   help="Override the bottleneck variant (A/B/C/D). "
+                        "v0.5: honored only when temporal_variant='baseline'; "
+                        "held at 'D' otherwise per stage1_v0_5_design.md §2.5.")
+    p.add_argument("--temporal_variant", default=None,
+                   help="Override the v0.5 temporal-axis variant "
+                        "(baseline / wide_t_kernel / delayed_t_pool / "
+                        "dilated_t). Default 'baseline' preserves v0.")
+    p.add_argument("--checkpoint_criterion", default=None,
+                   help="Override the checkpoint-save criterion "
+                        "(best_val_loss / best_unsplit_dice). Default "
+                        "'best_val_loss' preserves v0 behavior; v0.5 "
+                        "configs should set 'best_unsplit_dice'.")
+    p.add_argument("--arm", type=int, default=None,
+                   help="v0.6: arm number (1-4). When set, dispatches "
+                        "to build_segmenter_v0_6 instead of v0.5.")
+    p.add_argument("--output_resolution", default=None,
+                   help="v0.6 dataloader output resolution: 'full' "
+                        "(default, v0/v0.5) or 'low_res' (Arms 2/4).")
+    p.add_argument("--weight_decay_ssm", type=float, default=None,
+                   help="v0.6: weight_decay for SSM parameters. "
+                        "Default 0.0 per design §5.4.")
+    p.add_argument("--model_factory", default=None,
+                   help="v0.7: 'v0_6' (default) or 'v0_7'. v0.7 dispatches "
+                        "to build_segmenter_v0_7 with the v0.7-specific "
+                        "constructor args (fusion, stem_stride, dt_init_std).")
+    p.add_argument("--fusion", default=None,
+                   help="v0.7 Arm 4: 'sum' or 'concat_proj'.")
+    p.add_argument("--stem_stride", type=int, default=None,
+                   help="v0.7 Arm 2: 1 or 2 (stride-2 stem fallback).")
+    p.add_argument("--dt_init_std", type=float, default=None,
+                   help="v0.7: Mamba dt init std override; null preserves "
+                        "library default.")
+    p.add_argument("--gradient_clip_norm", type=float, default=None,
+                   help="v0.7: enable gradient clipping at this norm.")
+    p.add_argument("--warmup_epochs", type=int, default=None,
+                   help="v0.7: LinearLR warmup epoch count (0 disables).")
+    p.add_argument("--early_stop_min_epoch", type=int, default=None,
+                   help="v0.7 §11.11: earliest epoch at which early-stop "
+                        "checks fire. 999 disables.")
+    p.add_argument("--loss_target", default=None,
+                   help="v0.8: 'hard_binary' (default) or 'soft_gaussian'. "
+                        "Selects the loss target geometry per §3.2.")
+    p.add_argument("--use_bf16", type=int, default=None,
+                   help="v0.8: 1 to enable bf16 autocast on model "
+                        "forward + loss, 0 to disable. Default 0.")
+    p.add_argument("--gradient_checkpoint", type=int, default=None,
+                   help="v0.8: 1 to enable per-block gradient "
+                        "checkpointing, 0 to disable. Default 0.")
+    p.add_argument("--target_positive_pixels_per_frame", type=int, default=None,
+                   help="Per-frame positive-voxel count anchor for the "
+                        "BCE-with-logits pos_weight derivation. The "
+                        "v0.8 grid sweep uses this CLI override.")
+    p.add_argument("--secondary_recall_k", type=int, default=None,
+                   help="v0.9 §4.6: K for the secondary checkpoint "
+                        "best_recall_at_K. Default 3 preserves v0.8 "
+                        "behavior; v0.9 configs set 15.")
+    p.add_argument("--data_root", default=None)
+    p.add_argument("--output_root", default=None)
+    p.add_argument("--subset_size", type=int, default=None)
+    p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--num_epochs", type=int, default=None)
+    p.add_argument("--num_workers", type=int, default=None)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--proposal_patch_h", type=int, default=None,
+                   help="Phase 2 §5 item 7: proposal-patch height in input "
+                        "voxels (1/8 of field: 16/32/64/128 at "
+                        "128/256/512/1024²). Default 128.")
+    p.add_argument("--proposal_patch_w", type=int, default=None,
+                   help="Phase 2 §5 item 7: proposal-patch width in input "
+                        "voxels (see --proposal_patch_h).")
+    p.add_argument("--cluster_chip_size", type=int, default=None,
+                   help="Phase 2 Section A: full-res chip size (input "
+                        "voxels) for val_cluster_recall (32 @128², 128 "
+                        "@512²/1024²).")
+    p.add_argument("--gate_settle_min_epoch", type=int, default=None,
+                   help="Gate-aware checkpoint: min epoch for the settled "
+                        "regime; best_gate_model.pth = max cluster_recall "
+                        "among epochs >= this with abs_pos_frac <= bar. "
+                        "0 disables.")
+    p.add_argument("--gate_abs_frac_bar", type=float, default=None,
+                   help="abs_pos_frac ceiling for gate-checkpoint eligibility "
+                        "(default 0.25).")
+    add_root_args(p, ('data', 'runs'))
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Train the gate from a YAML config with optional overrides.
+
+    Args:
+        argv: Argument list (default: ``sys.argv[1:]``).
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    args = _parse_args(argv)
+    with open(args.config) as f:
+        cfg_dict = yaml.safe_load(f)
+    if getattr(args, "data_root", None):
+        cfg_dict.pop("dataset", None)
+    if getattr(args, "output_root", None):
+        cfg_dict.pop("run_name", None)
+    resolve_config_paths(cfg_dict, args.data_root_dir, args.runs_root_dir)
+
+    for k in ("bottleneck_variant", "temporal_variant", "checkpoint_criterion",
+              "arm", "output_resolution", "weight_decay_ssm",
+              "model_factory", "fusion", "stem_stride", "dt_init_std",
+              "gradient_clip_norm", "warmup_epochs", "early_stop_min_epoch",
+              "loss_target", "target_positive_pixels_per_frame",
+              "data_root", "output_root", "subset_size", "batch_size",
+              "num_epochs", "num_workers", "seed",
+              "secondary_recall_k",
+              "proposal_patch_h", "proposal_patch_w", "cluster_chip_size",
+              "gate_settle_min_epoch", "gate_abs_frac_bar"):
+        v = getattr(args, k, None)
+        if v is not None:
+            cfg_dict[k] = v
+    # bool overrides via 0/1 int (argparse can't do tristate bool).
+    for k in ("use_bf16", "gradient_checkpoint"):
+        v = getattr(args, k, None)
+        if v is not None:
+            cfg_dict[k] = bool(v)
+
+    cfg = Stage1SegTrainConfig(**cfg_dict)
+    result = run_training(cfg)
+
+    out = Path(cfg.output_root)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "training_history.json").write_text(
+        json.dumps(result, indent=2, default=str),
+    )
+    best_key = f"best_{cfg.checkpoint_criterion}_value"
+    best_epoch_key = f"best_epoch_by_{cfg.checkpoint_criterion}"
+    logging.info(
+        "Done. bottleneck=%s temporal=%s %s=%.4f@epoch=%s "
+        "final val Dice=%.4f final val IoU=%.4f",
+        cfg.bottleneck_variant, cfg.temporal_variant,
+        cfg.checkpoint_criterion,
+        result[best_key],
+        result.get(best_epoch_key),
+        result["avg_val_DSC"][-1] if result["avg_val_DSC"] else float("nan"),
+        result["avg_val_IoU"][-1] if result["avg_val_IoU"] else float("nan"),
+    )
+
+
+if __name__ == "__main__":
+    main()

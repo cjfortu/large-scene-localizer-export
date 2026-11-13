@@ -1,0 +1,1 @@
+"""Synthetic swarm-video generator (pure NumPy; no torch dependency)."""

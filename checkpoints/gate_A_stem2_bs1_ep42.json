@@ -1,0 +1,110 @@
+{
+  "name": "gate_A_stem2_bs1_ep42",
+  "file": "gate_A_stem2_bs1_ep42.pth",
+  "role": "gate (Stage 1, v0.10 Arm A, no-stabilizer recipe)",
+  "sha256": "d741b42d3c4eabf0f60021becd63b21e18a0bdf995fb1b8f02cffb347fd08cdb",
+  "bytes": 14357593,
+  "safetensors_sha256": "eb7932b53ec34ed931db94eddbd2cade5dfa0490d825a49538cd3ad826019a3e",
+  "safetensors_bytes": 14337404,
+  "epoch": 42,
+  "selection_criterion": "gate criterion: max val cluster_recall subject to absent-scene abs_pos_frac_mean <= 0.25 (train.log: 'saved gate checkpoint (cluster_recall=0.8510, abs_pos_frac=0.1346 <= 0.25)')",
+  "config_path": "configs/gate/A_stem2_bs1.yaml",
+  "config_path_at_training": "configs/stage1_v0_10_A_stem2_bs1.yaml",
+  "config_commit": "5ced936",
+  "config_note": "config_path is the current equivalent of config_path_at_training (same hyperparameters; dataset/run locations made relative).",
+  "source_path": "<runs root>/runs/stage1_v0_10/A/models/best_gate_model.pth",
+  "train_start": "2026-06-19T15:18:42-04:00",
+  "host": "gb10-node-1 (NVIDIA GB10, aarch64)",
+  "torch": "2.12.0.dev20260322+cu128",
+  "mamba_ssm": "2.3.1",
+  "causal_conv1d": "1.6.1",
+  "dataset": "multi_target_swarm_512x512x64 (3000 scenes; 2700/300 train/val; val_split 0.1, seed 0)",
+  "model_build": {
+    "factory": "build_segmenter_v0_7",
+    "arm": 2,
+    "nfeats": 32,
+    "fusion": "sum",
+    "stem_stride": 2,
+    "dt_init_std": null,
+    "output_resolution": "low_res",
+    "low_res_pool": [
+      2,
+      4,
+      4
+    ]
+  },
+  "val_metrics": {
+    "val_cluster_recall": 0.851,
+    "abs_pos_frac_mean": 0.1346,
+    "val_mean_fp_per_scene": 40.19,
+    "unsplit_dice": 0.3622,
+    "dice_present": 0.1878,
+    "val_recall_at_3": 0.6881,
+    "peak_vram_bytes": 8648129536,
+    "percell_rescore_k1": {
+      "per_cell_recall_strict": 0.9485,
+      "absent_cells_flagged_rate64_mean": 0.4024,
+      "caught_rate": 1.0,
+      "source": "analysis/stage1_v0_10_percell/rescore.json"
+    },
+    "system_with_classifier": {
+      "per_target_group_recall": 0.9486,
+      "caught": 3930,
+      "total_targets": 4143,
+      "gate_miss": 27,
+      "stage2_reject": 186,
+      "source": "analysis/stage1_v0_10_percell/per_target_recall.json"
+    }
+  },
+  "notes": "Raw state_dict (78 tensors, 3,582,633 params); no metadata inside the file. sha256 is the identity. Stem keys are down1.down.* (stem_stride=2); not drop-in compatible with stem_stride=1 checkpoints.",
+  "inferred_fields": {
+    "config_commit": "last commit touching the config before launch (git log); not recorded in the run dir",
+    "host": "from runs/stage1_v0_10/launch_manifest.txt",
+    "torch/mamba_ssm/causal_conv1d": "pip freeze of gb10-node-1 localizer env on 2026-11-05; newest dist-info mtime 2026-05-22 predates the run, so taken as the training stack",
+    "epoch": "train.log save line timestamp matches file mtime to the second; rescore.json gate_epoch=42"
+  },
+  "promoted": "2026-11-05",
+  "reproduced_on_x86": {
+    "date": "2026-11-05",
+    "platform": "Linux x86-64, NVIDIA RTX PRO 5000 Blackwell (24 GB), driver 595.84",
+    "environment": "Tier 1: Python 3.11.18, torch 2.12.0+cu130, mamba_ssm 2.3.2.post1, causal_conv1d 1.6.2.post1, numpy 2.4.6 (requirements/cuda-linux-x86_64.txt)",
+    "code_commit": "dfd6b28 plus scripts/segmenter/evaluate.py (committed with this record)",
+    "status": "reproduced exactly",
+    "per_cell_rescore": {
+      "command": "python scripts/gate/rescore_percell.py --gate-ckpt A=gate_A_stem2_bs1_ep42.pth --out rescore.json",
+      "cuda_kernels": {
+        "per_cell_recall_strict_k1": 0.9484978540772532,
+        "absent_cells_flagged_rate64_mean_k1": 0.4024390243902439,
+        "caught_rate_k1": 1.0,
+        "delta_vs_original_all_k": 0.0
+      },
+      "pure_pytorch_reference_LSL_FORCE_MAMBA_REF_1": {
+        "per_cell_recall_strict_k1": 0.9484978540772532,
+        "absent_cells_flagged_rate64_mean_k1": 0.4024390243902439,
+        "caught_rate_k1": 1.0,
+        "delta_vs_original_all_k": 0.0
+      }
+    },
+    "system_with_classifier": {
+      "chip_system_recall": 0.7146757679180887,
+      "per_target_group_recall": 0.9485879797248371,
+      "caught": 3930,
+      "total_groups": 4143,
+      "gate_miss": 27,
+      "classifier_reject": 186,
+      "fp_per_scene_absent_mean": 0.0,
+      "delta_vs_original": "0 on every field"
+    },
+    "backend_logit_drift": "CUDA kernels vs pure-PyTorch reference, first 30 val scenes: max |delta logit| 0.0047-0.184 (logits up to ~1795 in magnitude); 216 of 15.7M voxels flip at threshold 0.5; no per-cell decision changes.",
+    "tolerance_proposed": "see validation record; binarized cell/system metrics reproduced with zero delta on both backends",
+    "recheck_rebuilt_wheels": {
+      "date": "2026-11-06",
+      "wheels": "mamba_ssm 2.3.2.post1 and causal_conv1d 1.6.2.post1 rebuilt from the PyPI sdists with the CUDA 13.0 toolkit against torch 2.12.0+cu130 (requirements/wheels.sha256); the 2026-11-05 run used CUDA 12.8 builds",
+      "environment": "Tier 1 env rebuilt from requirements/cuda-linux-x86_64.txt + wheels/",
+      "status": "reproduced exactly",
+      "tests": "241 passed, 2 skipped (the 1024^2 tests)",
+      "per_cell_rescore_cuda_kernels": "identical to the original on every field, all k",
+      "system_with_classifier": "identical to the original on every field (per-target(group) recall 0.9485879797248371, 3930/4143, gate_miss 27, classifier_reject 186)"
+    }
+  }
+}

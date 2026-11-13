@@ -1,0 +1,73 @@
+# multi_target_swarm_512_v2 -- 512x512x64 GRF-clustered multi-target dataset.
+#
+# Phase 2 (gate-precision collapse-onset study) 512² rung. Generated to
+# hold PER-PIXEL TARGET DENSITY EQUAL to multi_target_swarm_1024_v2
+# (~6.5e-5, ~68 targets/present-scene at 1024² -> ~17 at 512²), so field
+# size is the only axis vs the K1 (128² clean) and v0.7 (1024² collapsed)
+# endpoints. Spec: stage1_hybrid_collapse_isolation_diagnostic_spec.md
+# § Phase 2.
+#
+# Density is preserved automatically by keeping the chip structure
+# identical (chip_size=128, ~4 targets/non-empty chip, ~26% non-empty
+# chips) and only shrinking the field 1024²->512² (64->16 chips): target
+# count scales with chip count = area, so targets/pixel is invariant.
+# Everything below is copied verbatim from multi_target_swarm_1024_v2.yaml
+# EXCEPT image_size (1024->512) and n_circles (background scaled by chip
+# count: 30000/chip x 16 chips = 480000, was 1920000 for 64 chips).
+
+n_frames: 64
+image_size: [512, 512]
+shape: square
+square_edge: 2          # 2x2 footprint -- FIXED at all resolutions (both specs)
+radius: 2
+
+# Velocity scales LINEARLY with resolution (px/frame is an absolute-pixel
+# quantity): 128² [0.0625,0.125,0.25] -> 1024² [0.5,1,2] is 8x over 8x
+# field. 512² = 4x the 128² values (= half the 1024² values).
+speeds: [0.25, 0.5, 1.0]
+samedir: true
+
+# Background swarm density -- 30000 per 128² chip x 16 chips (512² = 4x4
+# chip grid). Was 1920000 (64 chips) at 1024². Holds background density
+# per chip constant.
+n_circles: 480000
+
+# chip_size 128 -> 4x4 chip grid at 512² (512/128). This keeps the
+# 1024² v2 CHIP PHYSICS IDENTICAL (same 128px chips, same per-chip count
+# distribution), so 512² is literally a 4x4 sub-tile of the 1024² 8x8
+# grid -> per-pixel density is exactly the 1024² value with zero retune.
+target_sampler: grf_cluster
+chip_size: 128
+
+# Per-scene non-empty-chip fraction p ~ Beta(2,5) scaled to [1/10, 2/3].
+grf_fraction_range: [0.1, 0.6666666666666666]
+grf_fraction_beta: [2.0, 5.0]
+
+# GRF correlation length is held at a FIXED FRACTION of the field
+# (0.1875 = corr/grid), per the 128²/1024² specs jointly:
+#   1024² 8x8 grid, corr 1.5  -> 1.5/8  = 0.1875
+#   128²  4x4 grid, corr 0.75 -> 0.75/4 = 0.1875
+# 512² uses a 4x4 grid (chip 128), so corr = 0.1875 * 4 = 0.75 (NOT 1.5,
+# which would give 0.375 = double the canonical cluster-as-fraction).
+grf_corr_length: [0.75, 0.75]
+grf_jitter: 0.000001
+
+# Per-chip target count [1,10] -- IDENTICAL to 1024² v2 (NOT the 128²
+# [1,3]). With chip 128 + 4x4 grid this reproduces the 1024² per-pixel
+# density (~6.5e-5, ~17 targets/present-scene = 1/4 of 1024²'s ~68 at
+# 1/4 the area), which is the Phase 2 density anchor.
+grf_count_range: [1, 10]
+grf_count_noise_sigma: 1.0
+
+grf_absent_modulo: 4
+
+total_scenes: 3000
+save_gifs: false
+fps: 10
+
+batch_size: 50
+num_workers: 8
+
+# Output: <data root>/<dataset>; data root from --data-root or $LSL_DATA_ROOT
+# (or an absolute --output_root).
+dataset: multi_target_swarm_512x512x64

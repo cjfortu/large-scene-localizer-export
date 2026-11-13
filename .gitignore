@@ -1,0 +1,50 @@
+# Generated data (large, do not commit)
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.eggs/
+
+# Environment
+.env
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+/data/
+__pycache__/
+*.pyc 
+*.egg-info/ 
+dist/ 
+build/ 
+.eggs/ 
+*.npy
+*.mp4
+
+# Training artifacts (large, do not commit)
+# Weight files are not tracked; their <name>.json manifests are.
+/checkpoints/*
+!/checkpoints/*.json
+/runs/
+/logs/
+/analysis/
+/archive/
+/diagnostics/
+*.log
+
+# Model checkpoints
+*.pt
+*.pth
+.claude/
+
+# Locally built wheels (never tracked or shipped; the Tier 1 kernels are source pins)
+wheels/

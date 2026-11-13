@@ -1,0 +1,277 @@
+"""Volumetric segmentation training loop (recovered from earlier Stage 2 work).
+
+Combines cells [14] (train), [15] (validate), [17] (main), [19] (driver)
+from ``Vol_Seg.ipynb`` into a single library function ``run_training`` that
+the CLI (``main`` below; ``scripts/segmenter/train.py``) calls.
+
+Loss: ``BCEWithLogitsLoss(pos_weight=...)`` where
+``pos_weight = (H * W) / target_positive_pixels_per_frame`` from config —
+the original engineer's formula. Defaults give ~1260 for a 128x128 frame
+with a radius-2 disk (~13 positive pixels).
+
+Optimizer: ``AdamW(lr, weight_decay)``. Scheduler:
+``ReduceLROnPlateau(mode='min', factor, patience)`` on val loss.
+Best checkpoint by val loss. Per-epoch logs for loss / Dice / IoU / LR / wall.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import yaml
+
+import logging
+import random
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from localizer.common.paths import add_root_args, resolve_config_paths, require_path
+from localizer.common.data import make_dataloaders, setup_output_dirs
+from localizer.common.metrics import get_dice_batch_sum, get_iou_batch_sum
+from localizer.segmenter.model import VolumetricUNet
+from localizer.common.plotting import data_saver, plot_perf
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class VolsegTrainConfig:
+    """Training hyperparameters; populated from a YAML config + CLI overrides."""
+
+    seed: int = 0
+    nfeats: int = 32
+    target_positive_pixels_per_frame: int = 13
+    lr: float = 1e-3
+    weight_decay: float = 1e-2
+    scheduler_factor: float = 0.5
+    scheduler_patience: int = 10
+    batch_size: int = 8
+    num_epochs: int = 150
+    subset_size: int = 2500
+    data_root: str | None = None  # required; from the config `dataset:` key
+    val_split: float = 0.1
+    val_split_seed: int = 0
+    output_root: str | None = None  # required; from the config `run_name:` key
+    num_workers: int = 4
+
+
+def _train_one_epoch(model, device, train_loader, criterion, optimizer, scheduler, epoch):
+    """Train loop body for one epoch. Returns (loss, Dice, IoU)."""
+    model.train()
+    running_loss = 0.0
+    dice_batch_sum = torch.tensor(0.0, device=device)
+    iou_batch_sum = torch.tensor(0.0, device=device)
+    for sample in train_loader:
+        input = sample["volume"].to(device)
+        masks = sample["mask"].to(device)
+        optimizer.zero_grad()
+        outputs = model(input)
+        loss = criterion(outputs, masks)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item() * input.size(0)
+        dice_batch_sum += get_dice_batch_sum(outputs, masks)
+        iou_batch_sum += get_iou_batch_sum(outputs, masks)
+    epoch_loss = running_loss / len(train_loader.dataset)
+    dice_avg = dice_batch_sum / len(train_loader.dataset)
+    iou_avg = iou_batch_sum / len(train_loader.dataset)
+    logger.info(
+        "[epoch %d] train: loss=%.4f dice=%.4f iou=%.4f lr=%.6f",
+        epoch, epoch_loss, dice_avg, iou_avg, scheduler.get_last_lr()[0],
+    )
+    return epoch_loss, dice_avg, iou_avg
+
+
+def _validate(model, device, val_loader, criterion, scheduler, epoch, output_root):
+    """Validation loop body. Returns (loss, Dice, IoU); steps scheduler."""
+    model.eval()
+    val_loss = 0.0
+    dice_batch_sum = torch.tensor(0.0, device=device)
+    iou_batch_sum = torch.tensor(0.0, device=device)
+    saved_1 = False
+    saved_0 = False
+    with torch.no_grad():
+        for sample in val_loader:
+            videos = sample["volume"].to(device)
+            masks = sample["mask"].to(device)
+            label = int(sample["label"][0])
+            outputs = model(videos)
+            loss = criterion(outputs, masks)
+            val_loss += loss.item() * videos.size(0)
+            if label == 1 and not saved_1:
+                data_saver(videos, outputs, masks, output_root, label, epoch)
+                saved_1 = True
+            elif label == 0 and not saved_0:
+                data_saver(videos, outputs, masks, output_root, label, epoch)
+                saved_0 = True
+            dice_batch_sum += get_dice_batch_sum(outputs, masks)
+            iou_batch_sum += get_iou_batch_sum(outputs, masks)
+    epoch_loss = val_loss / len(val_loader.dataset)
+    dice_avg = dice_batch_sum / len(val_loader.dataset)
+    iou_avg = iou_batch_sum / len(val_loader.dataset)
+    scheduler.step(epoch_loss)
+    logger.info(
+        "[epoch %d] val:   loss=%.4f dice=%.4f iou=%.4f",
+        epoch, epoch_loss, dice_avg, iou_avg,
+    )
+    return epoch_loss, dice_avg, iou_avg
+
+
+def run_training(cfg: VolsegTrainConfig) -> dict:
+    """Train the volumetric segmenter end-to-end.
+
+    Sets seeds, builds dataloaders, instantiates model + loss + optimizer +
+    scheduler, runs ``cfg.num_epochs`` epochs, saves best checkpoint by val
+    loss, writes learning-curve CSVs + PNGs.
+
+    Returns dict with epochs / per-epoch Dice / IoU / best val loss.
+    """
+    require_path(cfg.data_root, "data_root")
+    require_path(cfg.output_root, "output_root")
+    # Seeds (framework-level RNGs). By project convention, dataset/generator code
+    # uses numpy.random.Generator instances and does not depend on the
+    # legacy global np.random.seed call.
+    torch.manual_seed(cfg.seed)
+    random.seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+
+    output_root = setup_output_dirs(cfg.output_root)
+
+    train_loader, val_loader, datshape = make_dataloaders(
+        data_root=cfg.data_root,
+        subset_size=cfg.subset_size,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        val_split=cfg.val_split,
+        val_split_seed=cfg.val_split_seed,
+    )
+    logger.info(
+        "Train batches: %d, val batches: %d, datshape: %s",
+        len(train_loader), len(val_loader), datshape,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Device: %s", device)
+    model = VolumetricUNet(cfg.nfeats).to(device)
+
+    # pos_weight per the original engineer's formula:
+    #   pos_weight = (H * W * T) / (target_positive_pixels_per_frame * T)
+    #              = (H * W) / target_positive_pixels_per_frame
+    H, W = datshape[-2], datshape[-1]
+    pos_weight = torch.tensor(
+        [(H * W) / cfg.target_positive_pixels_per_frame], device=device,
+    )
+    logger.info("pos_weight = %.2f", pos_weight.item())
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=cfg.scheduler_factor, patience=cfg.scheduler_patience,
+    )
+
+    best_val_loss = float("inf")
+    epochs: list[int] = []
+    avg_trn_DSC: list = []
+    avg_val_DSC: list = []
+    avg_trn_IoU: list = []
+    avg_val_IoU: list = []
+    for epoch in range(1, cfg.num_epochs + 1):
+        start = time.time()
+        train_loss, train_dice, train_iou = _train_one_epoch(
+            model, device, train_loader, criterion, optimizer, scheduler, epoch,
+        )
+        val_loss, val_dice, val_iou = _validate(
+            model, device, val_loader, criterion, scheduler, epoch, output_root,
+        )
+        epochs.append(epoch)
+        avg_trn_DSC.append(train_dice)
+        avg_val_DSC.append(val_dice)
+        avg_trn_IoU.append(train_iou)
+        avg_val_IoU.append(val_iou)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(
+                model.state_dict(), Path(output_root) / "models" / "best_3d_unet_model.pth",
+            )
+            logger.info("[epoch %d] saved best checkpoint (val_loss=%.4f)", epoch, val_loss)
+        logger.info("[epoch %d] wall=%.1fs", epoch, time.time() - start)
+
+    plot_perf(epochs, avg_trn_DSC, avg_val_DSC, "DSC", "Dice-Sorensen Coefficient", output_root)
+    plot_perf(epochs, avg_trn_IoU, avg_val_IoU, "IoU", "Intersection over Union", output_root)
+    return {
+        "epochs": epochs,
+        "avg_trn_DSC": [float(d.cpu()) if hasattr(d, "cpu") else d for d in avg_trn_DSC],
+        "avg_val_DSC": [float(d.cpu()) if hasattr(d, "cpu") else d for d in avg_val_DSC],
+        "avg_trn_IoU": [float(d.cpu()) if hasattr(d, "cpu") else d for d in avg_trn_IoU],
+        "avg_val_IoU": [float(d.cpu()) if hasattr(d, "cpu") else d for d in avg_val_IoU],
+        "best_val_loss": best_val_loss,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Command-line interface (moved here from the scripts/ entry point)
+# ---------------------------------------------------------------------------
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments (see ``main``)."""
+    p = argparse.ArgumentParser(description="Train the volumetric segmenter.")
+    p.add_argument("--config", required=True, help="YAML config path.")
+    p.add_argument("--data_root", default=None)
+    p.add_argument("--output_root", default=None)
+    p.add_argument("--subset_size", type=int, default=None)
+    p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--num_epochs", type=int, default=None)
+    p.add_argument("--num_workers", type=int, default=None)
+    p.add_argument("--seed", type=int, default=None)
+    add_root_args(p, ('data', 'runs'))
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Train the segmenter from a YAML config with optional overrides.
+
+    Args:
+        argv: Argument list (default: ``sys.argv[1:]``).
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    args = _parse_args(argv)
+    with open(args.config) as f:
+        cfg_dict = yaml.safe_load(f)
+    if getattr(args, "data_root", None):
+        cfg_dict.pop("dataset", None)
+    if getattr(args, "output_root", None):
+        cfg_dict.pop("run_name", None)
+    resolve_config_paths(cfg_dict, args.data_root_dir, args.runs_root_dir)
+
+    for k in ("data_root", "output_root", "subset_size", "batch_size",
+              "num_epochs", "num_workers", "seed"):
+        v = getattr(args, k, None)
+        if v is not None:
+            cfg_dict[k] = v
+
+    cfg = VolsegTrainConfig(**cfg_dict)
+    result = run_training(cfg)
+
+    out = Path(cfg.output_root)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "training_history.json").write_text(json.dumps(result, indent=2, default=str))
+    logging.info(
+        "Done. best_val_loss=%.4f, final val Dice=%.4f, final val IoU=%.4f",
+        result["best_val_loss"],
+        result["avg_val_DSC"][-1] if result["avg_val_DSC"] else float("nan"),
+        result["avg_val_IoU"][-1] if result["avg_val_IoU"] else float("nan"),
+    )
+
+
+if __name__ == "__main__":
+    main()

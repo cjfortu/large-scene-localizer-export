@@ -1,0 +1,43 @@
+"""Dice and IoU batch-sum metrics (extracted from Vol_Seg.ipynb cells [10] and [12]).
+
+Both functions return per-batch *sums* (not means). The training and
+validation loops average by total sample count at the end of each epoch
+— the original convention is preserved verbatim.
+"""
+
+import torch
+
+
+def get_dice_batch_sum(outputs: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+    """Sum of per-sample Dice-Sorensen coefficients over a batch.
+
+    Args:
+        outputs: ``(B, 1, T, H, W)`` model logits.
+        masks: ``(B, 1, T, H, W)`` ground-truth masks (float).
+
+    Returns:
+        Scalar tensor — sum of per-sample Dice scores.
+    """
+    smooth = 1.0e-6
+    preds = (torch.sigmoid(outputs) > 0.5).float()
+    truths = (masks > 0.5).float()
+    preds = preds.contiguous().view(preds.size(0), -1)
+    truths = truths.contiguous().view(truths.size(0), -1)
+    intersection = (preds * truths).sum(dim=1)
+    preds_sum = preds.sum(dim=1)
+    truths_sum = truths.sum(dim=1)
+    dice_batch_sum = ((2. * intersection + smooth) / (preds_sum + truths_sum + smooth)).sum()
+    return dice_batch_sum
+
+
+def get_iou_batch_sum(outputs: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+    """Sum of per-sample IoU scores over a batch."""
+    smooth = 1.0e-6
+    preds = (torch.sigmoid(outputs) > 0.5).float()
+    truths = (masks > 0.5).float()
+    preds = preds.contiguous().view(preds.size(0), -1)
+    truths = truths.contiguous().view(truths.size(0), -1)
+    intersection = (preds * truths).sum(dim=1)
+    union = preds.sum(dim=1) + truths.sum(dim=1) - intersection
+    iou_batch_sum = ((intersection + smooth) / (union + smooth)).sum()
+    return iou_batch_sum

@@ -1,0 +1,104 @@
+"""Determinism tests for worker(seed=start_idx).
+
+Verifies the legacy "seed = start_idx" convention:
+- Same args -> same bytes.
+- Same scene IDs under different batch boundaries can produce different
+  bytes for later scenes in the batch (documented intra-batch
+  determinism, cross-batch dependence).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import shutil
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+from localizer.synth.swarm import DataGenerator, worker  # noqa: E402
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _make_gen(tmp_path: Path) -> DataGenerator:
+    return DataGenerator(
+        n_frames=4,
+        n_circles=20,
+        image_size=(16, 16),
+        radius=2,
+        speeds=[0.25],
+        dat_lab_paths=[tmp_path / "data_all", tmp_path / "label_msk"],
+        samedir=True,
+        shape="square",
+        square_edge=2,
+    )
+
+
+def _hash_run(tmp_path: Path) -> dict:
+    """Return a dict {filename: sha256} of all vid*.npy files."""
+    out = {}
+    for sub in ("data_all", "label_msk"):
+        d = tmp_path / sub
+        for p in sorted(d.glob("vid*.npy")):
+            out[f"{sub}/{p.name}"] = _sha256(p)
+    return out
+
+
+def test_same_args_same_bytes(tmp_path: Path) -> None:
+    """Re-running with identical args produces identical bytes."""
+    run_a = tmp_path / "run_a"
+    run_b = tmp_path / "run_b"
+
+    gen = _make_gen(run_a)
+    worker(start_idx=0, batch_size=4, generator=gen, save_gifs=False)
+    hashes_a = _hash_run(run_a)
+
+    gen = _make_gen(run_b)
+    worker(start_idx=0, batch_size=4, generator=gen, save_gifs=False)
+    hashes_b = _hash_run(run_b)
+
+    assert hashes_a == hashes_b
+
+
+def test_batch_boundary_changes_later_scenes(tmp_path: Path) -> None:
+    """Splitting a 4-scene run into two 2-scene batches changes scenes 2-3."""
+    run_full = tmp_path / "run_full"
+    run_split = tmp_path / "run_split"
+
+    gen = _make_gen(run_full)
+    worker(start_idx=0, batch_size=4, generator=gen, save_gifs=False)
+    hashes_full = _hash_run(run_full)
+
+    gen = _make_gen(run_split)
+    worker(start_idx=0, batch_size=2, generator=gen, save_gifs=False)
+    worker(start_idx=2, batch_size=2, generator=gen, save_gifs=False)
+    hashes_split = _hash_run(run_split)
+
+    # Scenes 0-1: both runs consume rng(seed=0) from scratch through 2
+    # scenes; bytes match.
+    for name in ("data_all/vid0_1.npy", "data_all/vid1_0.npy",
+                 "label_msk/vid0_1_mask.npy", "label_msk/vid1_0_mask.npy"):
+        assert hashes_full[name] == hashes_split[name], (
+            f"Scene 0/1 hash mismatch on {name}: "
+            "intra-batch determinism failed"
+        )
+
+    # Scenes 2-3: full run extends seed=0's stream; split run uses seed=2.
+    # At least one of the four files must differ.
+    differing = [
+        name
+        for name in ("data_all/vid2_1.npy", "data_all/vid3_0.npy",
+                     "label_msk/vid2_1_mask.npy", "label_msk/vid3_0_mask.npy")
+        if hashes_full[name] != hashes_split[name]
+    ]
+    assert differing, (
+        "Expected at least one of scenes 2/3 to differ across batch "
+        "configurations, but all matched"
+    )

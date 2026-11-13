@@ -1,0 +1,143 @@
+"""Reading and writing model weight files (safetensors preferred, .pth/.pt accepted).
+
+The shipped weights are distributed as ``<name>.safetensors``: a flat
+``{tensor name: tensor}`` map with no executable content. Training runs
+write PyTorch ``.pth`` / ``.pt`` state_dicts (a pickle-based zip format); those
+load too, always with ``torch.load(weights_only=True)``.
+
+A weight path may be given with any of the three suffixes, or with none. The
+resolution rule, used by every loader in the project, is:
+
+1. ``<stem>.safetensors`` next to the given path, if it exists (preferred);
+2. otherwise the path exactly as given, if it exists;
+3. otherwise ``<stem>.pth`` then ``<stem>.pt``, if one exists.
+
+So the historical names (``gate_A_stem2_bs1_ep42.pth``) keep working where
+only the ``.safetensors`` file is present, and a ``.safetensors`` file always
+wins over a ``.pth`` of the same stem.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import torch
+
+SAFETENSORS_SUFFIX = ".safetensors"
+PICKLE_SUFFIXES = (".pth", ".pt")
+WEIGHT_SUFFIXES = (SAFETENSORS_SUFFIX,) + PICKLE_SUFFIXES
+
+
+def _stem_path(path: Path) -> Path:
+    """Return ``path`` without a known weight suffix (unchanged otherwise)."""
+    return path.with_suffix("") if path.suffix in WEIGHT_SUFFIXES else path
+
+
+def resolve_weights(path: str | os.PathLike) -> Path:
+    """Return the weight file to read for ``path``, preferring ``.safetensors``.
+
+    Args:
+        path: Weight file path, with a ``.safetensors``, ``.pth`` or ``.pt``
+            suffix or without a suffix.
+
+    Returns:
+        The existing file chosen by the module-level resolution rule.
+
+    Raises:
+        FileNotFoundError: if no candidate exists; the message lists them.
+    """
+    p = Path(path).expanduser()
+    stem = _stem_path(p)
+    candidates = [stem.parent / (stem.name + SAFETENSORS_SUFFIX), p]
+    candidates += [stem.parent / (stem.name + s) for s in PICKLE_SUFFIXES]
+    seen: list[Path] = []
+    for c in candidates:
+        if c in seen:
+            continue
+        seen.append(c)
+        if c.is_file():
+            return c
+    raise FileNotFoundError(
+        "no weight file found; tried " + ", ".join(str(c) for c in seen)
+    )
+
+
+def load_state_dict(
+    path: str | os.PathLike, map_location: str | torch.device = "cpu"
+) -> dict[str, torch.Tensor]:
+    """Load a state_dict from a ``.safetensors`` or ``.pth`` / ``.pt`` file.
+
+    Args:
+        path: Weight file path (resolved with :func:`resolve_weights`).
+        map_location: Device the tensors are placed on.
+
+    Returns:
+        ``{parameter or buffer name: tensor}``, names and dtypes as stored.
+        A ``.pth`` holding ``{"state_dict": ...}`` (and no ``"model"`` key) is
+        unwrapped.
+    """
+    f = resolve_weights(path)
+    if f.suffix == SAFETENSORS_SUFFIX:
+        from safetensors.torch import load_file
+
+        device = str(map_location) if not isinstance(map_location, str) else map_location
+        return load_file(str(f), device=device)
+    sd = torch.load(f, map_location=map_location, weights_only=True)
+    if isinstance(sd, dict) and "state_dict" in sd and "model" not in sd:
+        sd = sd["state_dict"]
+    return sd
+
+
+def load_weights(
+    model: torch.nn.Module,
+    path: str | os.PathLike,
+    map_location: str | torch.device = "cpu",
+    strict: bool = True,
+) -> torch.nn.Module:
+    """Load weights into ``model`` from either format.
+
+    Args:
+        model: Module whose parameter names match the file.
+        path: Weight file path (resolved with :func:`resolve_weights`).
+        map_location: Device the tensors are loaded onto before copying.
+        strict: Passed to ``load_state_dict``.
+
+    Returns:
+        ``model`` (same object), with the weights loaded.
+    """
+    model.load_state_dict(load_state_dict(path, map_location), strict=strict)
+    return model
+
+
+def save_safetensors(
+    state_dict: dict[str, torch.Tensor],
+    path: str | os.PathLike,
+    metadata: dict[str, str] | None = None,
+) -> Path:
+    """Write a state_dict as ``.safetensors`` (same names, dtypes and shapes).
+
+    Tensors are written from contiguous CPU copies; the values are unchanged.
+
+    Args:
+        state_dict: ``{name: tensor}``; every value must be a tensor.
+        path: Output path; must end in ``.safetensors``.
+        metadata: Optional string-to-string header metadata.
+
+    Returns:
+        The written path.
+
+    Raises:
+        ValueError: on a wrong suffix or a non-tensor value.
+    """
+    from safetensors.torch import save_file
+
+    out = Path(path)
+    if out.suffix != SAFETENSORS_SUFFIX:
+        raise ValueError(f"output must end in {SAFETENSORS_SUFFIX}: {out}")
+    bad = [k for k, v in state_dict.items() if not isinstance(v, torch.Tensor)]
+    if bad:
+        raise ValueError(f"non-tensor entries cannot be stored: {bad[:5]}")
+    flat = {k: v.detach().to("cpu").contiguous().clone() for k, v in state_dict.items()}
+    save_file(flat, str(out), metadata=metadata)
+    return out

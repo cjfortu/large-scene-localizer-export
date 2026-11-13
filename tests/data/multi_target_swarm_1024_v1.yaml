@@ -1,0 +1,48 @@
+# Test fixture: frozen copy of the retired v1 1024^2 generator config (tag
+# pre-reorg-2026-11, recovered/synth_swarm/configs/multi_target_swarm_1024.yaml).
+# The chip-aware backward-compatibility hashes in
+# swarm_chip_aware_compat_ref_hashes.json were generated from it.
+# multi_target_swarm_1024 — 1024x1024x64 multi-target dataset.
+#
+# Structurally extends slow_swarm_128 in two axes:
+#   - image_size: 1024x1024 (was 128x128)
+#   - target_sampler: chip_aware (was single)
+#
+# Target geometry (2x2 squares), parity rule (idx%2==0 -> present),
+# samedir convention, 8-direction velocity pool, NPY layout, and
+# filename convention are all inherited from slow_swarm_128 unchanged.
+# Speeds are restored to v0 values [0.5, 1.0, 2.0] per spec §3.4.
+# Background swarm density scales by area from v0.6's 30k @ 128² to
+# 1.92M @ 1024² per spec §3.5.
+
+n_frames: 64
+image_size: [1024, 1024]
+shape: square
+square_edge: 2
+radius: 2          # unused when shape="square", kept for backward-compat
+
+# Velocity pool — restored to v0 values for 1024² scale per §3.4.
+speeds: [0.5, 1.0, 2.0]
+samedir: true
+
+# Background swarm density — 30k per 128² chip x 64 chips per §3.5.
+n_circles: 1920000
+
+# Multi-target sampler — chip-aware per §3.2.
+target_sampler: chip_aware
+chip_size: 128
+chip_nonempty_range: [24, 40]      # k ~ Uniform{24,...,40}; ~50% non-empty
+chip_target_count_range: [1, 10]   # per non-empty chip; m_c ~ Uniform{1,...,10}
+
+total_scenes: 3000
+save_gifs: false       # see spec §2 / §5 step 1 — smoke run only
+fps: 10
+
+# Parallelism — per training node; total workers = total_scenes_this_node // batch_size
+# Note: batch_size will likely need tuning down from v0.5/v0.6's 250 due to
+# higher per-scene memory cost; see §6.2 worker count test.
+batch_size: 50
+num_workers: 8
+
+# Output: <data root>/<dataset>, or an absolute --output_root (the tests pass one).
+dataset: multi_target_swarm_1024x1024x64_v1

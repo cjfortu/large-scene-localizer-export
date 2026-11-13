@@ -1,0 +1,93 @@
+"""Bit-identity test for the Stage 1 v0.5 baseline arm (Arm 1).
+
+Per ``documents/history/specs/stage1_v0_5_design.md`` §6 and §9 step 2, the v0.5
+factory must return the v0 ``PureConvSegmenter3D`` class *directly* (no
+wrapping) when ``temporal_variant="baseline"``. Under the same RNG seed
+this must produce literal state-dict-key equality and bit-identical
+tensor values with a direct ``PureConvSegmenter3D(...)`` construction.
+That is the v0 reproducibility guarantee for Arm 1.
+
+This test is the named pass criterion for §9 step 2 and cannot be
+weakened — no prefix-stripping, no name-mapping, no
+allow-list-of-keys comparison.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import torch
+
+# Make `src/` importable when pytest runs from the repo root.
+_ROOT = Path(__file__).resolve().parents[2]
+
+from localizer.gate.model import (  # noqa: E402
+    PureConvSegmenter3D, build_segmenter_v0_5,
+)
+
+
+def test_baseline_factory_returns_pureconv_class() -> None:
+    """The factory returns a ``PureConvSegmenter3D`` instance, not a wrapper."""
+    torch.manual_seed(0)
+    m = build_segmenter_v0_5(
+        temporal_variant="baseline", bottleneck_variant="D", nfeats=32,
+    )
+    assert type(m) is PureConvSegmenter3D, (
+        f"factory must return PureConvSegmenter3D directly; got {type(m).__name__}"
+    )
+
+
+def test_baseline_factory_state_dict_bit_identical_to_v0() -> None:
+    """Factory output state-dict keys + tensor values match v0 under the same seed."""
+    torch.manual_seed(0)
+    a = PureConvSegmenter3D(bottleneck_variant="D", nfeats=32)
+    torch.manual_seed(0)
+    b = build_segmenter_v0_5(
+        temporal_variant="baseline", bottleneck_variant="D", nfeats=32,
+    )
+    sd_a, sd_b = a.state_dict(), b.state_dict()
+    # Literal key-set equality (no prefix stripping, no name mapping).
+    assert set(sd_a.keys()) == set(sd_b.keys()), (
+        f"state-dict keys diverged: "
+        f"only in a={set(sd_a) - set(sd_b)}, only in b={set(sd_b) - set(sd_a)}"
+    )
+    for k in sd_a:
+        assert torch.equal(sd_a[k], sd_b[k]), f"tensor diverged at key {k!r}"
+
+
+def test_baseline_factory_forward_bit_identical_to_v0() -> None:
+    """Forward outputs match bit-for-bit under same seed + same input."""
+    torch.manual_seed(0)
+    a = PureConvSegmenter3D(bottleneck_variant="D", nfeats=32)
+    torch.manual_seed(0)
+    b = build_segmenter_v0_5(
+        temporal_variant="baseline", bottleneck_variant="D", nfeats=32,
+    )
+    a.eval()
+    b.eval()
+    # Input shape must survive four 2× pools (min T=16, H=W=16).
+    x = torch.randn(1, 1, 16, 16, 16)
+    with torch.no_grad():
+        ya = a(x)
+        yb = b(x)
+    assert torch.equal(ya, yb), "forward outputs diverged for baseline factory vs v0"
+
+
+def test_baseline_factory_passes_bottleneck_variant_through() -> None:
+    """``bottleneck_variant`` is honored when ``temporal_variant='baseline'``."""
+    for variant in ("A", "B", "C", "D"):
+        torch.manual_seed(0)
+        a = PureConvSegmenter3D(bottleneck_variant=variant, nfeats=32)
+        torch.manual_seed(0)
+        b = build_segmenter_v0_5(
+            temporal_variant="baseline", bottleneck_variant=variant, nfeats=32,
+        )
+        assert type(b) is PureConvSegmenter3D
+        assert b.bottleneck_variant == variant
+        sd_a, sd_b = a.state_dict(), b.state_dict()
+        assert set(sd_a.keys()) == set(sd_b.keys())
+        for k in sd_a:
+            assert torch.equal(sd_a[k], sd_b[k]), (
+                f"tensor diverged at {k!r} for bottleneck_variant={variant!r}"
+            )

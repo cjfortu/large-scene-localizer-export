@@ -1,0 +1,137 @@
+"""Stage 3 segmenter: volumetric U-Net + 3D Swin bottleneck.
+
+Architecture (extracted from cell [7] of ``Vol_Seg.ipynb``):
+
+* ``DoubleConv3D`` — two ``Conv3d 3x3x3 + BatchNorm3d + ReLU`` in series
+  (defined in ``localizer.common.blocks``; shared with the gate).
+* ``Bottleneck`` — ``Conv3d 1x1x1`` patch-embed (256 -> 512), then 2 paired
+  ``SwinTransformerBlock3d`` blocks (block 0 unshifted, block 1 shifted by
+  half-window ``(1, 2, 2)``), 16 heads, mlp_ratio=4, drop_path linspace
+  ``[0, 0.2]``, post-``LayerNorm``, with permute glue between Conv3d's
+  ``(B, C, T, H, W)`` and the Swin block's ``(B, T, H, W, C)``.
+* ``VolumetricUNet(nfeats=32)`` — 4-stage encoder ``MaxPool3d(2)``, the
+  Bottleneck at the bottom, 4-stage decoder ``ConvTranspose3d 2 stride 2``
+  upsampling with encoder-skip concat, ``Conv3d 1x1x1`` final head producing
+  1 logit channel (no activation — ``BCEWithLogitsLoss`` handles sigmoid).
+"""
+
+import torch
+import torch.nn as nn
+
+from localizer.common.blocks import DoubleConv3D
+from localizer.common.swin3d import SwinTransformerBlock3d
+
+
+class Bottleneck(nn.Module):
+    """U-Net bottleneck with 3D Swin attention.
+
+    1x1x1 patch-embed Conv3d projects encoder output channels to ``out_size``,
+    then ``depth`` Swin blocks alternate between unshifted and shifted windows.
+    Output is permuted back to Conv3d's ``(B, C, T, H, W)`` channel-first form.
+    """
+
+    def __init__(
+        self,
+        in_size: int,
+        out_size: int,
+        dim: int,
+        depth: int,
+        num_heads: int,
+        window_size=(2, 4, 4),
+        mlp_ratio=4.,
+        proj_drop=0.,
+        attn_drop=0.,
+        ffn_drop=0.,
+        drop_path_rate=0.2,
+    ) -> None:
+        super().__init__()
+        self.patch_embed = nn.Conv3d(in_size, out_size, kernel_size=1, stride=1)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, 2)]
+        self.blocks = nn.ModuleList([
+            SwinTransformerBlock3d(
+                dim=dim,
+                num_heads=num_heads,
+                window_size=window_size,
+                shift_size=(0, 0, 0) if (i % 2 == 0) else (
+                    window_size[0] // 2, window_size[1] // 2, window_size[2] // 2,
+                ),
+                mlp_ratio=mlp_ratio,
+                proj_drop=proj_drop,
+                attn_drop=attn_drop,
+                ffn_drop=ffn_drop,
+                drop_path=dpr[i] if isinstance(dpr, list) else dpr,
+            )
+            for i in range(depth)
+        ])
+        self.norm = nn.LayerNorm(out_size)
+
+    def forward(self, x):
+        x = self.patch_embed(x)
+        x = x.permute(0, 2, 3, 4, 1)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+        x = x.permute(0, 4, 1, 2, 3)
+        return x
+
+
+class VolumetricUNet(nn.Module):
+    """4-stage encoder / Swin bottleneck / 4-stage decoder volumetric U-Net.
+
+    Args:
+        nfeats: Number of initial kernels (output of stage 1). Subsequent
+            stages double up to ``nfeats * 8`` at the bottleneck input,
+            ``nfeats * 16`` inside the bottleneck.
+    """
+
+    def __init__(self, nfeats: int) -> None:
+        super().__init__()
+        self.down1 = DoubleConv3D(1, nfeats)
+        self.pool1 = nn.MaxPool3d(2)
+        self.down2 = DoubleConv3D(nfeats, nfeats * 2)
+        self.pool2 = nn.MaxPool3d(2)
+        self.down3 = DoubleConv3D(nfeats * 2, nfeats * 4)
+        self.pool3 = nn.MaxPool3d(2)
+        self.down4 = DoubleConv3D(nfeats * 4, nfeats * 8)
+        self.pool4 = nn.MaxPool3d(2)
+        self.bottleneck = Bottleneck(
+            in_size=nfeats * 8,
+            out_size=nfeats * 16,
+            dim=512,
+            depth=2,
+            num_heads=16,
+            window_size=(2, 4, 4),
+            mlp_ratio=4.,
+            proj_drop=0.,
+            attn_drop=0.,
+            drop_path_rate=0.2,
+        )
+        self.up4 = nn.ConvTranspose3d(nfeats * 16, nfeats * 8, 2, stride=2)
+        self.conv4 = DoubleConv3D(nfeats * 16, nfeats * 8)
+        self.up3 = nn.ConvTranspose3d(nfeats * 8, nfeats * 4, 2, stride=2)
+        self.conv3 = DoubleConv3D(nfeats * 8, nfeats * 4)
+        self.up2 = nn.ConvTranspose3d(nfeats * 4, nfeats * 2, 2, stride=2)
+        self.conv2 = DoubleConv3D(nfeats * 4, nfeats * 2)
+        self.up1 = nn.ConvTranspose3d(nfeats * 2, nfeats, 2, stride=2)
+        self.conv1 = DoubleConv3D(nfeats * 2, nfeats)
+        self.final = nn.Conv3d(nfeats, 1, 1)
+
+    def forward(self, x):
+        d1 = self.down1(x)
+        p1 = self.pool1(d1)
+        d2 = self.down2(p1)
+        p2 = self.pool2(d2)
+        d3 = self.down3(p2)
+        p3 = self.pool3(d3)
+        d4 = self.down4(p3)
+        p4 = self.pool4(d4)
+        b = self.bottleneck(p4)
+        u4 = self.up4(b)
+        c4 = self.conv4(torch.cat([u4, d4], dim=1))
+        u3 = self.up3(c4)
+        c3 = self.conv3(torch.cat([u3, d3], dim=1))
+        u2 = self.up2(c3)
+        c2 = self.conv2(torch.cat([u2, d2], dim=1))
+        u1 = self.up1(c2)
+        c1 = self.conv1(torch.cat([u1, d1], dim=1))
+        return self.final(c1)

@@ -1,0 +1,23 @@
+# Test fixture: frozen copy of the retired v0 Variant D gate config (tag
+# pre-reorg-2026-11, configs/stage1_seg_v0_variant_D.yaml), with its absolute
+# paths replaced by bare names. Used by the backward-compatibility test in
+# tests/gate/test_checkpoint_criterion.py.
+# Stage 1 v0 pure-conv segmenter: Variant D
+# (identity bottleneck; channel widths max at 256 instead of 512).
+# All hyperparameters per design §7.1.
+bottleneck_variant: "D"
+seed: 0
+nfeats: 32
+target_positive_pixels_per_frame: 13
+lr: 1.0e-3
+weight_decay: 1.0e-2
+scheduler_factor: 0.5
+scheduler_patience: 10
+batch_size: 8
+num_epochs: 150
+subset_size: 5000
+data_root: "swarm_128x128x64"
+val_split: 0.1
+val_split_seed: 0
+output_root: "stage1_seg_v0_variant_D_5k"
+num_workers: 4

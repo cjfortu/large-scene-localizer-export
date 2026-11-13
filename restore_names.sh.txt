@@ -1,0 +1,84 @@
+#!/bin/sh
+# Restore the original file names of a transferred large-scene-localizer tree.
+#
+# The transfer form of the snapshot carries no executable file extensions:
+# every script (*.py, *.sh, *.ps1, Dockerfile, .dockerignore, and any file
+# with a shebang) had ".txt" appended, as listed in TRANSFER_RENAMES.txt.
+# This script, run from the top of the extracted tree (or from anywhere, by
+# path), does:
+#   (a) verify every file listed in MANIFEST.transfer.sha256 (the renamed
+#       tree); abort on any mismatch, before anything is renamed;
+#   (b) rename each "<original><TAB><renamed>" pair in TRANSFER_RENAMES.txt
+#       back, refusing to overwrite an existing destination (all pairs are
+#       checked before the first rename);
+#   (c) verify the restored tree against MANIFEST.sha256;
+#   (d) print one PASS or FAIL line; exit 0 on PASS, 1 on FAIL.
+#
+# Usage:  cp restore_names.sh.txt restore_names.sh && sh restore_names.sh
+# Needs:  a POSIX sh, mv, sha256sum, awk.
+
+fail() {
+  echo "FAIL: $*"
+  exit 1
+}
+
+case "$0" in
+  */*) cd "${0%/*}" || fail "cannot change to the script's directory" ;;
+esac
+
+TAB=$(printf '\t')
+for f in MANIFEST.transfer.sha256 TRANSFER_RENAMES.txt MANIFEST.sha256; do
+  [ -f "$f" ] || fail "$f not found in $(pwd) (run from the top of the extracted tree)"
+done
+
+# check_manifest <file> <step> <note>: format check, then sha256sum -c;
+# <note> ends the FAIL line.
+check_manifest() {
+  awk '!(length($1) == 64 && $1 ~ /^[0-9a-f]+$/ && substr($0, 65, 2) == "  " && length($0) > 66) { bad = 1 }
+       END { exit (NR == 0 || bad) }' "$1" \
+    || fail "step ($2): $1 is empty or not in sha256sum format"
+  out=$(sha256sum -c "$1" 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$out" | awk '!/: OK$/'
+    fail "step ($2): $1 verification failed (files above); $3"
+  fi
+}
+
+# (a) the renamed tree, as transferred
+check_manifest MANIFEST.transfer.sha256 a \
+  "nothing was renamed (if the tree is already restored, check MANIFEST.sha256 instead)"
+NT=$(awk 'END { print NR }' MANIFEST.transfer.sha256)
+
+# (b) rename back. TRANSFER_RENAMES.txt must hold "<path><TAB><path>.txt"
+# lines: relative paths, no "..", each original listed once.
+awk -F "$TAB" '
+  NF != 2 || $2 != $1 ".txt" || $1 ~ /^\// || $1 ~ /(^|\/)\.\.(\/|$)/ || seen[$1]++ { bad = 1 }
+  END { exit (NR == 0 || bad) }' TRANSFER_RENAMES.txt \
+  || fail "step (b): TRANSFER_RENAMES.txt is empty or malformed"
+
+while IFS="$TAB" read -r orig ren; do
+  [ -f "$ren" ] || fail "step (b): $ren (listed in TRANSFER_RENAMES.txt) is missing"
+  if [ -e "$orig" ] || [ -L "$orig" ]; then
+    fail "step (b): destination $orig already exists; refusing to overwrite (nothing was renamed)"
+  fi
+done < TRANSFER_RENAMES.txt || exit 1
+
+NR_DONE=0
+while IFS="$TAB" read -r orig ren; do
+  if [ -e "$orig" ] || [ -L "$orig" ]; then
+    fail "step (b): destination $orig appeared during the restore; refusing to overwrite ($NR_DONE renamed so far)"
+  fi
+  mv -- "$ren" "$orig" || fail "step (b): mv $ren -> $orig failed ($NR_DONE renamed so far)"
+  NR_DONE=$((NR_DONE + 1))
+done < TRANSFER_RENAMES.txt || exit 1
+NR=$(awk 'END { print NR }' TRANSFER_RENAMES.txt)
+
+# (c) the restored tree against the original manifest
+check_manifest MANIFEST.sha256 c \
+  "the names were restored but the restored tree does not match"
+NM=$(awk 'END { print NR }' MANIFEST.sha256)
+
+# (d)
+echo "PASS: $NR files renamed back; MANIFEST.transfer.sha256 ($NT files) and MANIFEST.sha256 ($NM files) verified"
+exit 0

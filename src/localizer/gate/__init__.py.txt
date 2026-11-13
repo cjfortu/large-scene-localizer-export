@@ -1,0 +1,1 @@
+"""Stage 1 gate: CNN+Mamba hybrid region proposer (model factories, blocks, trainer, metrics, losses)."""

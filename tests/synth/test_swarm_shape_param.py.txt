@@ -1,0 +1,104 @@
+"""Tests for the new shape/square_edge params on DataGenerator.
+
+Verifies:
+- _make_square stamps a 2x2 block (4 pixels) at top-left = (cx, cy).
+- _make_circle stamps a radius-2 disk (13 pixels) at center (cx, cy).
+- Invalid shape strings raise AssertionError.
+- Backward compat: omitting `shape` defaults to "disk".
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+from localizer.synth.swarm import DataGenerator  # noqa: E402
+
+
+def _make_gen(
+    tmp_path: Path,
+    shape: str | None = None,
+    square_edge: int | None = None,
+    extra: dict | None = None,
+) -> DataGenerator:
+    """Construct a small DataGenerator for direct stamping tests."""
+    kwargs = dict(
+        n_frames=4,
+        n_circles=10,
+        image_size=(16, 16),
+        radius=2,
+        speeds=[0.5],
+        dat_lab_paths=[tmp_path / "data_all", tmp_path / "label_msk"],
+        samedir=True,
+    )
+    if shape is not None:
+        kwargs["shape"] = shape
+    if square_edge is not None:
+        kwargs["square_edge"] = square_edge
+    if extra is not None:
+        kwargs.update(extra)
+    return DataGenerator(**kwargs)
+
+
+def test_make_circle_stamps_13_pixels(tmp_path: Path) -> None:
+    """Radius-2 disk has 13 pixels (the v0 swarm footprint)."""
+    gen = _make_gen(tmp_path, shape="disk")
+    gen.frame = np.zeros((gen.H, gen.W), dtype=np.uint8)
+    gen._make_circle((4, 4))
+    assert (gen.frame == 255).sum() == 13
+
+
+def test_make_square_stamps_4_pixels(tmp_path: Path) -> None:
+    """2x2 square has 4 pixels, top-left-anchored at (cx, cy)."""
+    gen = _make_gen(tmp_path, shape="square", square_edge=2)
+    gen.frame = np.zeros((gen.H, gen.W), dtype=np.uint8)
+    gen._make_square((4, 4))
+    assert (gen.frame == 255).sum() == 4
+    # top-left-anchored: rows [cy, cy+2), cols [cx, cx+2) -> rows 4-5, cols 4-5.
+    assert gen.frame[4:6, 4:6].sum() == 255 * 4
+
+
+def test_make_square_clips_out_of_bounds(tmp_path: Path) -> None:
+    """A 2x2 square at the corner clips correctly."""
+    gen = _make_gen(tmp_path, shape="square", square_edge=2)
+    gen.frame = np.zeros((gen.H, gen.W), dtype=np.uint8)
+    gen._make_square((15, 15))  # only pixel (15, 15) is in bounds
+    assert (gen.frame == 255).sum() == 1
+    gen.frame = np.zeros((gen.H, gen.W), dtype=np.uint8)
+    gen._make_square((-1, -1))  # only pixel (0, 0) is in bounds
+    assert (gen.frame == 255).sum() == 1
+    assert gen.frame[0, 0] == 255
+    gen.frame = np.zeros((gen.H, gen.W), dtype=np.uint8)
+    gen._make_square((-5, -5))  # fully out of bounds
+    assert (gen.frame == 255).sum() == 0
+
+
+def test_invalid_shape_raises(tmp_path: Path) -> None:
+    """Unsupported shape strings raise AssertionError at construction time."""
+    with pytest.raises(AssertionError):
+        _make_gen(tmp_path, shape="triangle")
+
+
+def test_invalid_square_edge_raises(tmp_path: Path) -> None:
+    """square_edge < 1 raises."""
+    with pytest.raises(AssertionError):
+        _make_gen(tmp_path, shape="square", square_edge=0)
+
+
+def test_backward_compat_default_disk(tmp_path: Path) -> None:
+    """Omitting `shape` defaults to disk mode (v0 swarm behavior)."""
+    gen = DataGenerator(
+        n_frames=4,
+        n_circles=10,
+        image_size=(16, 16),
+        radius=2,
+        speeds=[0.5],
+        dat_lab_paths=[tmp_path / "data_all", tmp_path / "label_msk"],
+        samedir=True,
+    )
+    assert gen.shape == "disk"

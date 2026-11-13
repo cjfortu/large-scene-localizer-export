@@ -1,0 +1,298 @@
+"""Honest per-cell (8x8) coverage re-score of v0.10 Stage-1 best_gate checkpoints.
+
+INFERENCE-ONLY diagnostic (no training, no backward, no optimizer, no checkpoint
+or code-path mutation). Forward-passes the saved ``best_gate_model.pth`` for each
+arm over the SAME val set / threshold 0.5 / native low-res grid (32x128x128) the
+live pipeline uses, then scores coverage on an 8x8 = 64-cell grid (16x16
+prediction-voxel blocks), time-collapsed over the 32 frames -- holding the gate
+to its own decision resolution (no nearest-upsample-to-512 step).
+
+The checkpoints are EMA-averaged weights for B1/B2; they are loaded AS-IS (EMA is
+not re-applied -- the saved state_dict already is the EMA shadow).
+
+Cell rules (swept):
+  truth-positive cell: mask_hard has any target voxel in the 16x16 block at any frame.
+  pred-positive cell : count of (sigmoid(logits)>0.5) voxels in the 16x16xT block
+                       is >= k, for k in {1 (any), 2, 4, 8}.
+
+Reports, per checkpoint:
+  1. Caught-rate (honest cluster_recall analog): fraction of PRESENT scenes with
+     >=1 cell both truth- and pred-positive. Shown beside the logged cluster_recall.
+  2. Per-cell recall (strict): sum(truth&pred cells) / sum(truth cells) over present.
+  3. Per-cell FP load: absent scenes -> mean flagged cells (+ rate/64, p50, p95);
+     present scenes -> mean non-target cells flagged.
+  4. The above swept over k.
+
+Verification anchors (B1): identify the exact scenes saved as comp_1_ep33 (present)
+and comp_0_ep33 (absent) by matching the recomputed binarized prediction against
+the saved pred_{1,0}_ep33.npy, then dump their full 8x8 truth + pred grids.
+
+Needs a CUDA GPU for practical speed (Mamba kernels); data/run/checkpoint
+locations resolve under $LSL_DATA_ROOT / $LSL_RUNS_ROOT / $LSL_CKPT_ROOT:
+  python scripts/gate/rescore_percell.py --gate-ckpt A=gate_A_stem2_bs1_ep42.safetensors --out rescore.json
+  (historical layout: --runs_dir <runs>/stage1_v0_10, scores A/B1/B2 and the B1 anchors)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+
+
+from localizer.gate.model import build_segmenter_v0_7
+from localizer.common.checkpoint_io import load_state_dict
+from localizer.common.paths import add_root_args, resolve_under
+from localizer.common.data import make_dataloaders
+
+# Frozen build args -- identical for A/B1/B2 (v0.10 §6; trainer build call).
+BUILD = dict(arm=2, nfeats=32, fusion="sum", stem_stride=2, dt_init_std=None)
+LOW_RES_POOL = (2, 4, 4)
+SUBSET_SIZE = 3000
+VAL_SPLIT = 0.1
+VAL_SPLIT_SEED = 0
+THRESHOLD = 0.5
+CELL = 16            # 16x16 prediction-voxel blocks
+NGRID = 8            # 8x8 = 64 cells over the 128x128 native grid
+K_SWEEP = (1, 2, 4, 8)
+ARMS = ("A", "B1", "B2")
+LOGGED_CLUSTER_RECALL = {"A": 0.851, "B1": 0.869, "B2": 0.806}
+GATE_EPOCH = {"A": 42, "B1": 33, "B2": 33}
+
+
+def build_val_dataset(data_root: str):
+    """Reconstruct the exact val membership the live pipeline used.
+
+    make_dataloaders fixes val membership deterministically via
+    train_test_split(random_state=VAL_SPLIT_SEED) -- independent of the loader
+    shuffle. We take the val_loader's underlying dataset and iterate it in fixed
+    index order (no shuffle) for reproducibility.
+    """
+    _, val_loader, datshape = make_dataloaders(
+        data_root=data_root, subset_size=SUBSET_SIZE, batch_size=1, num_workers=0,
+        val_split=VAL_SPLIT, val_split_seed=VAL_SPLIT_SEED,
+        output_resolution="low_res", soft_target=False, low_res_pool=LOW_RES_POOL,
+    )
+    return val_loader.dataset, datshape
+
+
+def cell_counts(voxel_bool: np.ndarray) -> np.ndarray:
+    """Collapse a (T, 128, 128) boolean voxel grid to an (8, 8) per-cell COUNT.
+
+    Count = number of True voxels in each 16x16 spatial block summed across all
+    T frames. ``any`` == (count >= 1).
+    """
+    t, h, w = voxel_bool.shape
+    assert h == NGRID * CELL and w == NGRID * CELL, f"unexpected spatial {h}x{w}"
+    # (T, 8, 16, 8, 16) -> sum over T (axis0), within-block rows (axis2), cols (axis4)
+    r = voxel_bool.reshape(t, NGRID, CELL, NGRID, CELL)
+    return r.sum(axis=(0, 2, 4)).astype(np.int64)   # (8, 8)
+
+
+@torch.no_grad()
+def predict_voxel_pos(model, volume_chw_t: torch.Tensor, device) -> np.ndarray:
+    """Forward one scene; return (T,128,128) bool of sigmoid(logits)>0.5 (native)."""
+    x = volume_chw_t.unsqueeze(0).to(device)             # (1,1,64,512,512)
+    logits = model(x).float()                            # (1,1,32,128,128)
+    pos = (torch.sigmoid(logits) > THRESHOLD)            # bool
+    return pos[0, 0].cpu().numpy()                       # (32,128,128)
+
+
+def load_model(ckpt_path: Path, device):
+    model = build_segmenter_v0_7(**BUILD).to(device)
+    sd = load_state_dict(ckpt_path, map_location=device)
+    missing, unexpected = model.load_state_dict(sd, strict=True)
+    model.eval()
+    return model
+
+
+def score_arm(arm: str, ckpt: Path, dataset, device) -> dict:
+    model = load_model(ckpt, device)
+
+    n = len(dataset)
+    # Per-k accumulators.
+    present_caught = {k: 0 for k in K_SWEEP}
+    present_truth_cells_tot = 0                              # k-independent
+    present_truthpred_cells = {k: 0 for k in K_SWEEP}
+    present_nontarget_flagged = {k: [] for k in K_SWEEP}     # per-scene
+    absent_flagged = {k: [] for k in K_SWEEP}               # per-scene
+    n_present = n_absent = 0
+
+    # For the anchor: recomputed binarized preds keyed by index, per label.
+    recomputed = {}   # idx -> (label, pred_count_grid_anyvoxel, voxel_pos)
+
+    for i in range(n):
+        s = dataset[i]
+        label = int(s["label"])
+        vol = torch.as_tensor(s["volume"])                  # (1,64,512,512)
+        truth_vox = (np.asarray(s["mask_hard"])[0] > 0.5)   # (32,128,128) bool
+        pred_vox = predict_voxel_pos(model, vol, device)    # (32,128,128) bool
+
+        truth_cnt = cell_counts(truth_vox)                  # (8,8) int
+        pred_cnt = cell_counts(pred_vox)                    # (8,8) int
+        truth_cells = truth_cnt >= 1                        # any-voxel truth rule
+
+        if label == 1:
+            n_present += 1
+            present_truth_cells_tot += int(truth_cells.sum())
+        else:
+            n_absent += 1
+
+        for k in K_SWEEP:
+            pred_cells = pred_cnt >= k
+            if label == 1:
+                overlap = truth_cells & pred_cells
+                if overlap.any():
+                    present_caught[k] += 1
+                present_truthpred_cells[k] += int(overlap.sum())
+                present_nontarget_flagged[k].append(int((pred_cells & ~truth_cells).sum()))
+            else:
+                absent_flagged[k].append(int(pred_cells.sum()))
+
+        recomputed[i] = (label, pred_vox)
+
+    def pdict(vals):
+        a = np.asarray(vals, dtype=np.float64) if vals else np.array([0.0])
+        return dict(mean=float(a.mean()), p50=float(np.percentile(a, 50)),
+                    p95=float(np.percentile(a, 95)), max=float(a.max()))
+
+    per_k = {}
+    for k in K_SWEEP:
+        per_k[str(k)] = {
+            "caught_rate": present_caught[k] / max(n_present, 1),
+            "per_cell_recall_strict": (
+                present_truthpred_cells[k] / max(present_truth_cells_tot, 1)
+            ),
+            "absent_cells_flagged": pdict(absent_flagged[k]),
+            "absent_cells_flagged_rate64": pdict([v / 64.0 for v in absent_flagged[k]]),
+            "present_nontarget_cells_flagged": pdict(present_nontarget_flagged[k]),
+        }
+
+    return {
+        "arm": arm, "ckpt": str(ckpt), "gate_epoch": GATE_EPOCH.get(arm),
+        "logged_cluster_recall": LOGGED_CLUSTER_RECALL.get(arm),
+        "n_present": n_present, "n_absent": n_absent,
+        "present_truth_cells_total": present_truth_cells_tot,
+        "per_k": per_k,
+        "_recomputed": recomputed,   # popped before JSON
+    }
+
+
+def grid_str(g: np.ndarray) -> list[list[int]]:
+    return [[int(v) for v in row] for row in g]
+
+
+def anchor_b1(score: dict, runs_root: Path, dataset) -> dict:
+    """Match saved B1 pred_{1,0}_ep33.npy to val scenes; dump 8x8 grids."""
+    recomputed = score["_recomputed"]
+    out = {}
+    for label, tag in ((1, "comp_1_ep33_present"), (0, "comp_0_ep33_absent")):
+        saved_p = runs_root / "B1" / "generated_files" / "pred_NPYs" / f"pred_{label}_ep33.npy"
+        saved = np.load(saved_p)                            # (1,32,128,128) binarized
+        saved_vox = (saved[0] > 0.5)
+        best_i, best_match = -1, -1.0
+        exact = False
+        for i, (lab, pred_vox) in recomputed.items():
+            if lab != label:
+                continue
+            inter = np.logical_and(saved_vox, pred_vox).sum()
+            union = np.logical_or(saved_vox, pred_vox).sum()
+            iou = 1.0 if union == 0 else inter / union
+            eq = bool(np.array_equal(saved_vox, pred_vox))
+            score_i = (2.0 if eq else iou)
+            if score_i > best_match:
+                best_match, best_i, exact = score_i, i, eq
+        s = dataset[best_i]
+        truth_vox = (np.asarray(s["mask_hard"])[0] > 0.5)
+        pred_vox = recomputed[best_i][1]
+        out[tag] = {
+            "matched_val_index": best_i,
+            "matched_file_name": s.get("file_name", "?"),
+            "exact_match_to_saved_pred": exact,
+            "iou_to_saved_pred": float(best_match if not exact else 1.0),
+            "truth_grid_8x8_anyvoxel": grid_str(cell_counts(truth_vox) >= 1),
+            "pred_count_grid_8x8": grid_str(cell_counts(pred_vox)),
+            "truth_cells_n": int((cell_counts(truth_vox) >= 1).sum()),
+            "pred_cells_anyvoxel_n": int((cell_counts(pred_vox) >= 1).sum()),
+        }
+    return out
+
+
+RUNS_REQUIRED = False
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--dataset", default="multi_target_swarm_512x512x64",
+                   help="dataset name under the data root, or an absolute path")
+    p.add_argument("--runs_dir", required=RUNS_REQUIRED,
+                   help="run directory holding <arm>/models/*.pth; relative to the runs root, or absolute")
+    p.add_argument("--gate-ckpt", action="append", default=None,
+                   help="score LABEL=PATH (or PATH) instead of the --runs_dir arms; relative "
+                        "paths resolve under the checkpoints root (repeatable)")
+    p.add_argument("--out", required=True)
+    add_root_args(p, ("data", "runs", "ckpt"))
+    args = p.parse_args()
+    args.data_root = str(resolve_under("data", args.dataset, args.data_root_dir))
+    args.runs_root = (str(resolve_under("runs", args.runs_dir, args.runs_root_dir))
+                      if args.runs_dir else None)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device={device}  host={__import__('socket').gethostname()}")
+    if device.type != "cuda":
+        print("WARNING: no CUDA -- the Mamba kernel requires GPU; expect failure on CPU.")
+
+    dataset, datshape = build_val_dataset(args.data_root)
+    print(f"val scenes={len(dataset)}  datshape={datshape}")
+    runs_root = Path(args.runs_root) if args.runs_root else None
+
+    if args.gate_ckpt:
+        targets = {}
+        for item in args.gate_ckpt:
+            label, _, path = item.rpartition("=")
+            targets[label or Path(path).stem] = resolve_under("ckpt", path, args.ckpt_root_dir)
+    elif runs_root is not None:
+        targets = {arm: runs_root / arm / "models" / "best_gate_model.pth" for arm in ARMS}
+    else:
+        p.error("give --gate-ckpt or --runs_dir")
+
+    results = {}
+    anchors = None
+    for arm, ckpt in targets.items():
+        print(f"--- scoring {arm} ---", flush=True)
+        sc = score_arm(arm, ckpt, dataset, device)
+        if arm == "B1" and runs_root is not None:
+            anchors = anchor_b1(sc, runs_root, dataset)
+        sc.pop("_recomputed", None)
+        results[arm] = sc
+        ck1 = sc["per_k"]["1"]
+        print(f"  {arm}: caught@any={ck1['caught_rate']:.3f} "
+              f"(logged cR={sc['logged_cluster_recall']}) "
+              f"cellRecall@any={ck1['per_cell_recall_strict']:.3f} "
+              f"absentFlag@any mean={ck1['absent_cells_flagged']['mean']:.2f} "
+              f"p95={ck1['absent_cells_flagged']['p95']:.1f}")
+
+    payload = {
+        "meta": {
+            "threshold": THRESHOLD, "grid": f"{NGRID}x{NGRID}", "cell_voxels": f"{CELL}x{CELL}",
+            "k_sweep": list(K_SWEEP), "build": BUILD, "low_res_pool": list(LOW_RES_POOL),
+            "val_split": VAL_SPLIT, "val_split_seed": VAL_SPLIT_SEED, "subset_size": SUBSET_SIZE,
+            "data_root": args.data_root,
+        },
+        "results": results,
+        "anchors_B1": anchors,
+    }
+    outp = Path(args.out)
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    outp.write_text(json.dumps(payload, indent=2, default=str))
+    print(f"wrote {outp}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,24 @@
+# Baseline variant for the 30k retrain ablation.
+# Identical to default.yaml except run_name is variant-tagged.
+
+seed: 0
+n_frames: 64
+dropout_rate: 0.5
+attn_dropout: 0.1
+max_attn_len: 2200
+
+# Head, loss, regularization: baseline (= original recovered config)
+head_type: "flatten"
+return_logits: false
+weight_decay: 0.0
+
+lr: 1.0e-3
+batch_size: 16
+num_epochs: 100
+num_workers: 4
+
+dataset: swarm_128x128x64            # resolved under $LSL_DATA_ROOT
+val_split: 0.1
+val_split_seed: 91
+
+run_name: classifier/baseline_30k            # resolved under $LSL_RUNS_ROOT

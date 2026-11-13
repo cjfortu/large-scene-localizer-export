@@ -1,0 +1,179 @@
+"""Gate loss: ``CellFocalLoss`` (cell-level focal loss on the low-res grid).
+
+``CellFocalLoss`` is the ``loss_target: cell_focal`` option of the gate
+trainer (``localizer.gate.train``); it was introduced for the 512^2
+gate-precision ladder (recipe L3). The other Stage 1 losses of the retired
+Phase A line (focal, Tversky, direction, combined) were removed; they remain
+in the repository history under tag ``pre-reorg-2026-11``.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+
+class CellFocalLoss(nn.Module):
+    """Cell-level focal loss for the 512 gate-precision ladder (L3, §4.3).
+
+    The Stage 1 v0.7 seg head emits low-res logits ``(B, 1, T_m, H_m,
+    W_m)`` (at 512² with ``low_res_pool=(2,4,4)``: ``(B, 1, 32, 128,
+    128)``). The 8x8 eval grid partitions the 128x128 spatial grid into
+    ``cell_size`` x ``cell_size`` blocks (default 16 -> 8x8 = 64 cells).
+    This loss aggregates the per-voxel logits within each
+    ``cell_size`` x ``cell_size`` x ``T_m`` block into a single cell logit,
+    then applies focal loss against cell labels. A cell label is positive
+    iff any target voxel falls in its block -- the exact 8x8 rescore truth
+    rule (``scripts/gate/rescore_percell.py``).
+
+    Aggregation (``aggregation``): the default ``'maxpool'`` takes the
+    per-block MAX logit, which is EXACTLY aligned with the per-voxel-
+    threshold eval rule -- ``sigmoid(max) > 0.5  <=>  max logit > 0  <=>
+    some voxel sigmoid > 0.5`` (the any-voxel cell-positive rule). The
+    spec's original ``'logsumexp'`` choice (512 ladder §4.3) is retained
+    as an option but is mis-calibrated against that eval: raw
+    ``logsumexp`` over an N=T*cs*cs (~8192) block adds ~log(N)~=9 to every
+    cell logit, so a 'positive' cell is satisfied with per-voxel logits
+    ~-9 (sigmoid ~1e-4, far below the 0.5 threshold) and training
+    collapses to predict-nothing while the loss still falls. Caught by the
+    §5.1 overfit gate; ``'maxpool'`` is the operator-selected resolution
+    (the §4.3 'hard max-pool' alternative).
+
+    The existing pos-weighted per-voxel BCE on the low-res mask is
+    retained as an auxiliary localization term (weight ``aux_weight``) so
+    the head still learns within-cell localization and does not degenerate
+    into a pure cell classifier. An optional Tversky FN>FP term (on the
+    cell-level probabilities) is available for the FN-preference retune
+    (§4.3), held at zero weight unless the §7 one-retune budget is spent.
+
+    Args:
+        cell_size: Spatial block edge in low-res voxels (default 16; the
+            128x128 grid -> 8x8 cells).
+        gamma: Focal focusing parameter (default 2.0).
+        alpha: Focal positive-class balance. ``None`` -> ``0.75`` (the
+            ``FocalLoss`` default); the ladder passes ``1 - p`` (p =
+            positive-cell frequency) to bias toward recall (§4.3).
+        aux_weight: Weight on the retained per-voxel pos-weighted BCE
+            (default 0.5).
+        pos_weight: ``pos_weight`` tensor for the auxiliary per-voxel BCE
+            (the trainer's derived ``(H_m*W_m)/tppf`` value). ``None``
+            uses unweighted BCE.
+        tversky_weight: Weight on the optional cell-level Tversky term
+            (default 0.0 = off).
+        tversky_alpha: Tversky FN weight (default 0.7).
+        tversky_beta: Tversky FP weight (default 0.3).
+        aggregation: ``'maxpool'`` (default, eval-aligned) or
+            ``'logsumexp'`` (the spec's original, mis-calibrated, choice).
+    """
+
+    _VALID_AGG = ("maxpool", "logsumexp")
+
+    def __init__(
+        self,
+        cell_size: int = 16,
+        gamma: float = 2.0,
+        alpha: float | None = None,
+        aux_weight: float = 0.5,
+        pos_weight: Tensor | None = None,
+        tversky_weight: float = 0.0,
+        tversky_alpha: float = 0.7,
+        tversky_beta: float = 0.3,
+        aggregation: str = "maxpool",
+    ) -> None:
+        super().__init__()
+        if aggregation not in self._VALID_AGG:
+            raise ValueError(
+                f"aggregation must be one of {self._VALID_AGG}; got {aggregation!r}"
+            )
+        self.aggregation = aggregation
+        self.cell_size = int(cell_size)
+        self.gamma = float(gamma)
+        self.alpha = 0.75 if alpha is None else float(alpha)
+        self.aux_weight = float(aux_weight)
+        self.tversky_weight = float(tversky_weight)
+        self.tversky_alpha = float(tversky_alpha)
+        self.tversky_beta = float(tversky_beta)
+        self.register_buffer(
+            "pos_weight",
+            None if pos_weight is None else pos_weight.detach().clone(),
+        )
+
+    def _cell_aggregate(
+        self, x: Tensor, reduce: str,
+    ) -> Tensor:
+        """Aggregate a ``(B, 1, T, H, W)`` field to ``(B, 1, gh, gw)``.
+
+        ``reduce='logsumexp'`` for logits (soft max over each block);
+        ``reduce='amax'`` for the mask (hard any-voxel rule). Blocks are
+        ``cell_size`` x ``cell_size`` spatial, collapsed over all ``T``.
+        """
+        B, C, T, H, W = x.shape
+        cs = self.cell_size
+        if H % cs != 0 or W % cs != 0:
+            raise ValueError(
+                f"CellFocalLoss: spatial dims ({H}x{W}) must be divisible "
+                f"by cell_size {cs}"
+            )
+        gh, gw = H // cs, W // cs
+        # (B, C, T, gh, cs, gw, cs) -> (B, C, gh, gw, T*cs*cs)
+        r = x.reshape(B, C, T, gh, cs, gw, cs)
+        r = r.permute(0, 1, 3, 5, 2, 4, 6).reshape(B, C, gh, gw, T * cs * cs)
+        if reduce == "logsumexp":
+            return torch.logsumexp(r, dim=-1)
+        if reduce == "amax":
+            return r.amax(dim=-1)
+        raise ValueError(f"unknown reduce {reduce!r}")
+
+    def forward(self, logits: Tensor, mask: Tensor) -> Tensor:
+        """Compute the cell-focal + auxiliary loss.
+
+        Args:
+            logits: ``(B, 1, T, H, W)`` low-res detection logits.
+            mask: ``(B, 1, T, H, W)`` low-res target mask (hard binary
+                for ``loss_target='cell_focal'``).
+
+        Returns:
+            Scalar combined loss.
+        """
+        # Cell aggregation (maxpool: eval-aligned; logsumexp: legacy/specced).
+        agg = "amax" if self.aggregation == "maxpool" else "logsumexp"
+        cell_logit = self._cell_aggregate(logits, agg)          # (B,1,gh,gw)
+        cell_label = (
+            self._cell_aggregate(mask, "amax") > 0.5
+        ).to(logits.dtype)                                       # (B,1,gh,gw)
+
+        # Focal loss on cell logits/labels. ``FocalLoss`` squeezes dim 1
+        # and takes targets of shape (B, gh, gw).
+        bce = F.binary_cross_entropy_with_logits(
+            cell_logit.squeeze(1), cell_label.squeeze(1), reduction="none"
+        )
+        p_t = torch.exp(-bce)
+        tgt = cell_label.squeeze(1)
+        alpha_t = self.alpha * tgt + (1.0 - self.alpha) * (1.0 - tgt)
+        focal = (alpha_t * (1.0 - p_t) ** self.gamma * bce).mean()
+
+        # Retained per-voxel pos-weighted BCE (auxiliary localization).
+        pw = self.pos_weight
+        if pw is not None and pw.device != logits.device:
+            pw = pw.to(logits.device)
+        aux = F.binary_cross_entropy_with_logits(
+            logits, mask, pos_weight=pw, reduction="mean",
+        )
+
+        loss = focal + self.aux_weight * aux
+
+        # Optional cell-level Tversky FN>FP term (off by default).
+        if self.tversky_weight > 0.0:
+            probs = torch.sigmoid(cell_logit.squeeze(1)).reshape(-1)
+            tflat = tgt.reshape(-1)
+            tp = (probs * tflat).sum()
+            fn = ((1.0 - probs) * tflat).sum()
+            fp = (probs * (1.0 - tflat)).sum()
+            tversky_index = (tp + 1e-6) / (
+                tp + self.tversky_alpha * fn + self.tversky_beta * fp + 1e-6
+            )
+            loss = loss + self.tversky_weight * (1.0 - tversky_index)
+
+        return loss

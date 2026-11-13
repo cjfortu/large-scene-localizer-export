@@ -1,0 +1,10 @@
+"""Gate -> classifier end-to-end system evaluation (chip-level recall, false detections/scene).
+
+Thin wrapper around ``localizer.pipeline.system_eval.main``; same as the console
+command ``lsl-system-eval``. Run with ``--help`` for the arguments.
+"""
+
+from localizer.pipeline.system_eval import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

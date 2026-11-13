@@ -1,0 +1,294 @@
+"""Border-flood attribution + interior-only localization re-score (v0.10).
+
+INFERENCE-ONLY diagnostic (no training, no backward, no checkpoint/code mutation).
+Follow-up to scripts/gate/rescore_percell.py (then rescore_v0_10_percell_coverage.py, commit c4aa080), which found
+the gate's positives are dominated by a content-independent perimeter frame.
+
+Part 1 - content-dependence map: per 8x8 cell, P(flag|present), P(flag|absent),
+         and contrast = P(flag|present) - P(flag|absent). Artifact cells fire in
+         both (contrast~0); signal cells fire more on present (contrast>0).
+Part 2 - interior-only re-score: drop the outer ring (keep interior 6x6=36 cells)
+         for truth AND prediction; recompute caught-rate, strict per-cell recall,
+         absent-FP load, and the border-only-target fairness count.
+Part 3 - seam attribution: (3.1) measure the input border-ring vs interior motion
+         (mean |frame-diff|) on a sample, as an 8x8 map to overlay on P(flag|absent);
+         (3.2) input-border ablation - blank the input outer 64px band (maps to the
+         outer cell ring) and re-run inference; if the perimeter prediction flood
+         vanishes it is input-content driven (data fix), if it persists it is an
+         architectural boundary effect (architecture fix).
+
+Native grid 32x128x128; cell = 16x16 voxels => 8x8=64 cells. Outer cell ring maps
+to the input's outer 64px band (low_res->input spatial factor 4; 16*4 = 64).
+
+Needs a CUDA GPU for practical speed (Mamba kernels); data/run/checkpoint
+locations resolve under $LSL_DATA_ROOT / $LSL_RUNS_ROOT / $LSL_CKPT_ROOT:
+  python scripts/gate/rescore_border.py --runs_dir <runs>/stage1_v0_10 --out border_attribution.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+
+
+from localizer.gate.model import build_segmenter_v0_7
+from localizer.common.checkpoint_io import load_weights
+from localizer.common.paths import add_root_args, resolve_under
+from localizer.common.data import make_dataloaders
+
+BUILD = dict(arm=2, nfeats=32, fusion="sum", stem_stride=2, dt_init_std=None)
+LOW_RES_POOL = (2, 4, 4)
+SUBSET_SIZE, VAL_SPLIT, VAL_SPLIT_SEED = 3000, 0.1, 0
+THRESHOLD = 0.5
+CELL, NGRID = 16, 8
+INPUT_BAND = 64           # outer cell ring -> outer 64px input band (16*4)
+ARMS = ("A", "B1")        # decision pair; B2 optional via --include_b2
+GATE_EPOCH = {"A": 42, "B1": 33, "B2": 33}
+ANCHORS = {"present": "vid1114_1.npy", "absent": "vid1059_0.npy"}
+ABLATION_N = 30           # per class for Part 3.2
+
+
+def build_val_dataset(data_root: str):
+    _, val_loader, datshape = make_dataloaders(
+        data_root=data_root, subset_size=SUBSET_SIZE, batch_size=1, num_workers=0,
+        val_split=VAL_SPLIT, val_split_seed=VAL_SPLIT_SEED,
+        output_resolution="low_res", soft_target=False, low_res_pool=LOW_RES_POOL,
+    )
+    return val_loader.dataset, datshape
+
+
+def cell_counts(voxel_bool: np.ndarray) -> np.ndarray:
+    t, h, w = voxel_bool.shape
+    return voxel_bool.reshape(t, NGRID, CELL, NGRID, CELL).sum(axis=(0, 2, 4)).astype(np.int64)
+
+
+def load_model(ckpt_path: Path, device):
+    model = build_segmenter_v0_7(**BUILD).to(device)
+    load_weights(model, ckpt_path, map_location=device, strict=True)
+    model.eval()
+    return model
+
+
+@torch.no_grad()
+def pred_voxel(model, vol_t, device):
+    logits = model(vol_t.unsqueeze(0).to(device)).float()
+    return (torch.sigmoid(logits) > THRESHOLD)[0, 0].cpu().numpy()   # (32,128,128) bool
+
+
+def ring_mask() -> np.ndarray:
+    """8x8 boolean: True on the outer ring (rows/cols 0 or 7)."""
+    m = np.zeros((NGRID, NGRID), dtype=bool)
+    m[0, :] = m[-1, :] = m[:, 0] = m[:, -1] = True
+    return m
+
+
+RING = ring_mask()
+INTERIOR = ~RING                 # 6x6 interior True (36 cells)
+
+
+def fmt_map(a, fmt="{:5.2f}"):
+    return [" ".join(fmt.format(v) for v in row) for row in a]
+
+
+def parts_1_2(arm, runs_root, dataset, device):
+    model = load_model(runs_root / arm / "models" / "best_gate_model.pth", device)
+    n = len(dataset)
+    flag_present = np.zeros((NGRID, NGRID))
+    flag_absent = np.zeros((NGRID, NGRID))
+    np_ = na = 0
+    # interior accumulators
+    int_caught = 0; int_scoreable = 0; int_border_only = 0
+    int_truthpred = 0; int_truth_tot = 0
+    int_absent_flagged = []
+    for i in range(n):
+        s = dataset[i]
+        label = int(s["label"])
+        truth = (np.asarray(s["mask_hard"])[0] > 0.5)
+        pred = pred_voxel(model, torch.as_tensor(s["volume"]), device)
+        tcell = cell_counts(truth) >= 1
+        pcell = cell_counts(pred) >= 1
+        if label == 1:
+            np_ += 1; flag_present += pcell
+            it = tcell & INTERIOR; ip = pcell & INTERIOR
+            ntruth = int(it.sum())
+            int_truth_tot += ntruth
+            int_truthpred += int((it & ip).sum())
+            if ntruth == 0:
+                int_border_only += 1
+            else:
+                int_scoreable += 1
+                if (it & ip).any():
+                    int_caught += 1
+        else:
+            na += 1; flag_absent += pcell
+            int_absent_flagged.append(int((pcell & INTERIOR).sum()))
+    Pp = flag_present / max(np_, 1)
+    Pa = flag_absent / max(na, 1)
+    af = np.asarray(int_absent_flagged, dtype=float) if int_absent_flagged else np.array([0.0])
+    return {
+        "arm": arm, "gate_epoch": GATE_EPOCH[arm], "n_present": np_, "n_absent": na,
+        "P_flag_present": Pp.tolist(), "P_flag_absent": Pa.tolist(),
+        "contrast": (Pp - Pa).tolist(),
+        "ring_mean_P_present": float(Pp[RING].mean()), "ring_mean_P_absent": float(Pa[RING].mean()),
+        "ring_mean_contrast": float((Pp - Pa)[RING].mean()),
+        "interior_mean_P_present": float(Pp[INTERIOR].mean()),
+        "interior_mean_P_absent": float(Pa[INTERIOR].mean()),
+        "interior_mean_contrast": float((Pp - Pa)[INTERIOR].mean()),
+        "interior_caught_rate_scoreable": int_caught / max(int_scoreable, 1),
+        "interior_caught_rate_all_present": int_caught / max(np_, 1),
+        "interior_strict_recall": int_truthpred / max(int_truth_tot, 1),
+        "interior_border_only_target_count": int_border_only,
+        "interior_scoreable_present": int_scoreable,
+        "interior_absent_flagged_mean": float(af.mean()),
+        "interior_absent_flagged_p50": float(np.percentile(af, 50)),
+        "interior_absent_flagged_p95": float(np.percentile(af, 95)),
+        "interior_absent_flagged_max": float(af.max()),
+        "_model": model,
+    }
+
+
+def part3_1_input_motion(dataset, n_sample=40):
+    """8x8 input motion map (mean |frame-diff|) for absent scenes + ring vs interior."""
+    absent_idx = [i for i in range(len(dataset)) if int(dataset[i]["label"]) == 0][:n_sample]
+    acc = np.zeros((NGRID, NGRID))
+    for i in absent_idx:
+        vol = np.asarray(dataset[i]["volume"])[0]               # (64,512,512) float in [0,1]
+        d = np.abs(np.diff(vol, axis=0)).mean(axis=0)           # (512,512) mean temporal motion
+        block = d.reshape(NGRID, 512 // NGRID, NGRID, 512 // NGRID).mean(axis=(1, 3))
+        acc += block
+    m = acc / max(len(absent_idx), 1)
+    return {
+        "n_absent_sampled": len(absent_idx),
+        "input_motion_map_absent": m.tolist(),
+        "ring_mean_motion": float(m[RING].mean()),
+        "interior_mean_motion": float(m[INTERIOR].mean()),
+        "ring_over_interior_ratio": float(m[RING].mean() / max(m[INTERIOR].mean(), 1e-9)),
+    }
+
+
+def blank_band(vol_t):
+    """Zero the outer INPUT_BAND px frame of a (1,T,512,512) tensor (clone)."""
+    v = vol_t.clone()
+    b = INPUT_BAND
+    v[..., :b, :] = 0; v[..., -b:, :] = 0; v[..., :, :b] = 0; v[..., :, -b:] = 0
+    return v
+
+
+def part3_2_ablation(model, dataset, device, n_each=ABLATION_N):
+    present_idx = [i for i in range(len(dataset)) if int(dataset[i]["label"]) == 1][:n_each]
+    absent_idx = [i for i in range(len(dataset)) if int(dataset[i]["label"]) == 0][:n_each]
+    out = {}
+    for tag, idxs in (("present", present_idx), ("absent", absent_idx)):
+        ring_orig = []; ring_blank = []; int_orig = []; int_blank = []
+        for i in idxs:
+            vol = torch.as_tensor(dataset[i]["volume"])
+            po = cell_counts(pred_voxel(model, vol, device)) >= 1
+            pb = cell_counts(pred_voxel(model, blank_band(vol), device)) >= 1
+            ring_orig.append(int(po[RING].sum())); ring_blank.append(int(pb[RING].sum()))
+            int_orig.append(int(po[INTERIOR].sum())); int_blank.append(int(pb[INTERIOR].sum()))
+        out[tag] = {
+            "n": len(idxs),
+            "ring_cells_orig_mean": float(np.mean(ring_orig)),
+            "ring_cells_blanked_mean": float(np.mean(ring_blank)),
+            "interior_cells_orig_mean": float(np.mean(int_orig)),
+            "interior_cells_blanked_mean": float(np.mean(int_blank)),
+        }
+    return out
+
+
+def anchor_interior(model, dataset, device):
+    out = {}
+    name_to_idx = {}
+    for i in range(len(dataset)):
+        name_to_idx[dataset[i].get("file_name", "")] = i
+    for tag, fname in ANCHORS.items():
+        i = name_to_idx.get(fname)
+        if i is None:
+            out[tag] = {"error": f"{fname} not in val set"}; continue
+        s = dataset[i]
+        truth = cell_counts(np.asarray(s["mask_hard"])[0] > 0.5)
+        pred = cell_counts(pred_voxel(model, torch.as_tensor(s["volume"]), device))
+        tcell_int = (truth >= 1) & INTERIOR
+        pcell_int = (pred >= 1) & INTERIOR
+        out[tag] = {
+            "file": fname, "val_index": i,
+            "interior_truth_cells": int(tcell_int.sum()),
+            "interior_pred_cells": int(pcell_int.sum()),
+            "interior_overlap_cells": int((tcell_int & pcell_int).sum()),
+        }
+    return out
+
+
+RUNS_REQUIRED = True
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--dataset", default="multi_target_swarm_512x512x64",
+                   help="dataset name under the data root, or an absolute path")
+    p.add_argument("--runs_dir", required=RUNS_REQUIRED,
+                   help="run directory holding <arm>/models/*.pth; relative to the runs root, or absolute")
+    p.add_argument("--out", required=True)
+    p.add_argument("--include_b2", action="store_true")
+    add_root_args(p, ("data", "runs", "ckpt"))
+    args = p.parse_args()
+    args.data_root = str(resolve_under("data", args.dataset, args.data_root_dir))
+    args.runs_root = (str(resolve_under("runs", args.runs_dir, args.runs_root_dir))
+                      if args.runs_dir else None)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device={device} host={socket.gethostname()}")
+    dataset, datshape = build_val_dataset(args.data_root)
+    print(f"val scenes={len(dataset)} datshape={datshape}")
+    runs_root = Path(args.runs_root) if args.runs_root else None
+    arms = list(ARMS) + (["B2"] if args.include_b2 else [])
+
+    results = {}; b1_model = None
+    for arm in arms:
+        print(f"--- parts 1+2: {arm} ---", flush=True)
+        r = parts_1_2(arm, runs_root, dataset, device)
+        model = r.pop("_model")          # always strip the model from the dict
+        if arm == "B1":
+            b1_model = model
+        results[arm] = r
+        print(f"  {arm}: ring P(abs)={r['ring_mean_P_absent']:.3f} ring contrast={r['ring_mean_contrast']:.3f} "
+              f"| INT caught={r['interior_caught_rate_scoreable']:.3f} INT recall={r['interior_strict_recall']:.3f} "
+              f"INT absFP mean={r['interior_absent_flagged_mean']:.2f} p95={r['interior_absent_flagged_p95']:.1f} "
+              f"border-only-tgt={r['interior_border_only_target_count']}")
+
+    print("--- part 3.1: input motion map ---", flush=True)
+    motion = part3_1_input_motion(dataset)
+    print(f"  ring/interior motion ratio = {motion['ring_over_interior_ratio']:.3f}")
+
+    print("--- part 3.2: input-border ablation (B1) ---", flush=True)
+    ablation = part3_2_ablation(b1_model, dataset, device)
+    for tag in ("present", "absent"):
+        a = ablation[tag]
+        print(f"  {tag}: ring {a['ring_cells_orig_mean']:.2f} -> {a['ring_cells_blanked_mean']:.2f} | "
+              f"interior {a['interior_cells_orig_mean']:.2f} -> {a['interior_cells_blanked_mean']:.2f}")
+
+    print("--- anchor (B1 interior) ---", flush=True)
+    anchors = anchor_interior(b1_model, dataset, device)
+
+    payload = {
+        "meta": {"threshold": THRESHOLD, "grid": "8x8", "interior": "6x6 (drop outer ring)",
+                 "input_band_px": INPUT_BAND, "build": BUILD, "data_root": args.data_root,
+                , "note_generator": "swarm generator uses border CLIPPING, not toroidal wrap"},
+        "results": results, "input_motion_part3_1": motion,
+        "border_ablation_part3_2": ablation, "anchors_B1_interior": anchors,
+    }
+    outp = Path(args.out); outp.parent.mkdir(parents=True, exist_ok=True)
+    outp.write_text(json.dumps(payload, indent=2, default=str))
+    print(f"wrote {outp}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

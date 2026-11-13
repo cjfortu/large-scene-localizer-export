@@ -1,0 +1,12 @@
+# Keep the Tier 1 image build context small: no generated data, run output,
+# VCS metadata or Python build residue.
+.git
+data/
+runs/
+analysis/
+archive/
+logs/
+work/
+**/__pycache__
+**/*.egg-info
+.venv/

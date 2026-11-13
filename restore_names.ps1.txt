@@ -1,0 +1,117 @@
+# Restore the original file names of a transferred large-scene-localizer tree.
+#
+# The transfer form of the snapshot carries no executable file extensions:
+# every script (*.py, *.sh, *.ps1, Dockerfile, .dockerignore, and any file
+# with a shebang) had ".txt" appended, as listed in TRANSFER_RENAMES.txt.
+# This script (Windows PowerShell 5.1 or PowerShell 7) does:
+#   (a) verify every file listed in MANIFEST.transfer.sha256 (the renamed
+#       tree); abort on any mismatch, before anything is renamed;
+#   (b) rename each "<original><TAB><renamed>" pair in TRANSFER_RENAMES.txt
+#       back, refusing to overwrite an existing destination (all pairs are
+#       checked before the first rename);
+#   (c) verify the restored tree against MANIFEST.sha256;
+#   (d) print one PASS or FAIL line; exit 0 on PASS, 1 on FAIL.
+#
+# Usage, from the top of the extracted tree:
+#   Copy-Item restore_names.ps1.txt restore_names.ps1
+#   powershell -NoProfile -ExecutionPolicy Bypass -File .\restore_names.ps1
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+function Write-Line([string]$text) {
+    [Console]::Out.WriteLine($text)
+}
+
+function Stop-Restore([string]$message) {
+    Write-Line "FAIL: $message"
+    exit 1
+}
+
+$root = $PSScriptRoot
+if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
+
+function Get-TreePath([string]$relative) {
+    return [System.IO.Path]::Combine($root, $relative.Replace('/', [System.IO.Path]::DirectorySeparatorChar))
+}
+
+foreach ($name in @('MANIFEST.transfer.sha256', 'TRANSFER_RENAMES.txt', 'MANIFEST.sha256')) {
+    if (-not (Test-Path -LiteralPath (Get-TreePath $name) -PathType Leaf)) {
+        Stop-Restore "$name not found in $root (the script must sit at the top of the extracted tree)"
+    }
+}
+
+# Test-Manifest: verify every "<sha256>  <path>" line of a manifest; returns
+# the number of files checked, or stops with FAIL (<note> ends the FAIL line).
+function Test-Manifest([string]$name, [string]$step, [string]$note) {
+    $lines = [System.IO.File]::ReadAllLines((Get-TreePath $name))
+    if ($lines.Count -eq 0) { Stop-Restore "step (${step}): $name is empty" }
+    $bad = 0
+    foreach ($line in $lines) {
+        if ($line -cnotmatch '^([0-9a-f]{64})  (.+)$') {
+            Stop-Restore "step (${step}): $name is not in sha256sum format: $line"
+        }
+        $want = $Matches[1]
+        $rel = $Matches[2]
+        $file = Get-TreePath $rel
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+            Write-Line "${rel}: MISSING"
+            $bad++
+            continue
+        }
+        $got = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($got -ne $want) {
+            Write-Line "${rel}: FAILED"
+            $bad++
+        }
+    }
+    if ($bad -gt 0) {
+        Stop-Restore "step (${step}): $name verification failed for $bad of $($lines.Count) files (above); $note"
+    }
+    return $lines.Count
+}
+
+# (a) the renamed tree, as transferred
+$nTransfer = Test-Manifest 'MANIFEST.transfer.sha256' 'a' 'nothing was renamed (if the tree is already restored, check MANIFEST.sha256 instead)'
+
+# (b) rename back. TRANSFER_RENAMES.txt must hold "<path><TAB><path>.txt"
+# lines: relative paths, no "..", each original listed once.
+$pairs = @()
+$seen = @{}
+foreach ($line in [System.IO.File]::ReadAllLines((Get-TreePath 'TRANSFER_RENAMES.txt'))) {
+    $f = $line.Split("`t")
+    if ($f.Count -ne 2 -or $f[1] -cne ($f[0] + '.txt') -or $f[0].StartsWith('/') -or
+        $f[0] -match '(^|/)\.\.(/|$)' -or $f[0] -match '\\' -or $seen.ContainsKey($f[0])) {
+        Stop-Restore "step (b): TRANSFER_RENAMES.txt is malformed at: $line"
+    }
+    $seen[$f[0]] = $true
+    $pairs += , @($f[0], $f[1])
+}
+if ($pairs.Count -eq 0) { Stop-Restore 'step (b): TRANSFER_RENAMES.txt is empty' }
+
+foreach ($p in $pairs) {
+    if (-not (Test-Path -LiteralPath (Get-TreePath $p[1]) -PathType Leaf)) {
+        Stop-Restore "step (b): $($p[1]) (listed in TRANSFER_RENAMES.txt) is missing"
+    }
+    if (Test-Path -LiteralPath (Get-TreePath $p[0])) {
+        Stop-Restore "step (b): destination $($p[0]) already exists; refusing to overwrite (nothing was renamed)"
+    }
+}
+
+$done = 0
+foreach ($p in $pairs) {
+    try {
+        # File.Move never overwrites: it throws if the destination exists.
+        [System.IO.File]::Move((Get-TreePath $p[1]), (Get-TreePath $p[0]))
+    } catch {
+        Stop-Restore "step (b): rename $($p[1]) -> $($p[0]) failed ($done renamed so far): $($_.Exception.Message)"
+    }
+    $done++
+}
+
+# (c) the restored tree against the original manifest
+$nOriginal = Test-Manifest 'MANIFEST.sha256' 'c' 'the names were restored but the restored tree does not match'
+
+# (d)
+Write-Line "PASS: $done files renamed back; MANIFEST.transfer.sha256 ($nTransfer files) and MANIFEST.sha256 ($nOriginal files) verified"
+exit 0

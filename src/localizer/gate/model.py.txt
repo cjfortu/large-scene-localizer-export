@@ -1,0 +1,1353 @@
+"""Stage 1 v0 / v0.5 / v0.6 segmenter classes and factories.
+
+v0 (this module) implements the four-variant bottleneck sweep per
+``documents/history/specs/stage1_v0_design.md`` §3. All four variants share an
+identical encoder, decoder (except for ``up4`` in-channels), and output
+head; they differ only in the bottleneck block:
+
+* Variant A — ``DoubleConv3D(256, 512)`` (canonical 3D U-Net bottleneck).
+* Variant B — ``Conv3d(256, 512, kernel=1)`` only (minimal delta from recovered).
+* Variant C — ``Conv3d(256, 512, 1)`` + ``DoubleConv3D(512, 512)`` (hybrid).
+* Variant D — identity (no bottleneck block; channel widths max at 256).
+
+For variants A, B, C the bottleneck output is 512 channels and the
+decoder's ``up4`` is ``ConvTranspose3d(512, 256, 2, stride=2)``. For
+variant D the bottleneck output is 256 channels and ``up4`` is
+``ConvTranspose3d(256, 256, 2, stride=2)``.
+
+The ``DoubleConv3D`` building block is reused verbatim from
+``localizer.common.blocks``.
+
+This module also hosts the v0.5 temporal-axis variant sweep per
+``documents/history/specs/stage1_v0_5_design.md`` §6: a ``build_segmenter_v0_5``
+factory that dispatches on ``temporal_variant`` and a sibling
+``TemporalVariantSegmenter3D`` class for the three non-baseline arms
+(wide_t_kernel, delayed_t_pool, dilated_t). The factory returns
+``PureConvSegmenter3D`` directly for ``temporal_variant="baseline"``,
+guaranteeing literal bit-identity with v0 for Arm 1.
+
+v0.6 adds the four-arm SSM existence-proof sweep per
+``documents/history/specs/stage1_v0_6_design.md`` §3: a
+``build_segmenter_v0_6`` factory that dispatches on ``arm`` to one of
+four classes. Arms 1 and 2 reuse the v0/v0.5 CNN encoder structure
+(Variant D bottleneck) and insert a single ``TemporalMambaBlock`` after
+``down1``; Arm 1 keeps the full U-Net decoder, Arm 2 replaces it with a
+low-resolution head. Arms 3 and 4 are pure-Mamba with a patchify
+encoder of ``TokenMambaBlock``s; Arm 3 has a symmetric token-split
+decoder + ConvTranspose unpatchify, Arm 4 has a small low-resolution
+head. All v0.6 classes are additive — v0 and v0.5 paths are unchanged.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+from localizer.common.blocks import DoubleConv3D
+
+from localizer.gate.blocks import (
+    PatchEmbed3D, TemporalMambaBlock, TokenMambaBlock,
+    TokenMambaBlockConcatFusion, TokenMambaBlockV07,
+    TokenMerge3D, TokenSplit3D,
+)
+
+
+_VALID_VARIANTS = ("A", "B", "C", "D")
+
+
+class PureConvSegmenter3D(nn.Module):
+    """Pure-conv 3D segmenter with four selectable bottleneck variants.
+
+    Args:
+        bottleneck_variant: One of ``"A"``, ``"B"``, ``"C"``, ``"D"``.
+            Selects the bottleneck block and the matching ``up4``
+            in-channel count.
+        nfeats: Number of initial encoder channels (output of stage 1).
+            Subsequent encoder stages double up to ``nfeats * 8`` at the
+            bottleneck input. ``nfeats=32`` matches the recovered
+            segmenter and the v0 design.
+    """
+
+    def __init__(self, bottleneck_variant: str, nfeats: int = 32) -> None:
+        super().__init__()
+        if bottleneck_variant not in _VALID_VARIANTS:
+            raise ValueError(
+                f"bottleneck_variant must be one of {_VALID_VARIANTS}; "
+                f"got {bottleneck_variant!r}"
+            )
+        self.bottleneck_variant = bottleneck_variant
+        self.nfeats = nfeats
+
+        c1, c2, c3, c4 = nfeats, nfeats * 2, nfeats * 4, nfeats * 8
+        c_bot = nfeats * 16
+
+        self.down1 = DoubleConv3D(1, c1)
+        self.pool1 = nn.MaxPool3d(2)
+        self.down2 = DoubleConv3D(c1, c2)
+        self.pool2 = nn.MaxPool3d(2)
+        self.down3 = DoubleConv3D(c2, c3)
+        self.pool3 = nn.MaxPool3d(2)
+        self.down4 = DoubleConv3D(c3, c4)
+        self.pool4 = nn.MaxPool3d(2)
+
+        if bottleneck_variant == "A":
+            self.bottleneck = DoubleConv3D(c4, c_bot)
+            bot_out = c_bot
+        elif bottleneck_variant == "B":
+            self.bottleneck = nn.Conv3d(c4, c_bot, kernel_size=1, stride=1)
+            bot_out = c_bot
+        elif bottleneck_variant == "C":
+            self.bottleneck = nn.Sequential(
+                nn.Conv3d(c4, c_bot, kernel_size=1, stride=1),
+                DoubleConv3D(c_bot, c_bot),
+            )
+            bot_out = c_bot
+        else:  # "D"
+            self.bottleneck = nn.Identity()
+            bot_out = c4
+
+        self.up4 = nn.ConvTranspose3d(bot_out, c4, 2, stride=2)
+        self.conv4 = DoubleConv3D(c4 * 2, c4)
+        self.up3 = nn.ConvTranspose3d(c4, c3, 2, stride=2)
+        self.conv3 = DoubleConv3D(c3 * 2, c3)
+        self.up2 = nn.ConvTranspose3d(c3, c2, 2, stride=2)
+        self.conv2 = DoubleConv3D(c2 * 2, c2)
+        self.up1 = nn.ConvTranspose3d(c2, c1, 2, stride=2)
+        self.conv1 = DoubleConv3D(c1 * 2, c1)
+        self.final = nn.Conv3d(c1, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        d1 = self.down1(x)
+        p1 = self.pool1(d1)
+        d2 = self.down2(p1)
+        p2 = self.pool2(d2)
+        d3 = self.down3(p2)
+        p3 = self.pool3(d3)
+        d4 = self.down4(p3)
+        p4 = self.pool4(d4)
+        b = self.bottleneck(p4)
+        u4 = self.up4(b)
+        c4 = self.conv4(torch.cat([u4, d4], dim=1))
+        u3 = self.up3(c4)
+        c3 = self.conv3(torch.cat([u3, d3], dim=1))
+        u2 = self.up2(c3)
+        c2 = self.conv2(torch.cat([u2, d2], dim=1))
+        u1 = self.up1(c2)
+        c1 = self.conv1(torch.cat([u1, d1], dim=1))
+        return self.final(c1)
+
+
+_VALID_TEMPORAL_VARIANTS = (
+    "baseline", "wide_t_kernel", "delayed_t_pool", "dilated_t",
+)
+
+
+class _DoubleConv3D_v0_5(nn.Module):
+    """Two Conv3d + BatchNorm3d + ReLU in series, with per-axis kernel
+    and temporal dilation parameters.
+
+    Mirrors ``localizer.common.blocks.DoubleConv3D`` but accepts
+    ``temporal_kernel_size``, ``spatial_kernel_size``, and ``dilation_t``
+    so the v0.5 temporal-axis variants can be expressed by varying these
+    arguments while holding the rest of the U-Net constant.
+
+    Padding is computed per axis to preserve ``(T, H, W)`` shape across
+    each conv: for kernel ``(kt, ks, ks)`` with dilation ``(dt, 1, 1)``,
+    padding is ``(dt * (kt - 1) // 2, ks // 2, ks // 2)``.
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        temporal_kernel_size: int = 3,
+        spatial_kernel_size: int = 3,
+        dilation_t: int = 1,
+    ) -> None:
+        super().__init__()
+        kt, ks, dt = temporal_kernel_size, spatial_kernel_size, dilation_t
+        kernel = (kt, ks, ks)
+        padding = (dt * (kt - 1) // 2, ks // 2, ks // 2)
+        dilation = (dt, 1, 1)
+        self.conv = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, kernel_size=kernel,
+                      padding=padding, dilation=dilation),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_ch, out_ch, kernel_size=kernel,
+                      padding=padding, dilation=dilation),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class TemporalVariantSegmenter3D(nn.Module):
+    """3D U-Net segmenter parameterized on the encoder temporal axis.
+
+    Implements the three non-baseline v0.5 arms per
+    ``documents/history/specs/stage1_v0_5_design.md`` §2 and §6:
+
+    * ``wide_t_kernel`` — all encoder convs use temporal kernel 5
+      (5×3×3); pools unchanged at 2×2×2.
+    * ``delayed_t_pool`` — encoder convs unchanged at 3×3×3;
+      first pool is ``(1, 2, 2)`` (spatial-only) to preserve T at the
+      first encoder stage. The corresponding ``up1`` is
+      ``(1, 2, 2)`` stride so the decoder mirrors the asymmetric
+      first-stage pooling and the d1 skip concat shape-matches.
+    * ``dilated_t`` — encoder convs at stages 3-4 use temporal
+      dilation 2 (effective T receptive field doubles at the same
+      activation memory); stages 1-2 unchanged. Pools 2×2×2.
+
+    The bottleneck is held at Variant D (``nn.Identity()``,
+    ``bot_out = c4 = nfeats * 8``) across all three non-baseline arms
+    per design §2.5. Decoder convs are the standard
+    ``DoubleConv3D(3×3×3)`` — temporal integration is an encoder concern
+    per §2.2.
+
+    The ``temporal_variant="baseline"`` value is NOT a valid argument
+    here — the v0.5 factory dispatches that case to
+    ``PureConvSegmenter3D`` directly so Arm 1 is literally the v0
+    model.
+
+    Args:
+        temporal_variant: One of ``"wide_t_kernel"``,
+            ``"delayed_t_pool"``, ``"dilated_t"``.
+        nfeats: Number of initial encoder channels (output of stage 1).
+            Subsequent encoder stages double up to ``nfeats * 8``.
+            ``nfeats=32`` matches the v0 segmenter and the v0.5 design.
+    """
+
+    def __init__(self, temporal_variant: str, nfeats: int = 32) -> None:
+        super().__init__()
+        if temporal_variant not in _VALID_TEMPORAL_VARIANTS:
+            raise ValueError(
+                f"temporal_variant must be one of {_VALID_TEMPORAL_VARIANTS}; "
+                f"got {temporal_variant!r}"
+            )
+        if temporal_variant == "baseline":
+            raise ValueError(
+                "TemporalVariantSegmenter3D does not implement the "
+                "baseline arm; use build_segmenter_v0_5(temporal_variant="
+                "'baseline', ...) which dispatches to PureConvSegmenter3D."
+            )
+        self.temporal_variant = temporal_variant
+        self.nfeats = nfeats
+
+        c1, c2, c3, c4 = nfeats, nfeats * 2, nfeats * 4, nfeats * 8
+
+        if temporal_variant == "wide_t_kernel":
+            kts = (5, 5, 5, 5)
+            dts = (1, 1, 1, 1)
+        elif temporal_variant == "delayed_t_pool":
+            kts = (3, 3, 3, 3)
+            dts = (1, 1, 1, 1)
+        else:  # dilated_t
+            kts = (3, 3, 3, 3)
+            dts = (1, 1, 2, 2)
+
+        self.down1 = _DoubleConv3D_v0_5(
+            1, c1, temporal_kernel_size=kts[0], dilation_t=dts[0],
+        )
+        if temporal_variant == "delayed_t_pool":
+            self.pool1 = nn.MaxPool3d(kernel_size=(1, 2, 2))
+        else:
+            self.pool1 = nn.MaxPool3d(2)
+        self.down2 = _DoubleConv3D_v0_5(
+            c1, c2, temporal_kernel_size=kts[1], dilation_t=dts[1],
+        )
+        self.pool2 = nn.MaxPool3d(2)
+        self.down3 = _DoubleConv3D_v0_5(
+            c2, c3, temporal_kernel_size=kts[2], dilation_t=dts[2],
+        )
+        self.pool3 = nn.MaxPool3d(2)
+        self.down4 = _DoubleConv3D_v0_5(
+            c3, c4, temporal_kernel_size=kts[3], dilation_t=dts[3],
+        )
+        self.pool4 = nn.MaxPool3d(2)
+
+        # Variant D bottleneck (identity) across all v0.5 arms.
+        self.bottleneck = nn.Identity()
+        bot_out = c4
+
+        self.up4 = nn.ConvTranspose3d(bot_out, c4, 2, stride=2)
+        self.conv4 = DoubleConv3D(c4 * 2, c4)
+        self.up3 = nn.ConvTranspose3d(c4, c3, 2, stride=2)
+        self.conv3 = DoubleConv3D(c3 * 2, c3)
+        self.up2 = nn.ConvTranspose3d(c3, c2, 2, stride=2)
+        self.conv2 = DoubleConv3D(c2 * 2, c2)
+        # up1 must mirror pool1's geometry so the d1 skip concat matches.
+        if temporal_variant == "delayed_t_pool":
+            self.up1 = nn.ConvTranspose3d(
+                c2, c1, kernel_size=(1, 2, 2), stride=(1, 2, 2),
+            )
+        else:
+            self.up1 = nn.ConvTranspose3d(c2, c1, 2, stride=2)
+        self.conv1 = DoubleConv3D(c1 * 2, c1)
+        self.final = nn.Conv3d(c1, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        d1 = self.down1(x)
+        p1 = self.pool1(d1)
+        d2 = self.down2(p1)
+        p2 = self.pool2(d2)
+        d3 = self.down3(p2)
+        p3 = self.pool3(d3)
+        d4 = self.down4(p3)
+        p4 = self.pool4(d4)
+        b = self.bottleneck(p4)
+        u4 = self.up4(b)
+        c4 = self.conv4(torch.cat([u4, d4], dim=1))
+        u3 = self.up3(c4)
+        c3 = self.conv3(torch.cat([u3, d3], dim=1))
+        u2 = self.up2(c3)
+        c2 = self.conv2(torch.cat([u2, d2], dim=1))
+        u1 = self.up1(c2)
+        c1 = self.conv1(torch.cat([u1, d1], dim=1))
+        return self.final(c1)
+
+
+def build_segmenter_v0_5(
+    temporal_variant: str,
+    bottleneck_variant: str = "D",
+    nfeats: int = 32,
+) -> nn.Module:
+    """Factory for the Stage 1 v0.5 temporal-axis variant sweep.
+
+    Per ``documents/history/specs/stage1_v0_5_design.md`` §6: dispatch on
+    ``temporal_variant`` to either the v0 ``PureConvSegmenter3D`` (Arm 1)
+    or the sibling ``TemporalVariantSegmenter3D`` (Arms 2-4). The
+    baseline branch returns ``PureConvSegmenter3D`` *directly* — no
+    wrapping — so Arm 1 is literally the v0 model, with the same class,
+    the same parameter initialization, and the same state-dict keys.
+
+    Args:
+        temporal_variant: One of ``"baseline"``, ``"wide_t_kernel"``,
+            ``"delayed_t_pool"``, ``"dilated_t"``.
+        bottleneck_variant: Used only when ``temporal_variant=="baseline"``;
+            passed through to ``PureConvSegmenter3D``. For the
+            non-baseline arms the bottleneck is held at Variant D per
+            §2.5 and this argument is ignored.
+        nfeats: Number of initial encoder channels.
+
+    Returns:
+        Either a ``PureConvSegmenter3D`` (baseline) or a
+        ``TemporalVariantSegmenter3D`` (other variants).
+    """
+    if temporal_variant not in _VALID_TEMPORAL_VARIANTS:
+        raise ValueError(
+            f"temporal_variant must be one of {_VALID_TEMPORAL_VARIANTS}; "
+            f"got {temporal_variant!r}"
+        )
+    if temporal_variant == "baseline":
+        return PureConvSegmenter3D(
+            bottleneck_variant=bottleneck_variant, nfeats=nfeats,
+        )
+    return TemporalVariantSegmenter3D(
+        temporal_variant=temporal_variant, nfeats=nfeats,
+    )
+
+
+# --------------------------------------------------------------------------
+# v0.6 SSM existence-proof sweep classes + factory.
+#
+# All four classes accept (B, 1, 64, 128, 128) input. Arms 1 and 3
+# produce (B, 1, 64, 128, 128) logits; Arms 2 and 4 produce
+# (B, 1, 32, 32, 32) logits supervised on a max-pooled mask per design
+# §3.3, §3.6.
+# --------------------------------------------------------------------------
+
+
+_VALID_V0_6_ARMS = (1, 2, 3, 4)
+
+
+class Stage1V06Arm1CnnMambaUnet(nn.Module):
+    """Arm 1 — CNN+Mamba U-Net (full-resolution decoder) per §3.2.
+
+    Variant D encoder (identity bottleneck) from ``PureConvSegmenter3D``
+    with a single ``TemporalMambaBlock`` inserted between ``down2`` and
+    ``pool2`` per the amended §3.2 (spec §11.12 records the move from
+    the original stage-1 placement after a STOP #2 pre-flight measured
+    ~47 GiB at the stage-1 shape; stage 2 is the cheaper-and-still-
+    expressive placement that also scales to the 1024² target).
+
+    At the stage-2 entry, ``d2`` has shape ``(B, c2=64, T/2=32, H/2=64,
+    W/2=64)``; the Mamba block transforms ``d2`` and the transformed
+    tensor is then both the input to ``pool2`` AND the decoder's ``d2``
+    skip. The single-path design preserves spec §3.2's "no pre-/post-
+    Mamba branching" decision.
+
+    Args:
+        nfeats: Initial encoder channel count. Default 32.
+    """
+
+    def __init__(self, nfeats: int = 32) -> None:
+        super().__init__()
+        self.nfeats = nfeats
+        c1, c2, c3, c4 = nfeats, nfeats * 2, nfeats * 4, nfeats * 8
+
+        self.down1 = DoubleConv3D(1, c1)
+        self.pool1 = nn.MaxPool3d(2)
+        self.down2 = DoubleConv3D(c1, c2)
+        self.mamba2 = TemporalMambaBlock(channels=c2)
+        self.pool2 = nn.MaxPool3d(2)
+        self.down3 = DoubleConv3D(c2, c3)
+        self.pool3 = nn.MaxPool3d(2)
+        self.down4 = DoubleConv3D(c3, c4)
+        self.pool4 = nn.MaxPool3d(2)
+        self.bottleneck = nn.Identity()  # Variant D
+
+        bot_out = c4
+        self.up4 = nn.ConvTranspose3d(bot_out, c4, 2, stride=2)
+        self.conv4 = DoubleConv3D(c4 * 2, c4)
+        self.up3 = nn.ConvTranspose3d(c4, c3, 2, stride=2)
+        self.conv3 = DoubleConv3D(c3 * 2, c3)
+        self.up2 = nn.ConvTranspose3d(c3, c2, 2, stride=2)
+        self.conv2 = DoubleConv3D(c2 * 2, c2)
+        self.up1 = nn.ConvTranspose3d(c2, c1, 2, stride=2)
+        self.conv1 = DoubleConv3D(c1 * 2, c1)
+        self.final = nn.Conv3d(c1, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        d1 = self.down1(x)
+        p1 = self.pool1(d1)
+        d2 = self.down2(p1)
+        d2 = self.mamba2(d2)
+        p2 = self.pool2(d2)
+        d3 = self.down3(p2)
+        p3 = self.pool3(d3)
+        d4 = self.down4(p3)
+        p4 = self.pool4(d4)
+        b = self.bottleneck(p4)
+        u4 = self.up4(b)
+        c4 = self.conv4(torch.cat([u4, d4], dim=1))
+        u3 = self.up3(c4)
+        c3 = self.conv3(torch.cat([u3, d3], dim=1))
+        u2 = self.up2(c3)
+        c2 = self.conv2(torch.cat([u2, d2], dim=1))
+        u1 = self.up1(c2)
+        c1 = self.conv1(torch.cat([u1, d1], dim=1))
+        return self.final(c1)
+
+
+class Stage1V06Arm2CnnMambaLowRes(nn.Module):
+    """Arm 2 — CNN+Mamba encoder + low-resolution head per §3.3.
+
+    Same encoder as Arm 1 (Variant D with one ``TemporalMambaBlock``
+    after ``down2`` per the amended §3.2 — see §11.12 for the
+    stage-1 → stage-2 move), tapped at ``down4``'s output
+    ``(B, c4=256, 8, 16, 16)``. A 1x1x1 conv reduces to a single
+    channel and trilinear interpolation upsamples to the supervised
+    resolution ``(32, 32, 32)``.
+
+    Args:
+        nfeats: Initial encoder channel count. Default 32.
+    """
+
+    def __init__(self, nfeats: int = 32) -> None:
+        super().__init__()
+        self.nfeats = nfeats
+        c1, c2, c3, c4 = nfeats, nfeats * 2, nfeats * 4, nfeats * 8
+
+        self.down1 = DoubleConv3D(1, c1)
+        self.pool1 = nn.MaxPool3d(2)
+        self.down2 = DoubleConv3D(c1, c2)
+        self.mamba2 = TemporalMambaBlock(channels=c2)
+        self.pool2 = nn.MaxPool3d(2)
+        self.down3 = DoubleConv3D(c2, c3)
+        self.pool3 = nn.MaxPool3d(2)
+        self.down4 = DoubleConv3D(c3, c4)
+        self.head = nn.Conv3d(c4, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        d1 = self.down1(x)
+        p1 = self.pool1(d1)
+        d2 = self.down2(p1)
+        d2 = self.mamba2(d2)
+        p2 = self.pool2(d2)
+        d3 = self.down3(p2)
+        p3 = self.pool3(d3)
+        d4 = self.down4(p3)
+        h = self.head(d4)                     # (B, 1, 8, 16, 16)
+        return F.interpolate(
+            h, size=(32, 32, 32),
+            mode="trilinear", align_corners=False,
+        )                                     # (B, 1, 32, 32, 32)
+
+
+class _Stage1V06PureMambaEncoder(nn.Module):
+    """Shared pure-Mamba encoder used by Arms 3 and 4 per §3.4.
+
+    Patch-embeds the input to ``(B, 16, 32, 32, C_emb)`` channels-last
+    tokens, then runs three encoder stages of
+    ``[TokenMambaBlock -> save skip -> TokenMerge3D]`` and a final
+    bottleneck ``TokenMambaBlock``. Spatial-only ``(1, 2, 2)`` merging
+    keeps ``T_tok = 16`` throughout, above the ``d_conv = 4``
+    degenerate threshold (see §3.4 "Token-merging is spatial-only").
+
+    Args:
+        embed_dim: Initial token embedding dimension ``C_emb``.
+            Default 64.
+        patch_size: Patch embed kernel/stride. Default ``(4, 4, 4)``.
+
+    Forward returns:
+        ``(bottleneck_out, [skip1, skip2, skip3])`` where ``bottleneck_out``
+        is ``(B, 16, 4, 4, 8*C_emb)`` and skips are at the encoder stages
+        before each merge.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        patch_size: tuple[int, int, int] = (4, 4, 4),
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        c0 = embed_dim
+        c1 = 2 * embed_dim
+        c2 = 4 * embed_dim
+        c3 = 8 * embed_dim
+        self.patch_embed = PatchEmbed3D(
+            in_channels=1, embed_dim=embed_dim, patch_size=patch_size,
+        )
+        self.enc1 = TokenMambaBlock(channels=c0)
+        self.merge1 = TokenMerge3D(channels=c0)
+        self.enc2 = TokenMambaBlock(channels=c1)
+        self.merge2 = TokenMerge3D(channels=c1)
+        self.enc3 = TokenMambaBlock(channels=c2)
+        self.merge3 = TokenMerge3D(channels=c2)
+        self.bottleneck = TokenMambaBlock(channels=c3)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        h = self.patch_embed(x)               # (B, 16, 32, 32, c0)
+        h = self.enc1(h)                      # (B, 16, 32, 32, c0)
+        skip1 = h
+        h = self.merge1(h)                    # (B, 16, 16, 16, c1)
+        h = self.enc2(h)
+        skip2 = h
+        h = self.merge2(h)                    # (B, 16, 8, 8, c2)
+        h = self.enc3(h)
+        skip3 = h
+        h = self.merge3(h)                    # (B, 16, 4, 4, c3)
+        h = self.bottleneck(h)                # (B, 16, 4, 4, c3)
+        return h, [skip1, skip2, skip3]
+
+
+class Stage1V06Arm3PureMambaUnet(nn.Module):
+    """Arm 3 — pure-Mamba U-Net per §3.4.
+
+    Patchify-based encoder of ``TokenMambaBlock`` stages with
+    spatial-only ``(1, 2, 2)`` token-merging, mirror-symmetric decoder
+    of ``TokenSplit3D`` + skip-concat + per-stage fusion ``Linear`` +
+    ``TokenMambaBlock``, then a ``ConvTranspose3d`` unpatchify back to
+    full ``(B, 1, 64, 128, 128)`` resolution.
+
+    Args:
+        embed_dim: Initial token embedding dimension ``C_emb``.
+            Default 64 (per §3.4 "Embedding dimension: C_emb = 64").
+        patch_size: Patch embed kernel/stride. Default ``(4, 4, 4)``.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        patch_size: tuple[int, int, int] = (4, 4, 4),
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        c0 = embed_dim
+        c1 = 2 * embed_dim
+        c2 = 4 * embed_dim
+        c3 = 8 * embed_dim
+
+        self.encoder = _Stage1V06PureMambaEncoder(
+            embed_dim=embed_dim, patch_size=patch_size,
+        )
+
+        # Decoder stage 1: split c3 -> c2, concat skip3 (c2), fuse 2c2 -> c2
+        self.dec_split1 = TokenSplit3D(channels=c3)                    # c3 -> c2
+        self.dec_fuse1 = nn.Linear(2 * c2, c2)
+        self.dec_mamba1 = TokenMambaBlock(channels=c2)
+        # Decoder stage 2: split c2 -> c1, concat skip2 (c1), fuse 2c1 -> c1
+        self.dec_split2 = TokenSplit3D(channels=c2)                    # c2 -> c1
+        self.dec_fuse2 = nn.Linear(2 * c1, c1)
+        self.dec_mamba2 = TokenMambaBlock(channels=c1)
+        # Decoder stage 3: split c1 -> c0, concat skip1 (c0), fuse 2c0 -> c0
+        self.dec_split3 = TokenSplit3D(channels=c1)                    # c1 -> c0
+        self.dec_fuse3 = nn.Linear(2 * c0, c0)
+        self.dec_mamba3 = TokenMambaBlock(channels=c0)
+
+        # Unpatchify: inverse of PatchEmbed3D. (B, c0, 16, 32, 32) -> (B, 1, 64, 128, 128).
+        self.unpatch = nn.ConvTranspose3d(
+            c0, 1, kernel_size=patch_size, stride=patch_size,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h, skips = self.encoder(x)
+        skip1, skip2, skip3 = skips
+        # Dec stage 1
+        h = self.dec_split1(h)                # (B, 16, 8, 8, c2)
+        h = torch.cat([h, skip3], dim=-1)     # (B, 16, 8, 8, 2*c2)
+        h = self.dec_fuse1(h)                 # (B, 16, 8, 8, c2)
+        h = self.dec_mamba1(h)
+        # Dec stage 2
+        h = self.dec_split2(h)                # (B, 16, 16, 16, c1)
+        h = torch.cat([h, skip2], dim=-1)
+        h = self.dec_fuse2(h)
+        h = self.dec_mamba2(h)
+        # Dec stage 3
+        h = self.dec_split3(h)                # (B, 16, 32, 32, c0)
+        h = torch.cat([h, skip1], dim=-1)
+        h = self.dec_fuse3(h)
+        h = self.dec_mamba3(h)
+        # Unpatchify: channels-last -> channels-first, then ConvTranspose3d.
+        h = h.permute(0, 4, 1, 2, 3).contiguous()  # (B, c0, 16, 32, 32)
+        return self.unpatch(h)                # (B, 1, 64, 128, 128)
+
+
+class Stage1V06Arm4PureMambaLowRes(nn.Module):
+    """Arm 4 — pure-Mamba encoder + low-resolution head per §3.6.
+
+    Reuses Arm 3's encoder through the bottleneck ``TokenMambaBlock``.
+    The head is two ``TokenSplit3D``s with asymmetric channel factors
+    (512 -> 128 then 128 -> 64), a per-token ``Linear(64, 1)``, and
+    trilinear interpolation to the supervised low-resolution
+    ``(32, 32, 32)`` grid.
+
+    Args:
+        embed_dim: Initial token embedding dimension ``C_emb``.
+            Default 64.
+        patch_size: Patch embed kernel/stride. Default ``(4, 4, 4)``.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        patch_size: tuple[int, int, int] = (4, 4, 4),
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        c0 = embed_dim
+        c1 = 2 * embed_dim
+        c2 = 4 * embed_dim
+        c3 = 8 * embed_dim
+
+        self.encoder = _Stage1V06PureMambaEncoder(
+            embed_dim=embed_dim, patch_size=patch_size,
+        )
+        # Head per §3.6 — two asymmetric splits then per-token Linear.
+        self.head_split1 = TokenSplit3D(channels=c3, out_channels=c1)  # 8C -> 2C
+        self.head_split2 = TokenSplit3D(channels=c1, out_channels=c0)  # 2C -> C
+        self.head_linear = nn.Linear(c0, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h, _ = self.encoder(x)                # (B, 16, 4, 4, c3)
+        h = self.head_split1(h)               # (B, 16, 8, 8, c1)
+        h = self.head_split2(h)               # (B, 16, 16, 16, c0)
+        h = self.head_linear(h)               # (B, 16, 16, 16, 1)
+        # channels-last -> channels-first.
+        h = h.permute(0, 4, 1, 2, 3).contiguous()  # (B, 1, 16, 16, 16)
+        return F.interpolate(
+            h, size=(32, 32, 32),
+            mode="trilinear", align_corners=False,
+        )                                     # (B, 1, 32, 32, 32)
+
+
+# --------------------------------------------------------------------------
+# v0.7 classes + factory per ``documents/history/specs/stage1_v0_7_design.md``.
+#
+# Two new model classes (additive — v0.6 classes are untouched):
+#
+# * ``Stage1V07Arm2CnnMambaLowRes`` — Arm 2 with the §3.3 head fix that
+#   makes the head output shape track ``MoverDataset._LOW_RES_POOL =
+#   (2, 4, 4)`` from the input shape, plus the optional ``stem_stride``
+#   flag that swaps ``down1`` for a stride-(1, 2, 2) stem per §3.4.
+# * ``Stage1V07Arm4PureMambaLowRes`` — Arm 4 with ``fusion`` selecting
+#   ``"sum"`` (v0.6 baseline) or ``"concat_proj"`` (arm B fusion
+#   variant) and an optional ``dt_init_std`` Mamba override per §5.3.
+#
+# The ``_Stage1V07StridedStem`` helper localizes the §3.4 modification
+# without touching ``localizer.common.blocks.DoubleConv3D``.
+# --------------------------------------------------------------------------
+
+
+_VALID_V0_7_FUSIONS = ("sum", "concat_proj")
+_VALID_V0_7_STEM_STRIDES = (1, 2)
+
+
+class _Stage1V07StridedStem(nn.Module):
+    """Stride-(1, 2, 2) stem replacing ``down1`` when ``stem_stride=2``.
+
+    Drops a single stride-(1, 2, 2) Conv3d + BN + ReLU at the input,
+    followed by a same-resolution Conv3d + BN + ReLU pair matching the
+    ``DoubleConv3D`` two-conv pattern. The full-resolution input
+    ``(B, 1, T, H, W)`` is mapped to ``(B, out_ch, T, H/2, W/2)`` at the
+    output of this block — half-spatial — so the rest of the v0.6 Arm 2
+    encoder runs on the smaller activation footprint and brings the
+    1024² VRAM into a 128 GB unified-memory GPU's budget. See v0.7 §3.4.
+    """
+
+    def __init__(self, out_ch: int = 32, padding_mode: str = "zeros") -> None:
+        super().__init__()
+        self.down = nn.Conv3d(
+            1, out_ch, kernel_size=3, stride=(1, 2, 2), padding=1,
+            padding_mode=padding_mode,
+        )
+        self.bn = nn.BatchNorm3d(out_ch)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv3d(
+            out_ch, out_ch, kernel_size=3, stride=1, padding=1,
+            padding_mode=padding_mode,
+        )
+        self.bn2 = nn.BatchNorm3d(out_ch)
+        self.relu2 = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.relu(self.bn(self.down(x)))
+        x = self.relu2(self.bn2(self.conv2(x)))
+        return x
+
+
+def _v07_low_res_target_shape(
+    x_shape: torch.Size | tuple,
+    pool_factor: tuple[int, int, int] = (2, 4, 4),
+) -> tuple[int, int, int]:
+    """Compute the v0.7 Arm 2 head target shape from the input shape.
+
+    Tracks ``MoverDataset.low_res_pool`` per design §3.3 — head output
+    is ``(T // pt, H // ph, W // pw)`` for any input ``(B, 1, T, H, W)``
+    and pool factor ``(pt, ph, pw)``. Default ``(2, 4, 4)`` preserves
+    v0.7/v0.8 behavior bit-identically: at 128² this is ``(32, 32, 32)``;
+    at 1024² this is ``(32, 256, 256)``. v0.9 M-supgrid passes
+    ``(1, 2, 2)`` per §3.3 to get ``(64, 64, 64)`` at 128².
+
+    Args:
+        x_shape: The 5D input shape ``(B, 1, T, H, W)`` (or its
+            torch.Size). The first two dims are ignored.
+        pool_factor: ``(pt, ph, pw)`` pool factors. Default ``(2, 4, 4)``
+            preserves v0.7/v0.8 behavior bit-identically.
+
+    Returns:
+        Triple ``(T // pt, H // ph, W // pw)``.
+    """
+    if len(x_shape) != 5:
+        raise ValueError(
+            f"_v07_low_res_target_shape expects 5D input shape; got {tuple(x_shape)!r}"
+        )
+    if len(pool_factor) != 3 or any(int(p) <= 0 for p in pool_factor):
+        raise ValueError(
+            f"pool_factor must be a 3-tuple of positive ints; got {pool_factor!r}"
+        )
+    _, _, T, H, W = x_shape
+    pt, ph, pw = pool_factor
+    return (T // int(pt), H // int(ph), W // int(pw))
+
+
+class Stage1V07Arm2CnnMambaLowRes(nn.Module):
+    """v0.7 Arm 2 — CNN+Mamba encoder + resolution-invariant low-res head.
+
+    Differences from ``Stage1V06Arm2CnnMambaLowRes`` (per v0.7 §3.3, §3.4):
+
+    * Head ``F.interpolate`` target shape is computed from the input
+      shape via ``_v07_low_res_target_shape`` rather than hardcoded
+      to ``(32, 32, 32)``. At 128² input this matches v0.6 bit-exactly;
+      at 1024² input it produces ``(32, 256, 256)`` to match
+      ``MoverDataset``'s pooled mask.
+    * Optional ``stem_stride=2`` swaps ``down1 = DoubleConv3D(1, c1)``
+      for ``_Stage1V07StridedStem(out_ch=c1)``, halving the spatial
+      resolution at the input. ``stem_stride=1`` (default) preserves
+      the v0.6 path bit-identically.
+
+    Args:
+        nfeats: Initial encoder channel count. Default 32.
+        stem_stride: 1 (v0.6-compatible) or 2 (1024² VRAM mitigation).
+        dt_init_std: Accepted but ignored — Arm 2 uses
+            ``TemporalMambaBlock`` which was stable in v0.6 with Mamba
+            defaults. The argument is accepted for trainer-side
+            uniformity with the Arm 4 plumbing. See v0.7 §5.3 note.
+        pool_factor: Head ``F.interpolate`` ``(pt, ph, pw)`` pool factor
+            tracking ``MoverDataset.low_res_pool``. Default ``(2, 4, 4)``
+            preserves v0.7 behavior bit-identically. v0.9 §5.2.
+        padding_mode: ``Conv3d`` padding mode threaded through every
+            encoder conv (down1..down4 + the strided stem). Default
+            ``'zeros'`` preserves v0.6/v0.7/v0.8 behavior bit-identically;
+            the 512 gate-precision ladder (§4.2) passes ``'replicate'`` to
+            remove the zero-padding perimeter flood (the head is a 1x1x1
+            conv with no padding, so it is unaffected).
+    """
+
+    def __init__(
+        self,
+        nfeats: int = 32,
+        stem_stride: int = 1,
+        dt_init_std: float | None = None,
+        pool_factor: tuple[int, int, int] = (2, 4, 4),
+        padding_mode: str = "zeros",
+    ) -> None:
+        super().__init__()
+        if stem_stride not in _VALID_V0_7_STEM_STRIDES:
+            raise ValueError(
+                f"stem_stride must be one of {_VALID_V0_7_STEM_STRIDES}; "
+                f"got {stem_stride!r}"
+            )
+        self.nfeats = nfeats
+        self.stem_stride = stem_stride
+        self.pool_factor = tuple(int(p) for p in pool_factor)
+        self.padding_mode = padding_mode
+        c1, c2, c3, c4 = nfeats, nfeats * 2, nfeats * 4, nfeats * 8
+
+        if stem_stride == 1:
+            self.down1 = DoubleConv3D(1, c1, padding_mode=padding_mode)
+        else:
+            self.down1 = _Stage1V07StridedStem(
+                out_ch=c1, padding_mode=padding_mode,
+            )
+        self.pool1 = nn.MaxPool3d(2)
+        self.down2 = DoubleConv3D(c1, c2, padding_mode=padding_mode)
+        self.mamba2 = TemporalMambaBlock(channels=c2)
+        self.pool2 = nn.MaxPool3d(2)
+        self.down3 = DoubleConv3D(c2, c3, padding_mode=padding_mode)
+        self.pool3 = nn.MaxPool3d(2)
+        self.down4 = DoubleConv3D(c3, c4, padding_mode=padding_mode)
+        self.head = nn.Conv3d(c4, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        target_shape = _v07_low_res_target_shape(x.shape, self.pool_factor)
+        d1 = self.down1(x)
+        p1 = self.pool1(d1)
+        d2 = self.down2(p1)
+        d2 = self.mamba2(d2)
+        p2 = self.pool2(d2)
+        d3 = self.down3(p2)
+        p3 = self.pool3(d3)
+        d4 = self.down4(p3)
+        h = self.head(d4)
+        return F.interpolate(
+            h, size=target_shape,
+            mode="trilinear", align_corners=False,
+        )
+
+
+class _Stage1V07PureMambaEncoder(nn.Module):
+    """v0.7 variant of ``_Stage1V06PureMambaEncoder`` accepting ``fusion``
+    and ``dt_init_std``.
+
+    Identical structure (patch embed -> 3 [block + skip + merge] stages
+    + bottleneck block) but uses either ``TokenMambaBlockV07``
+    (sum fusion + dt_init_std) or ``TokenMambaBlockConcatFusion``
+    (concat-then-project fusion + dt_init_std) per the v0.7 arm
+    assignment. Threads ``dt_init_std`` into every Mamba sub-module.
+
+    Args:
+        embed_dim: Initial token embedding dimension ``C_emb``. Default 64.
+        patch_size: Patch embed kernel/stride. Default ``(4, 4, 4)``.
+        fusion: ``"sum"`` (arm A) or ``"concat_proj"`` (arm B).
+        dt_init_std: Mamba ``dt`` init std override (forwarded to every
+            block). ``None`` preserves Mamba defaults.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        patch_size: tuple[int, int, int] = (4, 4, 4),
+        fusion: str = "sum",
+        dt_init_std: float | None = None,
+    ) -> None:
+        super().__init__()
+        if fusion not in _VALID_V0_7_FUSIONS:
+            raise ValueError(
+                f"fusion must be one of {_VALID_V0_7_FUSIONS}; got {fusion!r}"
+            )
+        self.embed_dim = embed_dim
+        self.fusion = fusion
+        self.dt_init_std = dt_init_std
+        c0 = embed_dim
+        c1 = 2 * embed_dim
+        c2 = 4 * embed_dim
+        c3 = 8 * embed_dim
+
+        if fusion == "sum":
+            block_cls = TokenMambaBlockV07
+        else:
+            block_cls = TokenMambaBlockConcatFusion
+
+        def _block(channels: int) -> nn.Module:
+            return block_cls(channels=channels, dt_init_std=dt_init_std)
+
+        self.patch_embed = PatchEmbed3D(
+            in_channels=1, embed_dim=embed_dim, patch_size=patch_size,
+        )
+        self.enc1 = _block(c0)
+        self.merge1 = TokenMerge3D(channels=c0)
+        self.enc2 = _block(c1)
+        self.merge2 = TokenMerge3D(channels=c1)
+        self.enc3 = _block(c2)
+        self.merge3 = TokenMerge3D(channels=c2)
+        self.bottleneck = _block(c3)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        h = self.patch_embed(x)
+        h = self.enc1(h)
+        skip1 = h
+        h = self.merge1(h)
+        h = self.enc2(h)
+        skip2 = h
+        h = self.merge2(h)
+        h = self.enc3(h)
+        skip3 = h
+        h = self.merge3(h)
+        h = self.bottleneck(h)
+        return h, [skip1, skip2, skip3]
+
+
+class Stage1V07Arm4PureMambaLowRes(nn.Module):
+    """v0.7 Arm 4 — pure-Mamba encoder + low-resolution head with selectable
+    bidirectional fusion (sum vs concat-then-project) and Mamba
+    ``dt_init_std`` override per v0.7 §3.2 / §5.3.
+
+    Encoder is ``_Stage1V07PureMambaEncoder`` (same structure as v0.6
+    but parameterized on ``fusion`` and ``dt_init_std``). Head is
+    identical to v0.6 Arm 4: two ``TokenSplit3D``s (512 -> 128 then
+    128 -> 64), per-token ``Linear(64, 1)``, then trilinear interpolation
+    to the supervised low-resolution ``(32, 32, 32)`` grid.
+
+    The supervision target for Arm 4 in v0.7 is the slow_swarm 128²
+    dataset (arms A and B); the head's hardcoded ``(32, 32, 32)``
+    interpolate is correct for that resolution. (Arm 4 is *not* an
+    Arm 2-class scale-up candidate in v0.7 — pure-Mamba at 1024² is
+    a v0.8 question per §10.)
+
+    Args:
+        embed_dim: Initial token embedding dimension ``C_emb``. Default 64.
+        patch_size: Patch embed kernel/stride. Default ``(4, 4, 4)``.
+        fusion: ``"sum"`` (arm A) or ``"concat_proj"`` (arm B).
+        dt_init_std: Mamba ``dt`` init std override. ``None`` preserves
+            Mamba defaults.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        patch_size: tuple[int, int, int] = (4, 4, 4),
+        fusion: str = "sum",
+        dt_init_std: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.fusion = fusion
+        self.dt_init_std = dt_init_std
+        c0 = embed_dim
+        c1 = 2 * embed_dim
+        c3 = 8 * embed_dim
+
+        self.encoder = _Stage1V07PureMambaEncoder(
+            embed_dim=embed_dim, patch_size=patch_size,
+            fusion=fusion, dt_init_std=dt_init_std,
+        )
+        self.head_split1 = TokenSplit3D(channels=c3, out_channels=c1)
+        self.head_split2 = TokenSplit3D(channels=c1, out_channels=c0)
+        self.head_linear = nn.Linear(c0, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h, _ = self.encoder(x)
+        h = self.head_split1(h)
+        h = self.head_split2(h)
+        h = self.head_linear(h)
+        h = h.permute(0, 4, 1, 2, 3).contiguous()
+        return F.interpolate(
+            h, size=(32, 32, 32),
+            mode="trilinear", align_corners=False,
+        )
+
+
+def build_segmenter_v0_7(
+    arm: int,
+    nfeats: int = 32,
+    fusion: str = "sum",
+    stem_stride: int = 1,
+    dt_init_std: float | None = None,
+    padding_mode: str = "zeros",
+) -> nn.Module:
+    """Factory for the Stage 1 v0.7 sweep (§6.6).
+
+    Dispatches on ``arm`` to one of two new classes:
+
+    * ``arm=2`` -> ``Stage1V07Arm2CnnMambaLowRes`` (head fix + optional
+      stride-2 stem). Honors ``stem_stride``; ignores ``fusion``.
+    * ``arm=4`` -> ``Stage1V07Arm4PureMambaLowRes`` (sum vs concat
+      fusion). Honors ``fusion``; ignores ``stem_stride``.
+
+    ``dt_init_std`` is forwarded to all Mamba blocks. For Arm 2 it is
+    accepted but ignored (Arm 2 uses ``TemporalMambaBlock`` which is
+    stable at Mamba defaults).
+
+    Args:
+        arm: 2 or 4. Other arms (1 = full-res CNN+Mamba U-Net; 3 =
+            pure-Mamba U-Net) are not part of the v0.7 sweep.
+        nfeats: CNN encoder channel count for Arm 2. Ignored for Arm 4.
+        fusion: "sum" (v0.6 default) or "concat_proj" (arm B).
+            Ignored for Arm 2.
+        stem_stride: 1 (default) or 2 (Arm 2 1024² VRAM mitigation).
+            Ignored for Arm 4.
+        dt_init_std: Mamba ``dt`` init std override. ``None`` preserves
+            library defaults.
+        padding_mode: ``Conv3d`` padding mode for the Arm 2 encoder convs.
+            Default ``'zeros'`` preserves prior behavior; ``'replicate'``
+            is the 512 gate-precision ladder border fix (§4.2). Ignored
+            for Arm 4 (pure-Mamba has no spatial-padding perimeter flood).
+
+    Returns:
+        An ``nn.Module``. Accepts the resolution implied by the chosen
+        arm: Arm 2 is resolution-invariant (128² or 1024²); Arm 4 is
+        128²-only (v0.7 keeps pure-Mamba at slow_swarm 128²).
+    """
+    if arm not in (2, 4):
+        raise ValueError(
+            f"v0.7 arm must be 2 or 4; got {arm!r}"
+        )
+    if fusion not in _VALID_V0_7_FUSIONS:
+        raise ValueError(
+            f"fusion must be one of {_VALID_V0_7_FUSIONS}; got {fusion!r}"
+        )
+    if stem_stride not in _VALID_V0_7_STEM_STRIDES:
+        raise ValueError(
+            f"stem_stride must be one of {_VALID_V0_7_STEM_STRIDES}; "
+            f"got {stem_stride!r}"
+        )
+    if arm == 2:
+        return Stage1V07Arm2CnnMambaLowRes(
+            nfeats=nfeats, stem_stride=stem_stride,
+            dt_init_std=dt_init_std, padding_mode=padding_mode,
+        )
+    return Stage1V07Arm4PureMambaLowRes(
+        fusion=fusion, dt_init_std=dt_init_std,
+    )
+
+
+# --------------------------------------------------------------------------
+# v0.8 classes + factory per ``documents/history/specs/stage1_v0_8_design.md``.
+#
+# Two new model classes (additive — v0.6 and v0.7 classes are untouched):
+#
+# * ``Stage1V08Arm2CnnMambaLowRes`` — v0.7 Arm 2 at ``stem_stride=1`` plus
+#   an optional ``gradient_checkpoint`` flag that wraps each
+#   ``DoubleConv3D`` invocation in
+#   ``torch.utils.checkpoint.checkpoint(..., use_reentrant=False)``. The
+#   ``TemporalMambaBlock`` is NOT wrapped (the selective-scan kernel has
+#   its own backward path; double-wrapping interferes — see design
+#   §11.13). At ``gradient_checkpoint=False`` the forward pass is
+#   bit-identical to ``Stage1V07Arm2CnnMambaLowRes(stem_stride=1)``.
+#
+# * ``Stage1V08Arm4PureMambaLowRes`` — v0.7 Arm 4 with the
+#   resolution-invariant head target shape (computed from the input
+#   shape via ``_v07_low_res_target_shape`` rather than hardcoded to
+#   ``(32, 32, 32)``) and an optional ``gradient_checkpoint`` flag that
+#   wraps the patch-embed stem and each ``TokenMambaBlock*`` invocation
+#   inside the encoder in checkpoint. At 128² and
+#   ``gradient_checkpoint=False`` the forward pass is bit-identical to
+#   ``Stage1V07Arm4PureMambaLowRes``.
+#
+# The v0.8 spec §2.4 drops the stride-2 stem variant (vanilla 1024² Arm 2
+# fits with bf16 + grad-ckpt), so Stage1V08Arm2CnnMambaLowRes does not
+# parameterize stem_stride.
+# --------------------------------------------------------------------------
+
+
+class Stage1V08Arm2CnnMambaLowRes(nn.Module):
+    """v0.8 Arm 2 — v0.7 hybrid Arm 2 + optional gradient checkpointing
+    + optional stride-2 stem per v0.8 design §3.3 / §5.1.
+
+    Forward semantics identical to ``Stage1V07Arm2CnnMambaLowRes`` at
+    matching ``stem_stride`` when ``gradient_checkpoint=False``: same
+    modules, same forward graph, same output. When
+    ``gradient_checkpoint=True``, each ``DoubleConv3D`` (down1..down4)
+    is invoked under ``torch.utils.checkpoint.checkpoint(...,
+    use_reentrant=False)`` to trade recompute wall for activation
+    memory reduction. The ``TemporalMambaBlock`` (``mamba2``) is NOT
+    wrapped per §11.13.
+
+    The ``stem_stride`` parameter is re-introduced after the v0.8
+    STOP #4 diagnostic (2026-05-27): vanilla 1024² (stem_stride=1) +
+    bf16 + grad-ckpt measured 67 s/sample on a GB10 node vs spec
+    projection of 4-5 s/sample — 13-17x over budget. The diagnostic
+    confirmed bf16 was engaging and grad-ckpt cost was minimal (~3%);
+    the dominant cost is the Conv3D layers + Mamba running at full
+    1024² spatial extent (vs 512² with the stride-2 stem). v0.8 §2.4
+    dropped stride-2 because the *VRAM* mitigation was no longer
+    needed; the *wall* problem was not anticipated. H1/H2 production
+    runs with ``stem_stride=2`` per the user's STOP #4 fallback path.
+
+    The resolution-invariant head is inherited from v0.7. At 128²
+    input the output is ``(B, 1, 32, 32, 32)``; at 1024² input it is
+    ``(B, 1, 32, 256, 256)`` — independent of stem_stride.
+
+    Args:
+        nfeats: Initial encoder channel count. Default 32.
+        stem_stride: 1 (vanilla v0.6 baseline) or 2 (v0.7 stride-2 stem
+            for 1024² wall mitigation). Default 1.
+        gradient_checkpoint: When True, wraps each ``DoubleConv3D`` in
+            torch.utils.checkpoint. Default False (bit-identical to v0.7
+            at the same stem_stride).
+        pool_factor: Head ``F.interpolate`` ``(pt, ph, pw)`` pool factor
+            tracking ``MoverDataset.low_res_pool``. Default ``(2, 4, 4)``
+            preserves v0.7/v0.8 behavior bit-identically. v0.9 §5.2.
+    """
+
+    def __init__(
+        self,
+        nfeats: int = 32,
+        stem_stride: int = 1,
+        gradient_checkpoint: bool = False,
+        pool_factor: tuple[int, int, int] = (2, 4, 4),
+    ) -> None:
+        super().__init__()
+        if stem_stride not in _VALID_V0_7_STEM_STRIDES:
+            raise ValueError(
+                f"stem_stride must be one of {_VALID_V0_7_STEM_STRIDES}; "
+                f"got {stem_stride!r}"
+            )
+        self.nfeats = nfeats
+        self.stem_stride = stem_stride
+        self.gradient_checkpoint = gradient_checkpoint
+        self.pool_factor = tuple(int(p) for p in pool_factor)
+        c1, c2, c3, c4 = nfeats, nfeats * 2, nfeats * 4, nfeats * 8
+
+        if stem_stride == 1:
+            self.down1 = DoubleConv3D(1, c1)
+        else:
+            self.down1 = _Stage1V07StridedStem(out_ch=c1)
+        self.pool1 = nn.MaxPool3d(2)
+        self.down2 = DoubleConv3D(c1, c2)
+        self.mamba2 = TemporalMambaBlock(channels=c2)
+        self.pool2 = nn.MaxPool3d(2)
+        self.down3 = DoubleConv3D(c2, c3)
+        self.pool3 = nn.MaxPool3d(2)
+        self.down4 = DoubleConv3D(c3, c4)
+        self.head = nn.Conv3d(c4, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        target_shape = _v07_low_res_target_shape(x.shape, self.pool_factor)
+        if self.gradient_checkpoint and self.training:
+            d1 = checkpoint(self.down1, x, use_reentrant=False)
+        else:
+            d1 = self.down1(x)
+        p1 = self.pool1(d1)
+        if self.gradient_checkpoint and self.training:
+            d2 = checkpoint(self.down2, p1, use_reentrant=False)
+        else:
+            d2 = self.down2(p1)
+        d2 = self.mamba2(d2)            # NOT wrapped (see §11.13)
+        p2 = self.pool2(d2)
+        if self.gradient_checkpoint and self.training:
+            d3 = checkpoint(self.down3, p2, use_reentrant=False)
+            p3 = self.pool3(d3)
+            d4 = checkpoint(self.down4, p3, use_reentrant=False)
+        else:
+            d3 = self.down3(p2)
+            d4 = self.down4(self.pool3(d3))
+        h = self.head(d4)
+        return F.interpolate(
+            h, size=target_shape,
+            mode="trilinear", align_corners=False,
+        )
+
+
+class Stage1V08Arm4PureMambaLowRes(nn.Module):
+    """v0.8 Arm 4 — v0.7 Arm 4 + resolution-invariant head + optional
+    gradient checkpointing per v0.8 design §3.3 / §5.1.
+
+    Architecturally identical to ``Stage1V07Arm4PureMambaLowRes`` with
+    two additive changes:
+
+    * The head's ``F.interpolate`` target shape is computed from the
+      input shape via ``_v07_low_res_target_shape`` rather than hardcoded
+      to ``(32, 32, 32)``. At 128² input this is ``(32, 32, 32)`` —
+      bit-identical to v0.7. At 1024² input this is ``(32, 256, 256)``
+      so the model output matches ``MoverDataset``'s low-resolution mask
+      shape.
+    * Optional ``gradient_checkpoint=True`` wraps the patch-embed stem
+      and each ``TokenMambaBlock*`` invocation (enc1/enc2/enc3/bottleneck)
+      in ``torch.utils.checkpoint.checkpoint(..., use_reentrant=False)``
+      per §11.13. The ``TokenMerge3D`` operations are unwrapped (cheap).
+      Bit-identical to v0.7 at 128² and ``gradient_checkpoint=False``.
+
+    Args:
+        embed_dim: Initial token embedding dimension ``C_emb``. Default 64.
+        patch_size: Patch embed kernel/stride. Default ``(4, 4, 4)``.
+        fusion: ``"sum"`` (v0.7 arm A) or ``"concat_proj"`` (v0.7 arm B).
+        dt_init_std: Mamba ``dt`` init std override. ``None`` preserves
+            Mamba defaults.
+        gradient_checkpoint: When True, wraps the patch-embed and each
+            Mamba block in torch.utils.checkpoint. Default False
+            (bit-identical to v0.7).
+        pool_factor: Head ``F.interpolate`` ``(pt, ph, pw)`` pool factor
+            tracking ``MoverDataset.low_res_pool``. Default ``(2, 4, 4)``
+            preserves v0.7/v0.8 behavior bit-identically. v0.9 §5.2.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        patch_size: tuple[int, int, int] = (4, 4, 4),
+        fusion: str = "sum",
+        dt_init_std: float | None = None,
+        gradient_checkpoint: bool = False,
+        pool_factor: tuple[int, int, int] = (2, 4, 4),
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.fusion = fusion
+        self.dt_init_std = dt_init_std
+        self.gradient_checkpoint = gradient_checkpoint
+        self.pool_factor = tuple(int(p) for p in pool_factor)
+        c0 = embed_dim
+        c1 = 2 * embed_dim
+        c3 = 8 * embed_dim
+
+        self.encoder = _Stage1V07PureMambaEncoder(
+            embed_dim=embed_dim, patch_size=patch_size,
+            fusion=fusion, dt_init_std=dt_init_std,
+        )
+        self.head_split1 = TokenSplit3D(channels=c3, out_channels=c1)
+        self.head_split2 = TokenSplit3D(channels=c1, out_channels=c0)
+        self.head_linear = nn.Linear(c0, 1)
+
+    def _encoder_forward_ckpt(
+        self, x: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Per-block-checkpointed re-implementation of the v0.7 encoder
+        forward. Used when ``gradient_checkpoint=True`` and the module is
+        in training mode. Bit-equivalent (up to recompute non-determinism
+        from dropout-style ops, of which there are none here) to the
+        encoder's own forward.
+        """
+        enc = self.encoder
+        h = checkpoint(enc.patch_embed, x, use_reentrant=False)
+        h = checkpoint(enc.enc1, h, use_reentrant=False)
+        skip1 = h
+        h = enc.merge1(h)
+        h = checkpoint(enc.enc2, h, use_reentrant=False)
+        skip2 = h
+        h = enc.merge2(h)
+        h = checkpoint(enc.enc3, h, use_reentrant=False)
+        skip3 = h
+        h = enc.merge3(h)
+        h = checkpoint(enc.bottleneck, h, use_reentrant=False)
+        return h, [skip1, skip2, skip3]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        target_shape = _v07_low_res_target_shape(x.shape, self.pool_factor)
+        if self.gradient_checkpoint and self.training:
+            h, _ = self._encoder_forward_ckpt(x)
+        else:
+            h, _ = self.encoder(x)
+        h = self.head_split1(h)
+        h = self.head_split2(h)
+        h = self.head_linear(h)
+        h = h.permute(0, 4, 1, 2, 3).contiguous()
+        return F.interpolate(
+            h, size=target_shape,
+            mode="trilinear", align_corners=False,
+        )
+
+
+def build_segmenter_v0_8(
+    arm: int,
+    nfeats: int = 32,
+    fusion: str = "sum",
+    stem_stride: int = 1,
+    dt_init_std: float | None = None,
+    gradient_checkpoint: bool = False,
+    pool_factor: tuple[int, int, int] = (2, 4, 4),
+) -> nn.Module:
+    """Factory for the Stage 1 v0.8 four-arm sweep per §6.6.
+
+    Dispatches on ``arm``:
+
+    * ``arm=2`` -> ``Stage1V08Arm2CnnMambaLowRes`` (CNN+Mamba hybrid;
+      H1 and H2 in the v0.8 spec, differing only in dataset/loss/config
+      not architecture). Honors ``nfeats``, ``stem_stride``, and
+      ``gradient_checkpoint``; ignores ``fusion`` and ``dt_init_std``.
+    * ``arm=4`` -> ``Stage1V08Arm4PureMambaLowRes`` (pure-Mamba; M1, M1',
+      and M2 in the v0.8 spec). Honors ``fusion``, ``dt_init_std``, and
+      ``gradient_checkpoint``; ignores ``nfeats`` and ``stem_stride``.
+
+    ``build_segmenter_v0_7`` is preserved unchanged for v0.7
+    reproducibility per §6.7.
+
+    Args:
+        arm: 2 (hybrid) or 4 (pure-Mamba). Other arms are not in v0.8.
+        nfeats: CNN encoder channel count for Arm 2. Ignored for Arm 4.
+        fusion: "sum" or "concat_proj" for Arm 4. Ignored for Arm 2.
+        stem_stride: 1 (vanilla) or 2 (1024² wall mitigation) for
+            Arm 2. Ignored for Arm 4. Default 1.
+        dt_init_std: Mamba ``dt`` init std override. ``None`` preserves
+            library defaults.
+        gradient_checkpoint: When True, wraps the appropriate dense
+            sub-blocks in torch.utils.checkpoint per §5.1 / §11.13.
+
+    Returns:
+        An ``nn.Module``. Resolution-invariant (accepts 128² or 1024²
+        input via the v0.7 ``_v07_low_res_target_shape`` head fix).
+    """
+    if arm not in (2, 4):
+        raise ValueError(
+            f"v0.8 arm must be 2 or 4; got {arm!r}"
+        )
+    if fusion not in _VALID_V0_7_FUSIONS:
+        raise ValueError(
+            f"fusion must be one of {_VALID_V0_7_FUSIONS}; got {fusion!r}"
+        )
+    if stem_stride not in _VALID_V0_7_STEM_STRIDES:
+        raise ValueError(
+            f"stem_stride must be one of {_VALID_V0_7_STEM_STRIDES}; "
+            f"got {stem_stride!r}"
+        )
+    if arm == 2:
+        return Stage1V08Arm2CnnMambaLowRes(
+            nfeats=nfeats, stem_stride=stem_stride,
+            gradient_checkpoint=gradient_checkpoint,
+            pool_factor=pool_factor,
+        )
+    return Stage1V08Arm4PureMambaLowRes(
+        fusion=fusion, dt_init_std=dt_init_std,
+        gradient_checkpoint=gradient_checkpoint,
+        pool_factor=pool_factor,
+    )
+
+
+def build_segmenter_v0_6(arm: int, nfeats: int = 32) -> nn.Module:
+    """Factory for the Stage 1 v0.6 SSM existence-proof sweep (§6.5).
+
+    Dispatches on ``arm`` to one of four classes. Arms 1 and 2 use
+    ``nfeats`` for the CNN portion; Arms 3 and 4 use the fixed
+    ``embed_dim=64`` patch-embedding dimension and ignore ``nfeats``.
+
+    Args:
+        arm: One of ``{1, 2, 3, 4}``.
+        nfeats: CNN encoder channel count for Arms 1/2 (default 32).
+            Ignored for Arms 3/4.
+
+    Returns:
+        An ``nn.Module`` accepting ``(B, 1, 64, 128, 128)`` input and
+        producing the per-arm output shape (full or low-res per §3.7).
+    """
+    if arm not in _VALID_V0_6_ARMS:
+        raise ValueError(
+            f"arm must be one of {_VALID_V0_6_ARMS}; got {arm!r}"
+        )
+    if arm == 1:
+        return Stage1V06Arm1CnnMambaUnet(nfeats=nfeats)
+    if arm == 2:
+        return Stage1V06Arm2CnnMambaLowRes(nfeats=nfeats)
+    if arm == 3:
+        return Stage1V06Arm3PureMambaUnet()
+    return Stage1V06Arm4PureMambaLowRes()

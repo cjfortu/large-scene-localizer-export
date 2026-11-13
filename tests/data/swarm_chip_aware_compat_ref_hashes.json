@@ -1,0 +1,15 @@
+{
+  "_provenance": {
+    "generator_commit": "42fe7b3",
+    "yaml_config": "recovered/synth_swarm/configs/multi_target_swarm_1024.yaml",
+    "cli_overrides": "--total_scenes 2 --batch_size 2 --num_workers 1",
+    "generated_at": "2026-05-24T20:41Z",
+    "host": "x86-64 Linux workstation",
+    "rng_seed_convention": "seed = start_idx = 0 (single worker, default_rng(0))",
+    "note": "Pre-v2 chip-aware reference. Hashes captured before any v2 generator changes land; §6.6(b) regression test must reproduce these bit-identically with the post-v2 generator on the same config + same CLI overrides."
+  },
+  "vid0_1.npy":      "d4410ff697926818f587c0f40c2058ed908f70b82b4bc955c3180323674e209d",
+  "vid1_0.npy":      "a07e872f8c0b6b2ed905ff3f9c3759295309436c875e4ee8dc6ce27ad3bebb5d",
+  "vid0_1_mask.npy": "5b260f54a5e0ba5cc32b9568ab5948c6c44b29aa8b56b8f5ad2490776279e017",
+  "vid1_0_mask.npy": "8ee1d0a79de1bf70b526ed2daa77c61d62e0260cc54e9e5d800561d7ea5de783"
+}

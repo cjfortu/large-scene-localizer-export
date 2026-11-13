@@ -1,0 +1,312 @@
+"""CPU-only smoke test for the v0.10 stabilization-ablation trainer changes.
+
+This exercises the ACTIVE trainer (``localizer.gate.train``,
+the v0_7 dispatch path that config A/B use) end-to-end on a tiny synthetic
+dataset, on CPU, with no GPU and no real data. It validates three things,
+selected by ``--mode``:
+
+* ``neutral`` — build a config from ONLY pre-v0.10 fields (so the exact same
+  invocation is valid on the parent commit) and dump the per-epoch
+  train/val loss sequence to ``--out``. The dynamics-neutrality proof runs
+  this in the current tree and in a clean parent-commit worktree and diffs
+  the two JSONs: with the v0.10 flags defaulting OFF they must be identical
+  (additive logging cannot perturb the optimized loss).
+* ``assert_keys`` — run the new trainer with the v0.10 flags OFF and assert
+  the §5 instrumentation history keys exist and are populated, and that the
+  EMA accumulation branch is NOT entered.
+* ``ema_on`` — run with ``use_ema=True`` (small ``ema_start_epoch``) and
+  confirm the EMA path executes and validation/checkpointing run on the EMA
+  weights without error. This is a smoke, not a correctness check.
+
+Usage:
+    python scripts/gate/smoke.py --mode neutral --out /tmp/a.json
+    python scripts/gate/smoke.py --mode assert_keys
+    python scripts/gate/smoke.py --mode ema_on
+
+The synthetic data is regenerated deterministically from a fixed seed on
+every run, so the ``neutral`` data is bit-identical across the new-code and
+parent-code runs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+
+from localizer.gate.train import (
+    Stage1SegTrainConfig, run_training,
+)
+
+# Tiny field sized for a fast CPU run. Volume is (T, H, W) on disk.
+#
+# NOTE on the arm: config A's production architecture is the CNN+Mamba
+# hybrid (v0_7 factory, arm 2), whose TemporalMambaBlock calls the
+# ``causal_conv1d`` CUDA kernel and therefore CANNOT run on CPU. The v0.10
+# changes under test (the §5 always-on instrumentation, the EMA stabilizer,
+# the min_lr LR-floor hook) all live in the TRAINER loop and are
+# architecture-independent — they execute identically regardless of which
+# model the factory builds. This smoke therefore drives the trainer with
+# the CPU-compatible pure-conv v0 arm (PureConvSegmenter3D, full-res), which
+# exercises every changed line of the trainer on CPU. The low-res-specific
+# full_res_metrics branch is unchanged by v0.10 and the per-scene
+# instrumentation sits outside it, so the validation is faithful.
+# PureConvSegmenter3D pools 4x on every axis, so each dim must be >= 16.
+_T, _H, _W = 16, 64, 64
+_N_SCENES = 12         # mix of present/absent (more val coverage)
+_DATA_SEED = 1234
+
+
+def _make_tiny_dataset(data_root: Path) -> None:
+    """Write a tiny ``vidN_L.npy`` + ``label_msk/vidN_L_mask.npy`` dataset.
+
+    Deterministic from ``_DATA_SEED`` so two independent runs (new code vs
+    parent code) generate bit-identical data. Even indices are absent
+    (all-zero mask), odd indices are present (a few positive voxels).
+    """
+    data_dir = data_root / "data_all"
+    label_dir = data_root / "label_msk"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    label_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(_N_SCENES):
+        rng = np.random.default_rng(_DATA_SEED + i)
+        label = i % 2  # 0 = absent, 1 = present
+        volume = rng.integers(0, 256, size=(_T, _H, _W), dtype=np.uint8)
+        mask = np.zeros((_T, _H, _W), dtype=np.uint8)
+        if label == 1:
+            # A handful of positive voxels spread over a few frames.
+            for _ in range(6):
+                t = int(rng.integers(0, _T))
+                y = int(rng.integers(0, _H))
+                x = int(rng.integers(0, _W))
+                mask[t, y, x] = 255
+        name = f"vid{i}_{label}"
+        np.save(data_dir / f"{name}.npy", volume)
+        np.save(label_dir / f"{name}_mask.npy", mask)
+
+
+def _base_config_kwargs(data_root: Path, output_root: Path, num_epochs: int) -> dict:
+    """Config kwargs using ONLY pre-v0.10 fields (valid on the parent commit).
+
+    CPU-compatible pure-conv v0 arm (PureConvSegmenter3D, full-res output)
+    so the trainer-loop changes can be exercised without the CUDA-only Mamba
+    kernel. CPU, batch 1, num_workers 0, fixed seed -> deterministic loss
+    sequence for the neutrality proof.
+    """
+    return dict(
+        # arm=None + model_factory default "v0_6" + temporal baseline
+        # dispatches to build_segmenter_v0_5 -> PureConvSegmenter3D (CPU OK).
+        bottleneck_variant="A",
+        temporal_variant="baseline",
+        output_resolution="full",
+        # low_res_pool (1,1,1): in full-res mode the native output grid IS
+        # the full volume, so gate_grid_voxels = datshape // (1,1,1) =
+        # full-res voxel count = prod(native logits dims). This makes the
+        # trainer's abs_pos_frac basis assert hold for this CPU arm (the
+        # production low-res arm satisfies it with (2,4,4)).
+        low_res_pool=(1, 1, 1),
+        checkpoint_criterion="best_dice_product",
+        nfeats=8,
+        target_positive_pixels_per_frame=4,
+        lr=1e-3,
+        batch_size=1,
+        num_epochs=num_epochs,
+        subset_size=_N_SCENES,
+        val_split=0.34,
+        val_split_seed=0,
+        num_workers=0,
+        seed=0,
+        data_root=str(data_root),
+        output_root=str(output_root),
+    )
+
+
+class _LogCapture(logging.Handler):
+    """Collect emitted log messages so branch-entry can be asserted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+def _run(cfg_kwargs: dict) -> tuple[dict, list[str]]:
+    cap = _LogCapture()
+    root = logging.getLogger()
+    prev_level = root.level
+    root.setLevel(logging.INFO)
+    root.addHandler(cap)
+    try:
+        cfg = Stage1SegTrainConfig(**cfg_kwargs)
+        history = run_training(cfg)
+    finally:
+        root.removeHandler(cap)
+        root.setLevel(prev_level)
+    return history, cap.messages
+
+
+_NEW_KEYS = [
+    "abs_pos_frac_per_scene", "abs_pos_frac_mean", "abs_pos_frac_std",
+    "abs_pos_frac_p50", "abs_pos_frac_p90", "abs_pos_frac_p95",
+    "abs_pos_frac_max", "peak_vram_bytes", "effective_lr",
+    "present_loss_component", "absent_loss_component",
+]
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--mode", required=True,
+                   choices=["neutral", "assert_keys", "ema_on"])
+    p.add_argument("--out", default=None,
+                   help="(neutral) JSON path for the loss sequence.")
+    p.add_argument("--num_epochs", type=int, default=3)
+    args = p.parse_args()
+
+    tmp = Path(tempfile.mkdtemp(prefix="v0_10_smoke_"))
+    data_root = tmp / "data"
+    output_root = tmp / "run"
+    _make_tiny_dataset(data_root)
+
+    if args.mode == "neutral":
+        kwargs = _base_config_kwargs(data_root, output_root, args.num_epochs)
+        history, _ = _run(kwargs)
+        payload = {
+            "train_loss": history["train_loss"],
+            "val_loss": history["val_loss"],
+            "dice_product": history["dice_product"],
+        }
+        out = args.out or str(tmp / "neutral_loss.json")
+        Path(out).write_text(json.dumps(payload, indent=2, default=str))
+        print(f"NEUTRAL OK: wrote loss sequence to {out}")
+        print(f"  train_loss = {payload['train_loss']}")
+        print(f"  val_loss   = {payload['val_loss']}")
+        return 0
+
+    if args.mode == "assert_keys":
+        kwargs = _base_config_kwargs(data_root, output_root, args.num_epochs)
+        history, msgs = _run(kwargs)
+        n = len(history["epochs"])
+        problems: list[str] = []
+        for k in _NEW_KEYS:
+            if k not in history:
+                problems.append(f"missing key: {k}")
+                continue
+            v = history[k]
+            if not isinstance(v, list) or len(v) != n:
+                problems.append(
+                    f"key {k}: expected list of len {n}, got "
+                    f"{type(v).__name__} len {len(v) if isinstance(v, list) else 'n/a'}"
+                )
+        # p95 must be populated (finite or nan float) for every epoch.
+        p95 = history.get("abs_pos_frac_p95", [])
+        if not all(isinstance(x, float) for x in p95):
+            problems.append("abs_pos_frac_p95 not all float")
+        # Per-scene vector: list-of-lists, one per epoch.
+        aps = history.get("abs_pos_frac_per_scene", [])
+        if not all(isinstance(x, list) for x in aps):
+            problems.append("abs_pos_frac_per_scene not list-of-lists")
+        # Flags-off provenance.
+        if history.get("use_ema") is not False:
+            problems.append(f"use_ema should be False, got {history.get('use_ema')}")
+        if history.get("min_lr") != 0.0:
+            problems.append(f"min_lr should be 0.0, got {history.get('min_lr')}")
+        # EMA branch must NOT have been entered.
+        if any("EMA accumulation started" in m for m in msgs):
+            problems.append("EMA branch entered with use_ema off")
+        if any("Weight EMA: ENABLED" in m for m in msgs):
+            problems.append("EMA constructed with use_ema off")
+        # Instrumentation log line must be present.
+        if not any("instr: abs_pos_frac" in m for m in msgs):
+            problems.append("instrumentation log line missing")
+        # Reconciliation: the mean of the new per-scene abs_pos_frac vector
+        # must equal the EXISTING validated dataset statistic
+        # mean_pos_vox_absent / gate_grid_voxels for the same epoch (within
+        # fp tol). This proves the per-scene stats are on the same scale as
+        # the number §1/§7 reason in. gate_grid_voxels is computed the
+        # identical way the trainer does: datshape // low_res_pool; here the
+        # full-res arm uses low_res_pool (1,1,1) so it is the full voxel count.
+        gate_grid_voxels = (_T // 1) * (_H // 1) * (_W // 1)
+        mpv = history.get("mean_pos_vox_absent", [])
+        aps_mean = history.get("abs_pos_frac_mean", [])
+        recon_rows: list[str] = []
+        tol = 1e-9
+        for e in range(n):
+            m_pv = mpv[e] if e < len(mpv) else float("nan")
+            if m_pv != m_pv:  # NaN -> no absent scene this epoch
+                continue
+            expected = m_pv / gate_grid_voxels
+            # (i) reported derived-stat mean vs mean_pos_vox_absent/grid
+            got_stat = aps_mean[e]
+            # (ii) recompute mean directly from the per-scene vector
+            vec = aps[e] if e < len(aps) else []
+            got_vec = sum(vec) / len(vec) if vec else float("nan")
+            d_stat = abs(got_stat - expected)
+            d_vec = abs(got_vec - expected)
+            if d_stat > tol or d_vec > tol:
+                problems.append(
+                    f"epoch {e}: abs_pos_frac mean {got_stat:.6e}/vec "
+                    f"{got_vec:.6e} != mean_pos_vox_absent/grid "
+                    f"{expected:.6e} (d_stat={d_stat:.2e} d_vec={d_vec:.2e})"
+                )
+            recon_rows.append(
+                f"    ep{e}: mean_pos_vox_absent={m_pv:.4f} / "
+                f"{gate_grid_voxels} = {expected:.6e} == "
+                f"per-scene mean {got_vec:.6e} (d={d_vec:.2e})"
+            )
+        if problems:
+            print("ASSERT_KEYS FAIL:")
+            for pr in problems:
+                print(f"  - {pr}")
+            return 1
+        print("ASSERT_KEYS OK:")
+        print(f"  epochs={n}; all {len(_NEW_KEYS)} instrumentation keys present "
+              f"and length-{n}")
+        print(f"  abs_pos_frac_p95 = {p95}")
+        print(f"  peak_vram_bytes  = {history['peak_vram_bytes']} (nan on CPU)")
+        print(f"  effective_lr     = {history['effective_lr']}")
+        print(f"  present_loss     = {history['present_loss_component']}")
+        print(f"  absent_loss      = {history['absent_loss_component']}")
+        print("  EMA branch NOT entered (use_ema off); instrumentation logged")
+        print(f"  reconciliation (per-scene mean == mean_pos_vox_absent / "
+              f"gate_grid_voxels={gate_grid_voxels}):")
+        for row in recon_rows:
+            print(row)
+        return 0
+
+    # ema_on
+    kwargs = _base_config_kwargs(data_root, output_root, max(args.num_epochs, 3))
+    kwargs.update(use_ema=True, ema_decay=0.99, ema_start_epoch=2)
+    history, msgs = _run(kwargs)
+    problems = []
+    if history.get("use_ema") is not True:
+        problems.append("use_ema not recorded True")
+    if not any("Weight EMA: ENABLED" in m for m in msgs):
+        problems.append("EMA enable log missing")
+    if not any("EMA accumulation started" in m for m in msgs):
+        problems.append("EMA accumulation-start log missing (branch not entered)")
+    # Checkpoints (saved on EMA weights once active) must exist.
+    models_dir = output_root / "models"
+    if not (models_dir / "last_epoch_model.pth").exists():
+        problems.append("last_epoch_model.pth not written")
+    if problems:
+        print("EMA_ON FAIL:")
+        for pr in problems:
+            print(f"  - {pr}")
+        return 1
+    print("EMA_ON OK:")
+    print(f"  epochs={len(history['epochs'])}; EMA enabled, accumulation started, "
+          "validation+checkpointing ran on EMA weights without error")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

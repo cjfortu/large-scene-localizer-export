@@ -1,0 +1,90 @@
+"""End-to-end test that shape="square" propagates through worker().
+
+Constructs a small-scale DataGenerator, runs a 4-scene batch, asserts:
+- volumes are (T, H, W) uint8 in {0, 255}
+- at least one frame contains a fully-filled 2x2 sub-block
+- per-frame positive-pixel count is in the square-mode range (well below
+  the disk-mode range)
+- masks are zero for label-0 (target-absent) scenes and nonzero somewhere
+  for label-1 (target-present) scenes.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+from localizer.synth.swarm import DataGenerator, worker  # noqa: E402
+
+
+def test_square_mode_pipeline(tmp_path: Path) -> None:
+    """End-to-end: shape='square' produces 2x2 stamps, not disks."""
+    gen = DataGenerator(
+        n_frames=8,
+        n_circles=100,
+        image_size=(32, 32),
+        radius=2,
+        speeds=[0.25],
+        dat_lab_paths=[tmp_path / "data_all", tmp_path / "label_msk"],
+        samedir=True,
+        shape="square",
+        square_edge=2,
+    )
+    worker(start_idx=0, batch_size=4, generator=gen, save_gifs=False)
+
+    data_dir = tmp_path / "data_all"
+    mask_dir = tmp_path / "label_msk"
+
+    expected_files = [
+        ("vid0_1.npy", "vid0_1_mask.npy", 1),
+        ("vid1_0.npy", "vid1_0_mask.npy", 0),
+        ("vid2_1.npy", "vid2_1_mask.npy", 1),
+        ("vid3_0.npy", "vid3_0_mask.npy", 0),
+    ]
+
+    medians = []
+    for vid_fname, mask_fname, label in expected_files:
+        v = np.load(data_dir / vid_fname)
+        m = np.load(mask_dir / mask_fname)
+
+        # Shape/dtype/value contracts.
+        assert v.shape == (8, 32, 32), f"volume shape {v.shape}"
+        assert v.dtype == np.uint8
+        assert set(np.unique(v)).issubset({0, 255}), f"volume values {np.unique(v)}"
+        assert m.shape == (8, 32, 32)
+        assert m.dtype == np.uint8
+        assert set(np.unique(m)).issubset({0, 255})
+
+        # At least one frame contains a fully-filled 2x2 sub-block.
+        found_block = False
+        for t in range(8):
+            for r in range(31):
+                if found_block:
+                    break
+                for c in range(31):
+                    if v[t, r:r + 2, c:c + 2].sum() == 255 * 4:
+                        found_block = True
+                        break
+            if found_block:
+                break
+        assert found_block, f"No 2x2 block found in {vid_fname}"
+
+        # Label parity vs mask all-zero / nonzero.
+        if label == 0:
+            assert (m == 0).all(), f"Label-0 mask not all zero: {mask_fname}"
+        else:
+            assert (m > 0).any(), f"Label-1 mask all zero: {mask_fname}"
+
+        # Per-frame positive count median (square mode range).
+        per_frame_positives = (v == 255).sum(axis=(1, 2))
+        medians.extend(per_frame_positives.tolist())
+
+    median_positives = float(np.median(medians))
+    assert 20 <= median_positives <= 100, (
+        f"median per-frame positives = {median_positives}; "
+        "expected square-mode range [20, 100]"
+    )

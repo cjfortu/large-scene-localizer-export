@@ -1,0 +1,463 @@
+"""Tests for ``localizer.gate.mamba_ref.Mamba`` (pure-PyTorch Mamba v1 fallback).
+
+Coverage:
+* shape, determinism and backward tests run anywhere (CPU, no ``mamba_ssm``);
+* parameter-name/shape parity, ``load_state_dict(strict=True)``, init parity
+  and CPU numerical parity against ``mamba_ssm``'s own reference math run only
+  when ``mamba_ssm`` is importable (construction of ``mamba_simple.Mamba`` does
+  not launch kernels, so CPU is fine);
+* ``test_gpu_parity_vs_cuda_kernel`` (marked ``gpu``) compares against the
+  fused CUDA kernel; it runs in Phase 3 validation on a CUDA node with
+  ``mamba_ssm`` installed and is skipped otherwise;
+* the checkpoint test loads every Mamba submodule group of the shipped gate
+  checkpoint ``$LSL_CKPT_ROOT/gate_A_stem2_bs1_ep42.safetensors`` (or ``.pth``) (skipped if that
+  file is absent; override the path with the ``MAMBA_REF_CKPT`` environment
+  variable).
+
+Set ``MAMBA_REF_BLOCK_MAMBA_SSM=1`` to hide ``mamba_ssm`` for this session and
+exercise the no-``mamba_ssm`` code paths on a machine that has it installed.
+
+CPU numerical parity note: ``mamba_ssm``'s ``mamba_inner_ref`` cannot run on
+CPU as shipped (it calls the CUDA ``causal_conv1d_fn`` and the CUDA
+``selective_scan_fn``). The parity reference is therefore ``mamba_inner_ref``
+itself with those two module globals monkeypatched to their pure-PyTorch
+references (``causal_conv1d_ref`` when ``causal_conv1d`` is importable,
+otherwise an equivalent ``F.conv1d`` composition, and ``selective_scan_ref``).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from collections import OrderedDict
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Callable, Optional
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+if os.environ.get("MAMBA_REF_BLOCK_MAMBA_SSM", "") not in ("", "0"):
+    # A None entry in sys.modules makes ``import mamba_ssm`` raise ImportError.
+    for _name in [n for n in list(sys.modules) if n == "mamba_ssm" or n.startswith("mamba_ssm.")]:
+        del sys.modules[_name]
+    sys.modules["mamba_ssm"] = None  # type: ignore[assignment]
+
+from localizer.common.checkpoint_io import load_state_dict, resolve_weights  # noqa: E402
+from localizer.gate.mamba_ref import Mamba  # noqa: E402
+
+# Constructor configs: the repo's call sites pass d_model, d_state, d_conv,
+# expand and (for the dt_init_std blocks) dt_scale; the remaining entries
+# exercise the other mamba_simple constructor arguments.
+REPO_CONFIGS: list[dict[str, Any]] = [
+    {"d_model": 64, "d_state": 16, "d_conv": 4, "expand": 2},  # v0.6 Arm 2 / v0.10 gate stage 2
+    {"d_model": 64, "d_state": 16, "d_conv": 4, "expand": 2, "dt_scale": 0.001 * 2.0},
+    {"d_model": 128, "d_state": 16, "d_conv": 4, "expand": 2},
+    {"d_model": 512, "d_state": 16, "d_conv": 4, "expand": 2, "dt_scale": 0.001 * 32 ** 0.5},
+]
+EXTRA_CONFIGS: list[dict[str, Any]] = [
+    {"d_model": 24, "d_state": 8, "d_conv": 3, "expand": 1.5, "dt_rank": 5,
+     "conv_bias": False, "bias": True, "dt_init": "constant"},
+    {"d_model": 16, "d_state": 4, "d_conv": 2, "expand": 2, "dt_min": 0.01,
+     "dt_max": 0.2, "dt_init_floor": 1e-3},
+]
+ALL_CONFIGS = REPO_CONFIGS + EXTRA_CONFIGS
+
+DEFAULT_CKPT_NAME = "gate_A_stem2_bs1_ep42.safetensors"
+
+
+def _default_ckpt() -> Path:
+    """Return the shipped gate checkpoint path (may not exist)."""
+    if os.environ.get("MAMBA_REF_CKPT"):
+        return Path(os.environ["MAMBA_REF_CKPT"])
+    return Path(os.environ.get("LSL_CKPT_ROOT", "")) / DEFAULT_CKPT_NAME
+
+
+def _try_import_mamba_ssm() -> Optional[ModuleType]:
+    """Import ``mamba_ssm.modules.mamba_simple`` if possible.
+
+    Returns:
+        Optional[ModuleType]: The ``mamba_simple`` module, or ``None`` when
+        ``mamba_ssm`` is missing or blocked or its extension fails to load.
+    """
+    try:
+        from mamba_ssm.modules import mamba_simple  # type: ignore[import-not-found]
+    except Exception:  # ImportError, OSError from missing CUDA libraries, etc.
+        return None
+    return mamba_simple
+
+
+def _require_mamba_simple() -> ModuleType:
+    """Return ``mamba_simple`` or skip the calling test.
+
+    Returns:
+        ModuleType: The ``mamba_ssm.modules.mamba_simple`` module.
+    """
+    mod = _try_import_mamba_ssm()
+    if mod is None:
+        pytest.skip("mamba_ssm not importable")
+    return mod
+
+
+def _make_ref(seed: int, **cfg: Any) -> Mamba:
+    """Build a reference Mamba under a fixed seed.
+
+    Args:
+        seed: Torch RNG seed applied before construction.
+        **cfg: Constructor kwargs.
+
+    Returns:
+        Mamba: Freshly initialized module.
+    """
+    torch.manual_seed(seed)
+    return Mamba(**cfg)
+
+
+def _perturb_(module: torch.nn.Module, seed: int) -> None:
+    """Add seeded noise to every parameter so parity tests exercise all terms
+    (e.g. non-unit ``D``, non-S4D ``A_log``).
+
+    Args:
+        module: Module whose parameters are modified in place.
+        seed: Seed for the noise generator.
+
+    Returns:
+        None.
+    """
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for p in module.parameters():
+            p.add_(0.05 * torch.randn(p.shape, generator=g, dtype=p.dtype).to(p.device))
+
+
+def _cpu_inner_reference(orig: torch.nn.Module, hidden: torch.Tensor,
+                         monkeypatch: pytest.MonkeyPatch) -> torch.Tensor:
+    """Compute the original module's output with mamba_ssm's own reference ops.
+
+    Mirrors ``mamba_simple.Mamba.forward`` fast path (``in_proj`` matmul,
+    ``A = -exp(A_log)``, ``mamba_inner_ref`` with ``delta_bias`` and
+    ``delta_softplus=True``) but with the CUDA-only ``causal_conv1d_fn`` and
+    ``selective_scan_fn`` swapped for their pure-PyTorch references.
+
+    Args:
+        orig: A ``mamba_simple.Mamba`` instance.
+        hidden: Input, shape ``(batch, seqlen, d_model)``.
+        monkeypatch: pytest monkeypatch fixture (patches are undone after the
+            test).
+
+    Returns:
+        torch.Tensor: Output, shape ``(batch, seqlen, d_model)``.
+    """
+    from mamba_ssm.ops import selective_scan_interface as ssi  # type: ignore[import-not-found]
+
+    try:
+        from causal_conv1d.causal_conv1d_interface import causal_conv1d_ref  # type: ignore
+        conv_ref: Callable[..., torch.Tensor] = causal_conv1d_ref
+    except Exception:
+        def conv_ref(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None,
+                     activation: Optional[str] = None) -> torch.Tensor:
+            """F.conv1d stand-in for ``causal_conv1d_ref``; x (b, d, L), weight (d, w)."""
+            seqlen = x.shape[-1]
+            dim, width = weight.shape
+            out = F.conv1d(x.to(weight.dtype), weight.unsqueeze(1), bias,
+                           padding=width - 1, groups=dim)[..., :seqlen]
+            return (out if activation is None else F.silu(out)).to(x.dtype)
+
+    monkeypatch.setattr(ssi, "causal_conv1d_fn", conv_ref)
+    monkeypatch.setattr(ssi, "selective_scan_fn", ssi.selective_scan_ref)
+
+    batch, seqlen, dim = hidden.shape
+    # xz = in_proj.weight @ (d, b*l) -> (b, d, l), exactly as the original.
+    xz = orig.in_proj.weight @ hidden.reshape(batch * seqlen, dim).t()
+    xz = xz.reshape(-1, batch, seqlen).permute(1, 0, 2)
+    if orig.in_proj.bias is not None:
+        xz = xz + orig.in_proj.bias.to(dtype=xz.dtype)[:, None]
+    A = -torch.exp(orig.A_log.float())
+    return ssi.mamba_inner_ref(
+        xz, orig.conv1d.weight, orig.conv1d.bias, orig.x_proj.weight,
+        orig.dt_proj.weight, orig.out_proj.weight, orig.out_proj.bias,
+        A, None, None, orig.D.float(),
+        delta_bias=orig.dt_proj.bias.float(), delta_softplus=True,
+    )
+
+
+# --------------------------------------------------------------------------
+# (a) shape
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "batch,seqlen,d_model",
+    [(1, 1, 16), (2, 3, 16), (3, 4, 32), (2, 17, 64), (1, 64, 64)],
+)
+def test_output_shape(batch: int, seqlen: int, d_model: int) -> None:
+    """Output shape equals input shape, including seqlen < d_conv."""
+    m = _make_ref(0, d_model=d_model)
+    x = torch.randn(batch, seqlen, d_model)
+    y = m(x)
+    assert y.shape == x.shape
+    assert y.dtype == x.dtype
+    assert torch.isfinite(y).all()
+
+
+def test_inference_params_none_accepted_and_other_rejected() -> None:
+    """``inference_params=None`` is accepted; a cache object is refused."""
+    m = _make_ref(0, d_model=16)
+    x = torch.randn(1, 5, 16)
+    assert torch.equal(m(x, inference_params=None), m(x))
+    with pytest.raises(NotImplementedError):
+        m(x, inference_params=object())
+
+
+def test_bf16_input_runs() -> None:
+    """bf16 input with fp32 weights runs; output is bf16 and close to fp32."""
+    m = _make_ref(0, d_model=32)
+    x = torch.randn(2, 9, 32)
+    y32 = m(x)
+    y16 = m(x.to(torch.bfloat16))
+    assert y16.dtype == torch.bfloat16
+    assert (y16.float() - y32).abs().max().item() < 5e-2
+
+
+# --------------------------------------------------------------------------
+# (b) determinism
+# --------------------------------------------------------------------------
+
+def test_determinism() -> None:
+    """Same seed gives bitwise-identical params and outputs; repeat passes match."""
+    cfg = REPO_CONFIGS[0]
+    m1 = _make_ref(123, **cfg)
+    m2 = _make_ref(123, **cfg)
+    for (k1, v1), (k2, v2) in zip(m1.state_dict().items(), m2.state_dict().items()):
+        assert k1 == k2 and torch.equal(v1, v2)
+    x = torch.randn(2, 12, cfg["d_model"], generator=torch.Generator().manual_seed(7))
+    y1 = m1(x)
+    y2 = m1(x)
+    y3 = m2(x)
+    assert torch.equal(y1, y2)
+    assert torch.equal(y1, y3)
+
+
+def test_causality() -> None:
+    """Output at time t does not depend on inputs after t (forward scan)."""
+    m = _make_ref(0, d_model=16)
+    x = torch.randn(1, 10, 16)
+    x2 = x.clone()
+    x2[:, 6:] += torch.randn_like(x2[:, 6:])
+    assert torch.allclose(m(x)[:, :6], m(x2)[:, :6], atol=0, rtol=0)
+
+
+def test_init_scheme() -> None:
+    """A_log is S4D-real, D is ones, softplus(dt bias) within [dt_min, dt_max],
+    dt_proj weight within +-dt_init_std, parity attributes present."""
+    m = _make_ref(0, d_model=64, d_state=16, dt_scale=0.5)
+    assert m.dt_rank == 4 and m.d_inner == 128
+    expected_A = torch.arange(1, 17, dtype=torch.float32).repeat(128, 1)
+    assert torch.allclose(torch.exp(m.A_log), expected_A)
+    assert m.A_log.dtype == torch.float32 and m.D.dtype == torch.float32
+    assert torch.equal(m.D, torch.ones(128))
+    dt = F.softplus(m.dt_proj.bias)
+    assert dt.min().item() >= 0.001 * (1 - 1e-4) and dt.max().item() <= 0.1 * (1 + 1e-4)
+    std = 4 ** -0.5 * 0.5
+    assert m.dt_proj.weight.abs().max().item() <= std
+    assert m.A_log._no_weight_decay and m.D._no_weight_decay
+    assert m.dt_proj.bias._no_reinit
+    assert isinstance(m.act, torch.nn.SiLU) and m.activation == "silu"
+    mc = _make_ref(0, d_model=32, dt_init="constant", dt_scale=2.0)
+    assert torch.allclose(mc.dt_proj.weight, torch.full_like(mc.dt_proj.weight, 2 ** -0.5 * 2.0))
+    with pytest.raises(NotImplementedError):
+        Mamba(d_model=16, dt_init="bogus")
+
+
+# --------------------------------------------------------------------------
+# (c) parameter-name/shape parity and strict loading
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cfg", ALL_CONFIGS, ids=lambda c: "-".join(f"{k}{v}" for k, v in c.items()))
+def test_state_dict_parity_and_strict_load(cfg: dict[str, Any]) -> None:
+    """Keys, order, shapes and dtypes match mamba_simple.Mamba; strict load
+    from the original works; same seed gives bitwise-identical init."""
+    ms = _require_mamba_simple()
+    torch.manual_seed(11)
+    orig = ms.Mamba(**cfg)
+    ref = _make_ref(11, **cfg)
+    sd_o, sd_r = orig.state_dict(), ref.state_dict()
+    assert list(sd_o.keys()) == list(sd_r.keys())
+    for k in sd_o:
+        assert sd_o[k].shape == sd_r[k].shape, k
+        assert sd_o[k].dtype == sd_r[k].dtype, k
+        # Same RNG consumption order -> identical initialization.
+        assert torch.equal(sd_o[k], sd_r[k]), k
+    assert [n for n, _ in orig.named_modules()] == [n for n, _ in ref.named_modules()]
+    assert [n for n, _ in orig.named_buffers()] == [n for n, _ in ref.named_buffers()]
+    for attr in ("d_model", "d_state", "d_conv", "expand", "d_inner", "dt_rank",
+                 "use_fast_path", "layer_idx", "activation"):
+        assert getattr(orig, attr) == getattr(ref, attr), attr
+
+    _perturb_(orig, seed=5)
+    fresh = _make_ref(99, **cfg)
+    result = fresh.load_state_dict(orig.state_dict(), strict=True)
+    assert not result.missing_keys and not result.unexpected_keys
+    for k, v in orig.state_dict().items():
+        assert torch.equal(fresh.state_dict()[k], v)
+
+
+def test_constructor_signature_parity() -> None:
+    """Constructor parameter names, order and defaults match the original."""
+    import inspect
+
+    ms = _require_mamba_simple()
+    sig_o = inspect.signature(ms.Mamba.__init__).parameters
+    sig_r = inspect.signature(Mamba.__init__).parameters
+    assert list(sig_o) == list(sig_r)
+    for name in sig_o:
+        assert sig_o[name].default == sig_r[name].default, name
+    fwd_o = inspect.signature(ms.Mamba.forward).parameters
+    fwd_r = inspect.signature(Mamba.forward).parameters
+    assert list(fwd_o) == list(fwd_r)
+
+
+# --------------------------------------------------------------------------
+# (d) CPU numerical parity against mamba_ssm's reference math
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cfg", ALL_CONFIGS, ids=lambda c: "-".join(f"{k}{v}" for k, v in c.items()))
+@pytest.mark.parametrize("batch,seqlen", [(2, 3), (3, 33)])
+def test_cpu_parity_vs_mamba_inner_ref(cfg: dict[str, Any], batch: int, seqlen: int,
+                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    """Our forward equals mamba_inner_ref (CPU-patched) to 1e-5 in fp32."""
+    ms = _require_mamba_simple()
+    torch.manual_seed(3)
+    orig = ms.Mamba(**cfg)
+    _perturb_(orig, seed=8)
+    ref = Mamba(**cfg)
+    ref.load_state_dict(orig.state_dict(), strict=True)
+    x = torch.randn(batch, seqlen, cfg["d_model"], generator=torch.Generator().manual_seed(4))
+    with torch.no_grad():
+        y_ref = _cpu_inner_reference(orig, x, monkeypatch)
+        y = ref(x)
+    diff = (y - y_ref).abs().max().item()
+    print(f"cpu parity cfg={cfg} B={batch} L={seqlen}: max abs diff {diff:.3e}")
+    assert y.shape == y_ref.shape
+    assert diff < 1e-5
+
+
+# --------------------------------------------------------------------------
+# (e) GPU parity against the fused CUDA kernel (Phase 3 validation)
+# --------------------------------------------------------------------------
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("cfg", REPO_CONFIGS[:2], ids=["arm2", "arm2_dtscale"])
+def test_gpu_parity_vs_cuda_kernel(cfg: dict[str, Any]) -> None:
+    """Original CUDA Mamba (fused path) vs ref on the same weights, fp32."""
+    ms = _require_mamba_simple()
+    dev = torch.device("cuda")
+    torch.manual_seed(21)
+    orig = ms.Mamba(**cfg).to(dev)
+    _perturb_(orig, seed=22)
+    ref = Mamba(**cfg).to(dev)
+    ref.load_state_dict(orig.state_dict(), strict=True)
+    x = torch.randn(4, 64, cfg["d_model"], device=dev,
+                    generator=torch.Generator(device=dev).manual_seed(23))
+    with torch.no_grad():
+        y_cuda = orig(x)
+        y_ref = ref(x)
+    diff = (y_cuda - y_ref).abs().max().item()
+    print(f"gpu parity cfg={cfg}: max abs diff vs CUDA kernel {diff:.3e}")
+    assert diff < 1e-4
+
+
+# --------------------------------------------------------------------------
+# (f) backward
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cfg", [REPO_CONFIGS[0], EXTRA_CONFIGS[0]], ids=["repo", "biases"])
+def test_backward_reaches_all_params(cfg: dict[str, Any]) -> None:
+    """loss.backward() populates a finite, non-None grad on every parameter."""
+    m = _make_ref(0, **cfg)
+    x = torch.randn(2, 6, cfg["d_model"], requires_grad=True)
+    loss = m(x).pow(2).mean()
+    loss.backward()
+    for name, p in m.named_parameters():
+        assert p.grad is not None, name
+        assert torch.isfinite(p.grad).all(), name
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+
+
+# --------------------------------------------------------------------------
+# Real checkpoint
+# --------------------------------------------------------------------------
+
+def _mamba_groups(sd: "OrderedDict[str, torch.Tensor]") -> dict[str, dict[str, torch.Tensor]]:
+    """Group checkpoint entries by Mamba-submodule prefix (keys ending A_log).
+
+    Args:
+        sd: Full model state_dict.
+
+    Returns:
+        dict[str, dict[str, torch.Tensor]]: prefix -> sub-state_dict with the
+        prefix stripped.
+    """
+    prefixes = sorted({k[: -len("A_log")] for k in sd if k.endswith("A_log")})
+    return {p: {k[len(p):]: v for k, v in sd.items() if k.startswith(p)} for p in prefixes}
+
+
+def _infer_cfg(group: dict[str, torch.Tensor]) -> dict[str, Any]:
+    """Infer Mamba constructor args from one group's tensor shapes.
+
+    Args:
+        group: Sub-state_dict of one Mamba module.
+
+    Returns:
+        dict[str, Any]: Constructor kwargs (d_model, d_state, d_conv, expand,
+        dt_rank, conv_bias, bias).
+    """
+    d_inner, d_state = group["A_log"].shape
+    d_model = group["in_proj.weight"].shape[1]
+    dt_rank = group["dt_proj.weight"].shape[1]
+    expand = d_inner / d_model
+    return {
+        "d_model": d_model,
+        "d_state": d_state,
+        "d_conv": group["conv1d.weight"].shape[-1],
+        "expand": int(expand) if float(expand).is_integer() else expand,
+        "dt_rank": dt_rank,
+        "conv_bias": "conv1d.bias" in group,
+        "bias": "in_proj.bias" in group,
+    }
+
+
+def test_real_checkpoint_groups_load_strict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every Mamba group of a real gate checkpoint loads with strict=True and
+    runs a finite forward pass; when mamba_ssm is importable, the trained
+    weights also match the CPU-patched mamba_inner_ref to 1e-5."""
+    path = _default_ckpt()
+    try:
+        path = resolve_weights(path)
+    except FileNotFoundError:
+        path = None
+    if path is None or not (os.environ.get("MAMBA_REF_CKPT") or os.environ.get("LSL_CKPT_ROOT")):
+        pytest.skip(f"checkpoint not found: {_default_ckpt()}")
+    sd = load_state_dict(path, map_location="cpu")
+    groups = _mamba_groups(sd)
+    assert groups, "no Mamba groups (keys ending in A_log) found"
+    for prefix, group in groups.items():
+        cfg = _infer_cfg(group)
+        auto_rank = -(-cfg["d_model"] // 16)
+        print(f"{prefix}: {cfg} (dt_rank auto would be {auto_rank})")
+        m = Mamba(**cfg)
+        result = m.load_state_dict(group, strict=True)
+        assert not result.missing_keys and not result.unexpected_keys
+        with torch.no_grad():
+            y = m(torch.randn(2, 16, cfg["d_model"]))
+        assert torch.isfinite(y).all()
+        ms = _try_import_mamba_ssm()
+        if ms is not None:
+            orig = ms.Mamba(**cfg)
+            orig.load_state_dict(group, strict=True)
+            x = torch.randn(3, 64, cfg["d_model"], generator=torch.Generator().manual_seed(1))
+            with torch.no_grad():
+                diff = (m(x) - _cpu_inner_reference(orig, x, monkeypatch)).abs().max().item()
+            print(f"{prefix}: trained-weight cpu parity max abs diff {diff:.3e}")
+            assert diff < 1e-5

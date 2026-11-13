@@ -1,0 +1,333 @@
+"""Day-0 preflight for the 512 gate-precision ladder (§5 of the spec).
+
+Runs the three cheap, load-bearing checks for ONE arm config and writes a
+JSON summary, then prints a PASS/HALT verdict against the §5.3 wall envelope
+and the §5.1 overfit-soundness bar. Intended to be run once per arm on its
+assigned training node (CUDA + the Mamba kernel are required).
+
+Checks (§5):
+  5.1 Single-scene overfit soundness gate -- build the exact arm model +
+      criterion (same code path the trainer uses, including the cell_focal
+      bias-init for L3), pick the most target-rich PRESENT scene, and overfit
+      it for <= --overfit_steps steps. Pass iff 8x8 per-cell recall reaches
+      >= --overfit_recall_bar (default 0.99). This is the autonomous
+      correctness check: buggy step-0 code fails to overfit and halts before
+      any multi-day run.
+  5.2 Per-arm VRAM -- reset_peak_memory_stats -> max_memory_allocated around a
+      real full-512 forward+backward.
+  5.3 Per-batch wall + 50-epoch projection -- time --timed_batches real train
+      batches (after --warmup_batches), project 50 epochs at the real train
+      batch count. The §5.3 envelope is ~3-4x the stride-2 baseline
+      (~36 h -> up to ~145 h/arm); a projection above ~145 h/arm is a §7.1
+      premise-challenge HALT.
+
+Usage (on the GPU host that will run the arm; dataset resolved under $LSL_DATA_ROOT):
+  python scripts/gate/preflight_512.py \
+      --config configs/gate/ladder_L3.yaml --out preflight_L3.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import yaml
+
+
+
+from localizer.gate.model import build_segmenter_v0_7
+from localizer.gate.losses import CellFocalLoss
+from localizer.common.paths import add_root_args, resolve_config_paths
+from localizer.gate.train import (
+    _estimate_positive_cell_frequency, _init_head_bias,
+)
+from localizer.common.data import make_dataloaders
+
+CELL = 16
+NGRID = 8
+THRESHOLD = 0.5
+STRIDE2_BASELINE_H = 36.0          # §9 operator stride-2 experience
+WALL_ENVELOPE_MAX_H = 145.0        # §5.3 / §7.1 top of the envelope
+
+
+def cell_grids(voxel_bool: np.ndarray) -> np.ndarray:
+    """(T,128,128) bool -> (8,8) per-cell True-voxel count."""
+    t, h, w = voxel_bool.shape
+    r = voxel_bool.reshape(t, NGRID, CELL, NGRID, CELL)
+    return r.sum(axis=(0, 2, 4)).astype(np.int64)
+
+
+@torch.no_grad()
+def measure_cell_recall(model, vol, truth_vox, device):
+    """8x8 cell recall + non-target cells flagged for one scene (k=1)."""
+    x = vol.unsqueeze(0).to(device)
+    logits = model(x).float()
+    pred_vox = (torch.sigmoid(logits) > THRESHOLD)[0, 0].cpu().numpy()
+    truth_cells = cell_grids(truth_vox) >= 1
+    pred_cells = cell_grids(pred_vox) >= 1
+    n_truth = int(truth_cells.sum())
+    n_hit = int((truth_cells & pred_cells).sum())
+    n_nontarget = int((pred_cells & ~truth_cells).sum())
+    recall = n_hit / max(n_truth, 1)
+    return recall, n_truth, n_nontarget
+
+
+def build_model_and_criterion(cfg: dict, train_loader, device):
+    """Build the arm's model + criterion exactly as the trainer does."""
+    model = build_segmenter_v0_7(
+        arm=int(cfg["arm"]), nfeats=int(cfg.get("nfeats", 32)),
+        fusion=cfg.get("fusion", "sum"), stem_stride=int(cfg["stem_stride"]),
+        dt_init_std=cfg.get("dt_init_std"),
+        padding_mode=cfg.get("padding_mode", "zeros"),
+    ).to(device)
+
+    # pos_weight from the mask shape (trainer logic).
+    sample0 = next(iter(train_loader))
+    H_m, W_m = sample0["mask"].shape[-2], sample0["mask"].shape[-1]
+    tppf = float(cfg["target_positive_pixels_per_frame"])
+    pos_weight = torch.tensor([(H_m * W_m) / tppf], device=device)
+
+    loss_target = cfg.get("loss_target", "hard_binary")
+    info = {"pos_weight": float(pos_weight.item()), "loss_target": loss_target}
+    if loss_target == "cell_focal":
+        cs = int(cfg.get("cell_focal_cell_size", 16))
+        p = _estimate_positive_cell_frequency(train_loader, cs, max_batches=300)
+        p = float(min(max(p, 1e-4), 1.0 - 1e-4))
+        import math
+        head_bias = math.log(p / (1.0 - p))
+        _init_head_bias(model, head_bias)
+        alpha = cfg.get("cell_focal_alpha")
+        alpha = (1.0 - p) if alpha is None else float(alpha)
+        aggregation = cfg.get("cell_focal_aggregation", "maxpool")
+        criterion = CellFocalLoss(
+            cell_size=cs, gamma=float(cfg.get("cell_focal_gamma", 2.0)),
+            alpha=float(alpha),
+            aux_weight=float(cfg.get("cell_focal_aux_weight", 0.5)),
+            pos_weight=pos_weight,
+            tversky_weight=float(cfg.get("cell_focal_tversky_weight", 0.0)),
+            tversky_alpha=float(cfg.get("cell_focal_tversky_alpha", 0.7)),
+            tversky_beta=float(cfg.get("cell_focal_tversky_beta", 0.3)),
+            aggregation=str(aggregation),
+        ).to(device)
+        info.update(pos_cell_freq=p, head_bias_init=head_bias,
+                    focal_alpha=alpha, aggregation=aggregation)
+    else:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    return model, criterion, info
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--overfit_steps", type=int, default=150)
+    ap.add_argument("--overfit_recall_bar", type=float, default=0.99)
+    ap.add_argument("--overfit_precision_bar", type=int, default=5,
+                    help="max non-target cells flagged at the high-recall point "
+                         "(guards against the predict-everywhere cold-start that "
+                         "trivially satisfies recall alone)")
+    ap.add_argument("--warmup_batches", type=int, default=2)
+    ap.add_argument("--timed_batches", type=int, default=10)
+    ap.add_argument("--scene_scan", type=int, default=60,
+                    help="how many train scenes to scan for the richest present scene")
+    ap.add_argument("--lr", type=float, default=None,
+                    help="override the config lr for the overfit gate (diagnostic; "
+                         "the real run keeps the config lr)")
+    ap.add_argument("--eval_every", type=int, default=10,
+                    help="evaluate cell recall/precision every N overfit steps")
+    ap.add_argument("--skip_wall", action="store_true",
+                    help="skip the 5.2 VRAM / 5.3 wall measurement (overfit-only re-test)")
+    add_root_args(ap, ("data", "runs"))
+    args = ap.parse_args()
+
+    cfg = yaml.safe_load(open(args.config))
+    resolve_config_paths(cfg, args.data_root_dir, args.runs_root_dir)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    host = socket.gethostname()
+    print(f"host={host} device={device} config={args.config}", flush=True)
+    if device.type != "cuda":
+        print("WARNING: no CUDA -- Mamba kernel needs GPU; this preflight will fail on CPU.")
+
+    train_loader, _, datshape = make_dataloaders(
+        data_root=cfg["data_root"], subset_size=int(cfg["subset_size"]),
+        batch_size=int(cfg.get("batch_size", 1)), num_workers=int(cfg.get("num_workers", 4)),
+        val_split=float(cfg["val_split"]), val_split_seed=int(cfg["val_split_seed"]),
+        output_resolution=cfg["output_resolution"],
+        soft_target=(cfg.get("loss_target") == "soft_gaussian"),
+        low_res_pool=tuple(cfg.get("low_res_pool", (2, 4, 4))),
+    )
+    n_train_batches = len(train_loader)
+    print(f"datshape={datshape} train_batches={n_train_batches}", flush=True)
+
+    model, criterion, crit_info = build_model_and_criterion(cfg, train_loader, device)
+    print(f"criterion info: {crit_info}", flush=True)
+    overfit_lr = args.lr if args.lr is not None else float(cfg.get("lr", 1e-3))
+    print(f"overfit lr={overfit_lr} eval_every={args.eval_every} skip_wall={args.skip_wall}", flush=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=overfit_lr)
+
+    # ---- 5.2 VRAM + 5.3 per-batch wall on real train batches ----
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    model.train()
+    per_batch_times = []
+    it = iter(train_loader)
+    total_needed = 0 if args.skip_wall else (args.warmup_batches + args.timed_batches)
+    for bi in range(total_needed):
+        try:
+            sample = next(it)
+        except StopIteration:
+            break
+        vol = sample["volume"].to(device)
+        mask = sample["mask"].to(device)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.time()
+        optimizer.zero_grad()
+        out = model(vol)
+        loss = criterion(out, mask)
+        loss.backward()
+        optimizer.step()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        dt = time.time() - t0
+        if bi >= args.warmup_batches:
+            per_batch_times.append(dt)
+        print(f"  batch {bi}: {dt:.3f}s loss={float(loss):.4f}"
+              f"{' (warmup)' if bi < args.warmup_batches else ''}", flush=True)
+
+    per_batch_s = float(np.median(per_batch_times)) if per_batch_times else float("nan")
+    vram_gib = (
+        torch.cuda.max_memory_allocated() / (1024 ** 3)
+        if (device.type == "cuda" and not args.skip_wall) else float("nan")
+    )
+    proj_50ep_h = per_batch_s * n_train_batches * 50 / 3600.0
+    proj_ratio = proj_50ep_h / STRIDE2_BASELINE_H
+    print(f"\n[5.2] peak VRAM allocated: {vram_gib:.2f} GiB", flush=True)
+    print(f"[5.3] median per-batch wall: {per_batch_s:.3f}s -> 50-epoch projection "
+          f"{proj_50ep_h:.1f} h ({proj_ratio:.2f}x the ~{STRIDE2_BASELINE_H:.0f}h stride-2 baseline)",
+          flush=True)
+
+    # ---- 5.1 single-scene overfit soundness gate ----
+    # Find the most target-rich PRESENT scene in the first scene_scan train scenes.
+    ds = train_loader.dataset
+    best_i, best_truth = -1, -1
+    scan = min(args.scene_scan, len(ds))
+    for i in range(scan):
+        s = ds[i]
+        if int(s["label"]) != 1:
+            continue
+        tv = (np.asarray(s["mask_hard"])[0] > 0.5)
+        nt = int((cell_grids(tv) >= 1).sum())
+        if nt > best_truth:
+            best_truth, best_i = nt, i
+    if best_i < 0:
+        print("HALT(5.1): no present scene found in scan window", flush=True)
+        verdict = "HALT_NO_PRESENT_SCENE"
+        _write(args.out, cfg, crit_info, vram_gib, per_batch_s, proj_50ep_h,
+               proj_ratio, n_train_batches, None, None, verdict, host, datshape)
+        return 2
+
+    s = ds[best_i]
+    vol = torch.as_tensor(s["volume"])
+    mask = torch.as_tensor(np.asarray(s["mask"])).unsqueeze(0).to(device)  # (1,1,T,H,W)
+    truth_vox = (np.asarray(s["mask_hard"])[0] > 0.5)
+    print(f"\n[5.1] overfit scene idx={best_i} target_cells={best_truth} "
+          f"(file={s.get('file_name','?')})", flush=True)
+
+    x = vol.unsqueeze(0).to(device)
+    model.train()
+    recall_traj = []
+    best_recall = 0.0
+    # Precision-aware soundness: an overfit single scene must reach high
+    # recall WHILE suppressing non-target cells. Recall alone is trivially
+    # satisfied by the predict-everywhere cold start (every 8192-voxel cell
+    # has some voxel > 0.5), so we require recall>=bar AND nontarget<=bar at
+    # the SAME step. Track the best non-target count among high-recall steps.
+    best_nt_at_recall = None
+    sound_step = None
+    for step in range(args.overfit_steps):
+        optimizer.zero_grad()
+        out = model(x)
+        loss = criterion(out, mask)
+        loss.backward()
+        optimizer.step()
+        if step % args.eval_every == 0 or step == args.overfit_steps - 1:
+            model.eval()
+            rec, n_truth, n_nt = measure_cell_recall(model, vol, truth_vox, device)
+            model.train()
+            best_recall = max(best_recall, rec)
+            recall_traj.append({"step": step, "loss": float(loss),
+                                "cell_recall": rec, "nontarget_cells": n_nt})
+            print(f"  step {step:3d}: loss={float(loss):.4f} cell_recall={rec:.3f} "
+                  f"nontarget_cells={n_nt}/{64 - n_truth}", flush=True)
+            if rec >= args.overfit_recall_bar:
+                if best_nt_at_recall is None or n_nt < best_nt_at_recall:
+                    best_nt_at_recall = n_nt
+                if n_nt <= args.overfit_precision_bar and sound_step is None:
+                    sound_step = step
+            if (best_recall >= args.overfit_recall_bar
+                    and best_nt_at_recall is not None
+                    and best_nt_at_recall <= args.overfit_precision_bar):
+                break
+
+    overfit_pass = (
+        best_recall >= args.overfit_recall_bar
+        and best_nt_at_recall is not None
+        and best_nt_at_recall <= args.overfit_precision_bar
+    )
+    wall_pass = args.skip_wall or (proj_50ep_h <= WALL_ENVELOPE_MAX_H)
+    if not overfit_pass:
+        verdict = "HALT_OVERFIT_FAIL"          # §7.2
+    elif not wall_pass:
+        verdict = "HALT_WALL_EXCEEDS_ENVELOPE"  # §7.1
+    else:
+        verdict = "PASS"
+
+    print(f"\n[5.1] overfit best cell_recall={best_recall:.3f} (bar {args.overfit_recall_bar}) "
+          f"min nontarget_cells@recall={best_nt_at_recall} (bar {args.overfit_precision_bar}) "
+          f"-> {'PASS' if overfit_pass else 'FAIL'}", flush=True)
+    print(f"VERDICT: {verdict}", flush=True)
+
+    _write(args.out, cfg, crit_info, vram_gib, per_batch_s, proj_50ep_h, proj_ratio,
+           n_train_batches, best_recall, recall_traj, verdict, host, datshape,
+           best_nt_at_recall, sound_step)
+    return 0 if verdict == "PASS" else 3
+
+
+def _write(out, cfg, crit_info, vram_gib, per_batch_s, proj_50ep_h, proj_ratio,
+           n_train_batches, best_recall, recall_traj, verdict, host, datshape,
+           best_nt_at_recall=None, sound_step=None):
+    payload = {
+        "host": host, "config": cfg.get("output_root", "?"),
+        "verdict": verdict,
+        "datshape": list(datshape) if datshape is not None else None,
+        "n_train_batches": n_train_batches,
+        "criterion_info": crit_info,
+        "vram_peak_gib": vram_gib,
+        "per_batch_wall_s": per_batch_s,
+        "proj_50ep_hours": proj_50ep_h,
+        "proj_ratio_vs_stride2_36h": proj_ratio,
+        "wall_envelope_max_h": WALL_ENVELOPE_MAX_H,
+        "overfit_best_cell_recall": best_recall,
+        "overfit_min_nontarget_at_recall": best_nt_at_recall,
+        "overfit_sound_step": sound_step,
+        "overfit_trajectory": recall_traj,
+        "stem_stride": cfg.get("stem_stride"),
+        "padding_mode": cfg.get("padding_mode"),
+        "loss_target": cfg.get("loss_target", "hard_binary"),
+    }
+    outp = Path(out)
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    outp.write_text(json.dumps(payload, indent=2, default=str))
+    print(f"wrote {outp}", flush=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

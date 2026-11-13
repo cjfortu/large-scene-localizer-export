@@ -1,0 +1,63 @@
+# multi_target_swarm_1024_v2 -- 1024x1024x64 GRF-clustered multi-target dataset.
+#
+# v2 supersedes the v1 multi_target_swarm_1024 config; see
+# documents/specs/multi_target_swarm_1024_v2_dataset_spec.md for full rationale.
+#
+# Structural changes vs v1:
+#   - target_sampler: grf_cluster (was chip_aware)
+#   - per-scene non-empty chip fraction: Beta(2,5) scaled to [1/10, 2/3]
+#     (was uniform on [24/64, 40/64])
+#   - spatial clustering of non-empty chips via 2D GRF (was uniform-without-replacement)
+#   - per-chip target count derived from GRF field value (was uniform[1,10])
+#   - parity rule: idx % 4 == 3 -> absent (was idx % 2 != 0)
+#
+# Unchanged from v1: image_size, n_frames, n_circles, speeds, samedir,
+# 2x2 square geometry, NPY layout, filename convention.
+
+n_frames: 64
+image_size: [1024, 1024]
+shape: square
+square_edge: 2
+radius: 2          # unused when shape="square", kept for backward-compat
+
+# Velocity pool -- v0 values at 1024^2 scale, inherited from v1 §3.4.
+speeds: [0.5, 1.0, 2.0]
+samedir: true
+
+# Background swarm density -- 30k per 128^2 chip x 64 chips, inherited from v1 §3.5.
+n_circles: 1920000
+
+# Multi-target sampler -- grf_cluster per spec §3.2.
+target_sampler: grf_cluster
+chip_size: 128
+
+# Per-scene non-empty-chip fraction p ~ Beta(alpha, beta) scaled to [p_lo, p_hi].
+grf_fraction_range: [0.1, 0.6666666666666666]      # [1/10, 2/3]
+grf_fraction_beta: [2.0, 5.0]                       # Beta(2, 5) -- right-skewed toward sparse
+
+# GRF kernel length scales [l_y, l_x] in units of chips on the 8x8 chip grid.
+# Production: isotropic 1.5. Anisotropic alternative (e.g., [1.0, 4.0] for
+# east-west urban corridors) is a one-line config change, no code change needed.
+grf_corr_length: [1.5, 1.5]
+grf_jitter: 0.000001                   # diagonal jitter for Cholesky stability
+
+# Per-chip target count: linear-by-field-value mapping into [1, 10], plus
+# Gaussian noise sigma_count, clipped and rounded.
+grf_count_range: [1, 10]
+grf_count_noise_sigma: 1.0
+
+# Parity rule modulus -- idx % grf_absent_modulo == grf_absent_modulo - 1 => absent.
+# Production: 4 => 25% absent (750 scenes of 3000).
+grf_absent_modulo: 4
+
+total_scenes: 3000
+save_gifs: false       # see spec §5 step 5 -- smoke run only
+fps: 10
+
+# Parallelism -- carry forward v1's locked values pending re-tuning.
+batch_size: 50
+num_workers: 8
+
+# Output: <data root>/<dataset>; data root from --data-root or $LSL_DATA_ROOT
+# (or an absolute --output_root).
+dataset: multi_target_swarm_1024x1024x64

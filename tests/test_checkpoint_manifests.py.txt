@@ -1,0 +1,114 @@
+"""Checks on the tracked checkpoint manifests (``checkpoints/*.json``).
+
+The weight files are not tracked; each shipped checkpoint has a JSON
+manifest that is its identity (sha256, size, provenance). A checkpoint exists
+in two formats with the same tensors: the original PyTorch ``file`` (``.pth``
+/ ``.pt``; ``sha256``, ``bytes``) and ``<name>.safetensors``
+(``safetensors_sha256``, ``safetensors_bytes``), which is the format that
+ships. These tests load every manifest and check its keys and values; they do
+not need the weights. When ``LSL_CKPT_ROOT`` points at a directory holding
+weight files, the size and sha256 of each format present are also checked,
+and at least one format must be present.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[1]
+MANIFEST_DIR = REPO / "checkpoints"
+EXPECTED_NAMES = {
+    "gate_A_stem2_bs1_ep42",
+    "classifier_baseline_30k_ep64",
+    "segmenter_volseg_ep19",
+}
+REQUIRED_KEYS = {
+    "name", "file", "role", "sha256", "bytes", "epoch", "selection_criterion",
+    "config_path", "config_path_at_training", "config_commit", "source_path",
+    "train_start", "host", "torch", "mamba_ssm", "causal_conv1d", "dataset",
+    "val_metrics", "notes", "inferred_fields", "reproduced_on_x86",
+    "safetensors_sha256", "safetensors_bytes",
+}
+MANIFESTS = sorted(MANIFEST_DIR.glob("*.json"))
+
+
+def _load(path: Path) -> dict:
+    """Load one manifest."""
+    return json.loads(path.read_text())
+
+
+def test_expected_manifests_present() -> None:
+    """Exactly the three shipped checkpoints have manifests."""
+    assert {p.stem for p in MANIFESTS} == EXPECTED_NAMES
+
+
+@pytest.mark.parametrize("path", MANIFESTS, ids=lambda p: p.stem)
+def test_manifest_schema(path: Path) -> None:
+    """Required keys present; hash, size, epoch and file name well formed."""
+    m = _load(path)
+    missing = REQUIRED_KEYS - set(m)
+    assert not missing, f"{path.name} missing {sorted(missing)}"
+    assert m["name"] == path.stem
+    assert m["file"].startswith(m["name"]) and m["file"].endswith((".pth", ".pt"))
+    assert re.fullmatch(r"[0-9a-f]{64}", m["sha256"])
+    assert isinstance(m["bytes"], int) and m["bytes"] > 0
+    assert re.fullmatch(r"[0-9a-f]{64}", m["safetensors_sha256"])
+    assert isinstance(m["safetensors_bytes"], int) and m["safetensors_bytes"] > 0
+    assert m["safetensors_sha256"] != m["sha256"]
+    assert isinstance(m["epoch"], int) and m["epoch"] > 0
+    assert isinstance(m["val_metrics"], dict) and m["val_metrics"]
+    assert isinstance(m["inferred_fields"], dict)
+
+
+@pytest.mark.parametrize("path", MANIFESTS, ids=lambda p: p.stem)
+def test_manifest_config_exists(path: Path) -> None:
+    """The current config each manifest points at is tracked in the repo."""
+    assert (REPO / _load(path)["config_path"]).is_file()
+
+
+def test_gate_manifest_build_matches_shipped_gate() -> None:
+    """The gate manifest records the build used by the pipeline evaluation."""
+    m = _load(MANIFEST_DIR / "gate_A_stem2_bs1_ep42.json")
+    assert m["model_build"]["factory"] == "build_segmenter_v0_7"
+    assert m["model_build"]["arm"] == 2 and m["model_build"]["stem_stride"] == 2
+    assert m["epoch"] == 42
+
+
+def _sha256(path: Path) -> str:
+    """Return the hex sha256 of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 22), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+@pytest.mark.parametrize("path", MANIFESTS, ids=lambda p: p.stem)
+def test_weights_match_manifest_when_available(path: Path) -> None:
+    """If $LSL_CKPT_ROOT holds the checkpoint, each format present matches.
+
+    Checks ``<name>.safetensors`` against ``safetensors_sha256`` /
+    ``safetensors_bytes`` and the original ``file`` against ``sha256`` /
+    ``bytes``. A shipped snapshot carries only the ``.safetensors`` file; at
+    least one of the two formats must be present.
+    """
+    root = os.environ.get("LSL_CKPT_ROOT")
+    m = _load(path)
+    if not root:
+        pytest.skip("weight file not available (set LSL_CKPT_ROOT)")
+    pairs = [
+        (Path(root) / f"{m['name']}.safetensors", m["safetensors_bytes"], m["safetensors_sha256"]),
+        (Path(root) / m["file"], m["bytes"], m["sha256"]),
+    ]
+    present = [(w, n, h) for w, n, h in pairs if w.is_file()]
+    if not present:
+        pytest.skip("weight file not available (set LSL_CKPT_ROOT)")
+    for weight, nbytes, sha in present:
+        assert weight.stat().st_size == nbytes, weight.name
+        assert _sha256(weight) == sha, weight.name

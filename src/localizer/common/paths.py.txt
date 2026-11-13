@@ -1,0 +1,165 @@
+"""Resolution of dataset, run and checkpoint locations.
+
+Configs and scripts never carry absolute paths. They name things relative to
+three roots:
+
+* the **data root** -- directory holding the datasets
+  (``<data root>/<dataset>/{data_all,label_msk}``),
+* the **runs root** -- directory where training/evaluation output goes
+  (``<runs root>/<run_name>/``),
+* the **checkpoints root** -- directory holding shipped weight files and their
+  ``<name>.json`` manifests.
+
+Each root is taken from a command-line argument when given, otherwise from an
+environment variable (``LSL_DATA_ROOT``, ``LSL_RUNS_ROOT``, ``LSL_CKPT_ROOT``).
+If neither is set, resolution fails with a message that says which argument or
+variable to set. Nothing depends on the current working directory or on where
+the repository is checked out.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+from typing import Any
+
+ENV_VARS: dict[str, str] = {
+    "data": "LSL_DATA_ROOT",
+    "runs": "LSL_RUNS_ROOT",
+    "ckpt": "LSL_CKPT_ROOT",
+}
+CLI_FLAGS: dict[str, str] = {
+    "data": "--data-root",
+    "runs": "--runs-root",
+    "ckpt": "--checkpoints-root",
+}
+_DESCRIPTIONS: dict[str, str] = {
+    "data": "directory holding the datasets",
+    "runs": "directory for run output",
+    "ckpt": "directory holding checkpoint files and manifests",
+}
+
+
+class RootNotConfiguredError(RuntimeError):
+    """Raised when a root is needed but neither the CLI flag nor the env var is set."""
+
+
+def resolve_root(kind: str, cli_value: str | os.PathLike | None = None) -> Path:
+    """Return the root directory of the given kind.
+
+    Args:
+        kind: One of ``"data"``, ``"runs"``, ``"ckpt"``.
+        cli_value: Value of the corresponding command-line argument, or
+            ``None`` if not given.
+
+    Returns:
+        The root as a ``Path`` (not required to exist; callers that read from
+        it fail naturally if it does not).
+
+    Raises:
+        RootNotConfiguredError: if ``cli_value`` is ``None`` and the
+            environment variable is unset or empty.
+    """
+    if kind not in ENV_VARS:
+        raise ValueError(f"unknown root kind {kind!r}; expected one of {sorted(ENV_VARS)}")
+    if cli_value:
+        return Path(cli_value).expanduser()
+    env = os.environ.get(ENV_VARS[kind], "").strip()
+    if env:
+        return Path(env).expanduser()
+    raise RootNotConfiguredError(
+        f"The {_DESCRIPTIONS[kind]} is not configured. Pass {CLI_FLAGS[kind]} "
+        f"or set the environment variable {ENV_VARS[kind]}."
+    )
+
+
+def add_root_args(parser: argparse.ArgumentParser, kinds: tuple[str, ...]) -> None:
+    """Add ``--data-root`` / ``--runs-root`` / ``--checkpoints-root`` arguments.
+
+    Args:
+        parser: Parser to extend.
+        kinds: Which roots to add, a subset of ``("data", "runs", "ckpt")``.
+
+    Returns:
+        None. The parsed values land in ``args.data_root_dir``,
+        ``args.runs_root_dir`` and ``args.ckpt_root_dir``.
+    """
+    for kind in kinds:
+        parser.add_argument(
+            CLI_FLAGS[kind], dest=f"{kind}_root_dir", default=None,
+            help=f"{_DESCRIPTIONS[kind].capitalize()} (default: ${ENV_VARS[kind]}).",
+        )
+
+
+def resolve_under(kind: str, name: str | os.PathLike, cli_root: str | os.PathLike | None = None) -> Path:
+    """Resolve ``name`` against a root unless it is already absolute.
+
+    Args:
+        kind: Root kind (``"data"``, ``"runs"``, ``"ckpt"``).
+        name: Relative name (e.g. ``"multi_target_swarm_512x512x64"``) or an
+            absolute path, which is returned unchanged.
+        cli_root: Command-line value for the root, if given.
+
+    Returns:
+        Absolute or root-relative ``Path``.
+    """
+    p = Path(name).expanduser()
+    if p.is_absolute():
+        return p
+    return resolve_root(kind, cli_root) / p
+
+
+def resolve_config_paths(
+    cfg: dict[str, Any],
+    data_root: str | os.PathLike | None = None,
+    runs_root: str | os.PathLike | None = None,
+) -> dict[str, Any]:
+    """Turn a config's relative ``dataset`` / ``run_name`` into trainer paths.
+
+    A config names its input as ``dataset: <name>`` and its output as
+    ``run_name: <relative/path>``. This function pops those keys and sets the
+    absolute ``data_root`` / ``output_root`` keys that the trainer dataclasses
+    expect. A config that already sets ``data_root`` / ``output_root``
+    directly (for example a test writing into a temporary directory) is left
+    as it is for that key.
+
+    Args:
+        cfg: Config dict loaded from YAML; modified in place and returned.
+        data_root: Command-line data root, or ``None`` to use ``LSL_DATA_ROOT``.
+        runs_root: Command-line runs root, or ``None`` to use ``LSL_RUNS_ROOT``.
+
+    Returns:
+        The same dict, with ``data_root`` / ``output_root`` set where the
+        config named a ``dataset`` / ``run_name``.
+    """
+    dataset = cfg.pop("dataset", None)
+    run_name = cfg.pop("run_name", None)
+    if dataset is not None:
+        cfg["data_root"] = str(resolve_under("data", dataset, data_root))
+    if run_name is not None:
+        cfg["output_root"] = str(resolve_under("runs", run_name, runs_root))
+    return cfg
+
+
+def require_path(value: str | None, field: str) -> str:
+    """Fail clearly when a required path field was never resolved.
+
+    Args:
+        value: The field value (``None`` when unset).
+        field: Field name, for the message.
+
+    Returns:
+        ``value`` unchanged when set.
+
+    Raises:
+        ValueError: if ``value`` is ``None`` or empty.
+    """
+    if not value:
+        hint = "dataset" if field == "data_root" else "run_name"
+        raise ValueError(
+            f"{field} is not set. Name it in the config as `{hint}: <relative name>` "
+            f"and set {ENV_VARS['data' if field == 'data_root' else 'runs']} "
+            f"(or pass {CLI_FLAGS['data' if field == 'data_root' else 'runs']})."
+        )
+    return value
